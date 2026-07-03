@@ -1,0 +1,1661 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PhotoVault</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif;
+         background: #101014; color: #e8e8ec; min-height: 100vh;
+         user-select: none; -webkit-user-select: none; overflow-x: hidden; }
+  .center { min-height: 100vh; display: grid; place-items: center; }
+  .card { background: #1a1a21; border: 1px solid #2a2a33; border-radius: 14px;
+          padding: 36px; width: 360px; text-align: center; }
+  .card h1 { font-size: 20px; margin-bottom: 4px; }
+  .card p { color: #9a9aa6; font-size: 13px; margin-bottom: 20px; }
+  input[type=password], input[type=text].ti {
+          width: 100%; padding: 10px 12px; margin-bottom: 12px;
+          background: #101014; border: 1px solid #33333e; border-radius: 8px;
+          color: #e8e8ec; font-size: 15px; outline: none;
+          user-select: text; -webkit-user-select: text; }
+  input[type=password]:focus, input[type=text].ti:focus { border-color: #6c6cf5; }
+  .wide { width: 100%; padding: 10px; border: 0; border-radius: 8px;
+          background: #5656e8; color: #fff; font-size: 15px; cursor: pointer; }
+  .wide:hover { background: #6a6af0; }
+  .wide:disabled { opacity: .6; cursor: default; }
+  .wide.ghost { background: #24242d; color: #e8e8ec; margin-top: 10px; }
+  .wide.ghost:hover { background: #2c2c36; }
+  .err { color: #ff7070; font-size: 13px; margin-bottom: 12px; min-height: 20px; }
+  .linky { color: #8a8af5; font-size: 13px; cursor: pointer; background: none;
+           border: 0; padding: 0; margin-top: 14px; }
+  .linky:hover { text-decoration: underline; }
+  .note { color: #c9a54a; font-size: 12px; margin-top: 14px; }
+  .meter { display: flex; gap: 4px; margin: -4px 0 12px; }
+  .meter span { flex: 1; height: 4px; border-radius: 2px; background: #2a2a33; }
+  .meter.s1 span:nth-child(1) { background: #e05555; }
+  .meter.s2 span:nth-child(-n+2) { background: #c9a54a; }
+  .meter.s3 span { background: #4fae62; }
+
+  header { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+           border-bottom: 1px solid #22222a; position: sticky; top: 0;
+           background: #101014ee; backdrop-filter: blur(8px); z-index: 5;
+           flex-wrap: wrap; }
+  header h1 { font-size: 16px; white-space: nowrap; }
+  header .count { color: #9a9aa6; font-size: 13px; white-space: nowrap; }
+  #search { flex: 1; min-width: 120px; max-width: 300px; padding: 7px 12px;
+      background: #1a1a21; border: 1px solid #33333e; border-radius: 8px;
+      color: #e8e8ec; font-size: 13px; outline: none;
+      user-select: text; -webkit-user-select: text; }
+  #search:focus { border-color: #6c6cf5; }
+  .btn { padding: 7px 14px; border-radius: 8px; border: 1px solid #33333e;
+         background: #1a1a21; color: #e8e8ec; font-size: 13px; cursor: pointer;
+         white-space: nowrap; }
+  .btn:hover { background: #24242d; }
+  .btn.primary { background: #5656e8; border-color: #5656e8; }
+  .btn.primary:hover { background: #6a6af0; }
+  .btn.danger { color: #ff8080; border-color: #4a2a2a; }
+  .btn.danger:hover { background: #2a1a1a; }
+  .btn.on { border-color: #6c6cf5; color: #b0b0ff; }
+  select.sel { padding: 7px 10px; border-radius: 8px; border: 1px solid #33333e;
+      background: #1a1a21; color: #e8e8ec; font-size: 13px; outline: none; }
+
+  .menuwrap { position: relative; }
+  .menu { display: none; position: absolute; right: 0; top: calc(100% + 6px);
+      background: #1e1e26; border: 1px solid #33333e; border-radius: 10px;
+      min-width: 190px; padding: 5px; z-index: 60;
+      box-shadow: 0 8px 30px #00000080; max-height: 320px; overflow-y: auto; }
+  .menu.open { display: block; }
+  .menu button { display: block; width: 100%; text-align: left; padding: 8px 12px;
+      background: none; border: 0; border-radius: 7px; color: #e8e8ec;
+      font-size: 13px; cursor: pointer; }
+  .menu button:hover { background: #2a2a35; }
+  .menu .sep { border-top: 1px solid #2a2a33; margin: 5px 0; }
+  #selbar .menu { top: auto; bottom: calc(100% + 6px); }
+
+  .main { display: flex; align-items: flex-start; }
+  #sidebar { width: 200px; flex: none; position: sticky; top: var(--hh, 57px);
+      height: calc(100vh - var(--hh, 57px)); overflow-y: auto; padding: 12px 8px;
+      border-right: 1px solid #1c1c24; }
+  #sidebar .item { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+      border-radius: 8px; cursor: pointer; font-size: 13.5px; color: #c8c8d2; }
+  #sidebar .item:hover { background: #1a1a21; }
+  #sidebar .item.active { background: #24243a; color: #fff; }
+  #sidebar .item .n { margin-left: auto; color: #9a9aa6; font-size: 12px; }
+  #sidebar .head { display: flex; align-items: center; padding: 14px 10px 4px;
+      color: #9a9aa6; font-size: 11px; text-transform: uppercase;
+      letter-spacing: .06em; }
+  #sidebar .head button { margin-left: auto; background: none; border: 0;
+      color: #8a8af5; font-size: 15px; cursor: pointer; line-height: 1; }
+  #sidebar .item .tools { display: none; margin-left: auto; gap: 2px; }
+  #sidebar .item:hover .tools { display: flex; }
+  #sidebar .item:hover .n { display: none; }
+  #sidebar .tools button { background: none; border: 0; color: #9a9aa6;
+      cursor: pointer; font-size: 12px; padding: 0 3px; }
+  #sidebar .tools button:hover { color: #fff; }
+  #content { flex: 1; min-width: 0; }
+
+  #trashbanner { display: flex; align-items: center; gap: 12px; margin: 10px 12px 0;
+      padding: 9px 14px; background: #241a1a; border: 1px solid #3a2626;
+      border-radius: 10px; color: #d9a0a0; font-size: 13px; }
+  #trashbanner button { margin-left: auto; }
+
+  table.list { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .list th { text-align: left; color: #9a9aa6; font-weight: 500;
+      padding: 8px 12px; border-bottom: 1px solid #22222a; cursor: pointer;
+      position: sticky; top: var(--hh, 57px); background: #101014; z-index: 2;
+      white-space: nowrap; }
+  .list th:hover { color: #e8e8ec; }
+  .list td { padding: 5px 12px; border-bottom: 1px solid #1a1a21;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .list tr.row { cursor: pointer; }
+  .list tr.row:hover { background: #17171d; }
+  .list tr.row.sel { background: #1d1d32; }
+  .list tr.row.focused { outline: 2px solid #6c6cf5; outline-offset: -2px; }
+  .list img.mini { width: 42px; height: 42px; object-fit: cover;
+      border-radius: 4px; background: #1a1a21; display: block; }
+  .list td.dim { color: #9a9aa6; }
+  .list .fav { color: #f06a6a; margin-right: 5px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+          gap: 6px; padding: 6px; }
+  .grid .ph { aspect-ratio: 1; overflow: hidden; border-radius: 6px;
+              background: #1a1a21; cursor: pointer; position: relative; }
+  .grid img { width: 100%; height: 100%; object-fit: cover; display: block;
+              transition: transform .15s; }
+  .grid .ph:hover img { transform: scale(1.03); }
+  .grid .ph.sel { outline: 3px solid #5656e8; outline-offset: -3px; }
+  .grid .ph.focused { outline: 3px solid #8a8af5; outline-offset: -3px; }
+  .grid .ph .check { display: none; position: absolute; top: 6px; right: 6px;
+      width: 22px; height: 22px; border-radius: 50%; background: #5656e8;
+      color: #fff; font-size: 13px; line-height: 22px; text-align: center; }
+  .grid .ph.sel .check { display: block; }
+  .grid .ph .fbadge { position: absolute; top: 6px; left: 6px; color: #f06a6a;
+      font-size: 14px; text-shadow: 0 1px 3px #000; }
+  .grid .ph .vbadge { position: absolute; inset: 0; display: grid;
+      place-items: center; font-size: 30px; color: #ffffffd0;
+      text-shadow: 0 1px 6px #000; pointer-events: none; }
+
+  .empty { padding: 90px 20px; text-align: center; color: #9a9aa6; }
+
+  #selbar { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+      display: none; align-items: center; gap: 8px; padding: 10px 14px;
+      background: #1e1e26f2; border: 1px solid #33333e; border-radius: 12px;
+      z-index: 90; box-shadow: 0 8px 30px #00000090; flex-wrap: wrap;
+      max-width: 92vw; }
+  #selbar.open { display: flex; }
+  #selbar .sc { font-size: 13px; color: #c8c8d2; margin-right: 4px; }
+
+  #drophint { display: none; position: fixed; inset: 0; place-items: center;
+      font-size: 22px; background: #101014dd; border: 2px dashed #5656e8;
+      z-index: 300; pointer-events: none; }
+  #drophint.active { display: grid; }
+
+  #lightbox { position: fixed; inset: 0; background: #000000f2; z-index: 100;
+      display: none; flex-direction: column; }
+  #lightbox.open { display: flex; }
+  #lightbox .bar { display: flex; gap: 8px; padding: 12px 16px;
+      align-items: center; color: #bbb; font-size: 13px; flex-wrap: wrap; }
+  #lightbox.slideshow .bar { visibility: hidden; }
+  #lbname { margin-right: auto; cursor: text; padding: 2px 6px;
+      border-radius: 6px; }
+  #lbname:hover { background: #ffffff14; }
+  #lbrename { margin-right: auto; width: 300px; padding: 4px 8px;
+      background: #101014; border: 1px solid #6c6cf5; border-radius: 6px;
+      color: #e8e8ec; font-size: 13px; outline: none; display: none;
+      user-select: text; -webkit-user-select: text; }
+  #lightbox .stage { flex: 1; position: relative; min-height: 0;
+      margin: 0 16px 16px; overflow: hidden; }
+  #lightbox .stage img { position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; transform-origin: center; }
+  #lightbox .stage video { position: absolute; inset: 0; width: 100%;
+      height: 100%; background: #000; }
+  #lightbox .nav { position: absolute; top: 50%; transform: translateY(-50%);
+      background: #00000070; border: 0; color: #fff; font-size: 26px;
+      width: 44px; height: 60px; cursor: pointer; border-radius: 8px;
+      z-index: 5; }
+  #lightbox .nav:hover { background: #000000b0; }
+  #lightbox.slideshow .nav { display: none; }
+  #lbprev { left: 8px; } #lbnext { right: 8px; }
+  #lbinfo { position: absolute; top: 0; right: 0; bottom: 0; width: 270px;
+      background: #16161cf5; border-left: 1px solid #2a2a33; padding: 18px;
+      display: none; overflow-y: auto; z-index: 6; }
+  #lbinfo.open { display: block; }
+  #lbinfo h3 { font-size: 13px; color: #9a9aa6; margin: 14px 0 2px;
+      font-weight: 500; }
+  #lbinfo h3:first-child { margin-top: 0; }
+  #lbinfo div.v { font-size: 13.5px; word-break: break-all; }
+  #lbinfo .chip { display: inline-block; background: #24243a; border-radius: 6px;
+      padding: 2px 8px; font-size: 12px; margin: 2px 4px 2px 0; }
+
+  .modal { position: fixed; inset: 0; display: none; place-items: center;
+      background: #000000a8; z-index: 200; }
+  .modal.open { display: grid; }
+  .modal .box { background: #1a1a21; border: 1px solid #2a2a33;
+      border-radius: 14px; padding: 26px; width: 460px; max-width: 92vw;
+      max-height: 86vh; overflow-y: auto; }
+  .modal .box h2 { font-size: 17px; margin-bottom: 14px; }
+  .modal .box h3 { font-size: 12px; color: #9a9aa6; text-transform: uppercase;
+      letter-spacing: .06em; margin: 20px 0 8px; font-weight: 600; }
+  .modal .box h3:first-of-type { margin-top: 6px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 7px 0;
+      font-size: 13.5px; }
+  .row .grow { margin-right: auto; }
+  .row .hint { color: #9a9aa6; font-size: 12px; }
+  .switch { appearance: none; width: 36px; height: 21px; border-radius: 11px;
+      background: #33333e; position: relative; cursor: pointer; flex: none;
+      transition: background .15s; }
+  .switch:checked { background: #5656e8; }
+  .switch::after { content: ""; position: absolute; top: 2.5px; left: 3px;
+      width: 16px; height: 16px; border-radius: 50%; background: #fff;
+      transition: left .15s; }
+  .switch:checked::after { left: 17px; }
+  .modal .close { float: right; background: none; border: 0; color: #9a9aa6;
+      font-size: 18px; cursor: pointer; margin: -6px -6px 0 0; }
+  .modal .close:hover { color: #fff; }
+  #rkey { font: 15px/1.9 ui-monospace, Menlo, monospace; background: #101014;
+      border: 1px solid #33333e; border-radius: 10px; padding: 14px;
+      text-align: center; letter-spacing: .04em; word-break: break-all;
+      user-select: text; -webkit-user-select: text; margin: 10px 0 14px; }
+  .btnrow { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .pwform input { margin-bottom: 8px; }
+
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      background: #24242d; border: 1px solid #33333e; padding: 8px 18px;
+      border-radius: 8px; font-size: 13px; display: none; z-index: 400;
+      align-items: center; gap: 12px; }
+  #toast button { background: none; border: 0; color: #8a8af5; font-size: 13px;
+      cursor: pointer; padding: 0; }
+  #toast button:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<div id="auth" class="center" style="display:none">
+  <form class="card" id="authform">
+    <h1>&#128274; PhotoVault</h1>
+    <p id="authmsg"></p>
+    <div class="err" id="autherr"></div>
+    <input type="text" class="ti" id="rk" placeholder="Recovery key"
+           autocomplete="off" spellcheck="false" style="display:none">
+    <input type="password" id="pw" placeholder="Password" required>
+    <div class="meter" id="meter" style="display:none"><span></span><span></span><span></span></div>
+    <input type="password" id="pw2" placeholder="Confirm password" style="display:none">
+    <button class="wide" id="authbtn" type="submit">Unlock</button>
+    <button class="wide ghost" id="touchidbtn" type="button" style="display:none">
+      Unlock with Touch&nbsp;ID</button>
+    <div><button class="linky" id="forgotbtn" type="button" style="display:none">
+      Forgot password?</button></div>
+    <div class="note" id="inboxnote" style="display:none"></div>
+  </form>
+</div>
+
+<div id="gallery" style="display:none">
+  <header>
+    <h1>&#128274; PhotoVault</h1>
+    <input id="search" type="search" placeholder="Search photos&hellip;"
+           autocomplete="off" spellcheck="false">
+    <span class="count" id="count"></span>
+    <select class="sel" id="sortsel" title="Sort">
+      <option value="added-desc">Newest first</option>
+      <option value="added-asc">Oldest first</option>
+      <option value="taken-desc">Date taken &#8595;</option>
+      <option value="taken-asc">Date taken &#8593;</option>
+      <option value="name-asc">Name A&ndash;Z</option>
+      <option value="name-desc">Name Z&ndash;A</option>
+      <option value="size-desc">Largest first</option>
+      <option value="size-asc">Smallest first</option>
+      <option value="type-asc">Type</option>
+    </select>
+    <button class="btn" id="viewbtn">List</button>
+    <button class="btn" id="selectbtn">Select</button>
+    <div class="menuwrap">
+      <button class="btn primary" id="importbtn">+ Import</button>
+      <div class="menu" id="importmenu">
+        <button id="impphotos">Photos or videos&hellip;</button>
+        <button id="impfolder">Folder&hellip;</button>
+      </div>
+    </div>
+    <button class="btn" id="settingsbtn" title="Settings">&#9881;</button>
+    <button class="btn" id="lockbtn">Lock</button>
+  </header>
+  <div class="main">
+    <nav id="sidebar"></nav>
+    <div id="content">
+      <div id="trashbanner" style="display:none">
+        Items in Recently Deleted are permanently removed after 30 days.
+        <button class="btn danger" id="emptytrashbtn">Empty Trash</button>
+      </div>
+      <div class="grid" id="grid"></div>
+      <div class="empty" id="empty" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<div id="selbar">
+  <span class="sc" id="selcount"></span>
+  <button class="btn" id="selfav">&#9825; Favorite</button>
+  <div class="menuwrap">
+    <button class="btn" id="selalbum">Album &#9662;</button>
+    <div class="menu" id="albummenu"></div>
+  </div>
+  <button class="btn" id="selexport">Export&hellip;</button>
+  <button class="btn" id="selrestore" style="display:none">Restore</button>
+  <button class="btn danger" id="seldelete">Delete</button>
+  <button class="btn danger" id="selpurge" style="display:none">Delete Forever</button>
+  <button class="btn" id="selclear">&#10005;</button>
+</div>
+
+<div id="drophint">Drop photos or videos to import</div>
+
+<div id="lightbox">
+  <div class="bar">
+    <span id="lbname" title="Click to rename"></span>
+    <input id="lbrename" spellcheck="false">
+    <button class="btn" id="lbfav">&#9825;</button>
+    <button class="btn" id="lbinfobtn">Info</button>
+    <button class="btn" id="lbplay" title="Slideshow">&#9654; Slideshow</button>
+    <button class="btn" id="lbexport">Export</button>
+    <button class="btn" id="lbrestore" style="display:none">Restore</button>
+    <button class="btn danger" id="lbdel">Delete</button>
+    <button class="btn danger" id="lbpurge" style="display:none">Delete Forever</button>
+    <button class="btn" id="lbclose">Close &nbsp;esc</button>
+  </div>
+  <div class="stage" id="lbstage">
+    <img id="lbimg" alt="">
+    <video id="lbvid" controls playsinline style="display:none"></video>
+    <button class="nav" id="lbprev">&#8249;</button>
+    <button class="nav" id="lbnext">&#8250;</button>
+    <div id="lbinfo"></div>
+  </div>
+</div>
+
+<div class="modal" id="settings">
+  <div class="box">
+    <button class="close" id="setclose">&#10005;</button>
+    <h2>Settings</h2>
+
+    <h3>General</h3>
+    <div class="row">
+      <span class="grow">Auto-lock after inactivity</span>
+      <select class="sel" id="autolocksel">
+        <option value="60">1 min</option>
+        <option value="300">5 min</option>
+        <option value="900">15 min</option>
+        <option value="1800">30 min</option>
+        <option value="3600">1 hour</option>
+        <option value="0">Never</option>
+      </select>
+    </div>
+    <div class="row"><span class="grow">Lock when the Mac sleeps or the screen locks</span>
+      <input type="checkbox" class="switch" id="optsleep"></div>
+    <div class="row"><span class="grow">Block screenshots &amp; screen sharing</span>
+      <input type="checkbox" class="switch" id="optprotect"></div>
+    <div class="row"><span class="grow">Skip duplicates when importing
+      <div class="hint">Identical files already in the vault are not re-added</div></span>
+      <input type="checkbox" class="switch" id="optdedupe"></div>
+
+    <h3>Security</h3>
+    <div class="row" id="touchidrow" style="display:none">
+      <span class="grow">Touch&nbsp;ID unlock
+        <div class="hint" id="touchidhint"></div></span>
+      <input type="checkbox" class="switch" id="opttouchid">
+    </div>
+    <div class="row"><span class="grow">Recovery key
+      <div class="hint" id="rkhint"></div></span>
+      <span class="btnrow" style="margin:0">
+        <button class="btn" id="rkgen">Generate&hellip;</button>
+        <button class="btn" id="rkoff" style="display:none">Disable</button>
+      </span>
+    </div>
+    <form class="pwform" id="pwform" style="margin-top:10px">
+      <input type="password" id="cpw0" placeholder="Current password" autocomplete="off">
+      <input type="password" id="cpw1" placeholder="New password (min 8 characters)" autocomplete="off">
+      <input type="password" id="cpw2" placeholder="Confirm new password" autocomplete="off">
+      <button class="btn" type="submit">Change password</button>
+    </form>
+
+    <h3>Library</h3>
+    <div class="btnrow">
+      <button class="btn" id="backupbtn">Back up vault&hellip;</button>
+      <button class="btn" id="scanbtn">Find photo dates</button>
+      <button class="btn" id="exportallbtn">Export all&hellip;</button>
+    </div>
+    <div class="btnrow">
+      <button class="btn danger" id="emptytrashbtn2">Empty Trash</button>
+      <button class="btn danger" id="clearbtn">Delete all photos&hellip;</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="keymodal">
+  <div class="box">
+    <h2>Your recovery key</h2>
+    <p style="color:#9a9aa6;font-size:13px">Write this down or store it in a
+    password manager. It's the <b>only</b> way back in if you forget your
+    password — it will not be shown again.</p>
+    <div id="rkey"></div>
+    <div class="btnrow">
+      <button class="btn" id="rkcopy">Copy</button>
+      <button class="btn primary" id="rkdone">I've saved it</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="offermodal">
+  <div class="box">
+    <h2>Set up a recovery key?</h2>
+    <p style="color:#9a9aa6;font-size:13px;margin-bottom:16px">Your password
+    can't be recovered. A recovery key is a one-time code that can unlock the
+    vault and reset the password if you ever forget it. You can also do this
+    later in Settings.</p>
+    <div class="btnrow">
+      <button class="btn primary" id="offeryes">Generate recovery key</button>
+      <button class="btn" id="offerno">Skip for now</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="promptmodal">
+  <form class="box" id="promptform">
+    <h2 id="pmtitle"></h2>
+    <input type="text" class="ti" id="pminput" autocomplete="off" spellcheck="false">
+    <div class="btnrow">
+      <button class="btn primary" type="submit">OK</button>
+      <button class="btn" type="button" id="pmcancel">Cancel</button>
+    </div>
+  </form>
+</div>
+
+<div id="toast"><span id="toastmsg"></span><button id="toastact" style="display:none"></button></div>
+
+<script>
+const { invoke } = window.__TAURI__.core;
+const { open, save, ask } = window.__TAURI__.dialog;
+const { listen } = window.__TAURI__.event;
+
+const $ = id => document.getElementById(id);
+const mediaURL = (id, thumb) => `pvmedia://localhost/${id}${thumb ? "/thumb" : ""}`;
+
+let mode = "login";        // login | setup | recovery
+let photos = [];           // full library metadata
+let albums = [];           // [{id, name, created}]
+let visible = [];          // photos in the current view, sorted
+let currentView = { type: "all", album: null };
+let query = "";
+let selection = new Set();
+let selectMode = false;
+let lastClick = -1;
+let focusIdx = -1;
+let cur = -1;              // lightbox index into `visible`
+let settings = null;
+let importing = false;
+
+// ------------------------------------------------------------------ toast ---
+
+function toast(msg, action, onAction) {
+  const t = $("toast");
+  $("toastmsg").textContent = msg;
+  const act = $("toastact");
+  if (action) {
+    act.textContent = action;
+    act.style.display = "inline";
+    act.onclick = () => { t.style.display = "none"; onAction(); };
+  } else {
+    act.style.display = "none";
+  }
+  t.style.display = "flex";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => (t.style.display = "none"), action ? 6000 : 2500);
+}
+
+function progressToast(verb) {
+  return e => {
+    const { done, total } = e.payload;
+    const t = $("toast");
+    clearTimeout(t._h);
+    $("toastact").style.display = "none";
+    $("toastmsg").textContent = `${verb} ${done.toLocaleString()} / ${total.toLocaleString()}…`;
+    t.style.display = "flex";
+  };
+}
+
+// ------------------------------------------------------------- formatting ---
+
+const esc = s => s.replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ext = n => { const i = n.lastIndexOf("."); return i > 0 ? n.slice(i + 1).toUpperCase() : ""; };
+const VIDEO_EXTS = ["MP4", "MOV", "M4V"];
+const isVideo = p => VIDEO_EXTS.includes(ext(p.name));
+const fmtSize = b => b == null ? "—"
+  : b < 1024 ? b + " B"
+  : b < 1048576 ? Math.round(b / 1024) + " KB"
+  : b < 1073741824 ? (b / 1048576).toFixed(1) + " MB"
+  : (b / 1073741824).toFixed(2) + " GB";
+const fmtDate = s => s == null ? "—"
+  : new Date(s * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+
+// ------------------------------------------------------------ auth screen ---
+
+async function refresh() {
+  const status = await invoke("vault_status");
+  if (status === "unlocked") {
+    $("auth").style.display = "none";
+    $("gallery").style.display = "block";
+    settings = await invoke("get_settings").catch(() => null);
+    await loadAlbums();
+    await loadGrid();
+    invoke("cleanup_orphans").catch(() => {}); // crash-leftover sweep, silent
+    return;
+  }
+  mode = status === "new" ? "setup" : "login";
+  clearSelection();
+  closeLightbox();
+  for (const m of ["settings", "keymodal", "offermodal", "promptmodal"])
+    $(m).classList.remove("open");
+  $("gallery").style.display = "none";
+  $("auth").style.display = "grid";
+  renderAuth();
+  if (mode === "login") {
+    const info = await invoke("lock_screen_info").catch(() => null);
+    if (info) {
+      $("touchidbtn").style.display = info.touch_id ? "block" : "none";
+      $("forgotbtn").style.display = info.has_recovery ? "inline" : "none";
+      if (info.inbox_pending > 0) {
+        $("inboxnote").style.display = "block";
+        $("inboxnote").textContent =
+          `⚠ ${info.inbox_pending} file${info.inbox_pending === 1 ? "" : "s"} waiting ` +
+          `(unencrypted) in PhotoVault Inbox — they'll be imported after unlock.`;
+      }
+    }
+  }
+}
+
+function renderAuth() {
+  $("autherr").textContent = "";
+  $("pw").value = ""; $("pw2").value = ""; $("rk").value = "";
+  $("touchidbtn").style.display = "none";
+  $("forgotbtn").style.display = "none";
+  $("inboxnote").style.display = "none";
+  $("rk").style.display = mode === "recovery" ? "block" : "none";
+  $("pw2").style.display = mode === "login" ? "none" : "block";
+  $("meter").style.display = mode === "login" ? "none" : "flex";
+  $("meter").className = "meter";
+  if (mode === "setup") {
+    $("authmsg").innerHTML = "Choose a password to create your vault.<br>Minimum 8 characters.";
+    $("pw").placeholder = "Password";
+    $("authbtn").textContent = "Create vault";
+  } else if (mode === "recovery") {
+    $("authmsg").textContent = "Enter your recovery key and choose a new password.";
+    $("pw").placeholder = "New password (min 8 characters)";
+    $("pw2").placeholder = "Confirm new password";
+    $("authbtn").textContent = "Reset password & unlock";
+    $("forgotbtn").style.display = "inline";
+    $("forgotbtn").textContent = "Back to password";
+  } else {
+    $("authmsg").textContent = "Enter your password to unlock.";
+    $("pw").placeholder = "Password";
+    $("authbtn").textContent = "Unlock";
+  }
+  (mode === "recovery" ? $("rk") : $("pw")).focus();
+}
+
+const pwScore = pw => {
+  let s = 0;
+  if (pw.length >= 8) s++;
+  if (pw.length >= 12) s++;
+  if ([/[a-z]/, /[A-Z]/, /[0-9]/, /[^a-zA-Z0-9]/].filter(r => r.test(pw)).length >= 3) s++;
+  return s;
+};
+$("pw").addEventListener("input", () => {
+  if (mode === "login") return;
+  $("meter").className = "meter s" + Math.min(3, pwScore($("pw").value));
+});
+
+$("forgotbtn").onclick = () => {
+  mode = mode === "recovery" ? "login" : "recovery";
+  renderAuth();
+  if (mode === "login") refresh();
+};
+
+$("touchidbtn").onclick = async () => {
+  $("autherr").textContent = "";
+  try {
+    await invoke("touchid_unlock");
+    await refresh();
+  } catch (err) {
+    if (!String(err).includes("cancelled")) $("autherr").textContent = err;
+  }
+};
+
+$("authform").addEventListener("submit", async e => {
+  e.preventDefault();
+  const pw = $("pw").value;
+  $("autherr").textContent = "";
+  if (mode !== "login" && pw !== $("pw2").value) {
+    $("autherr").textContent = "Passwords don't match.";
+    return;
+  }
+  $("authbtn").disabled = true;
+  try {
+    if (mode === "setup") {
+      await invoke("create_vault", { password: pw });
+      $("offermodal").classList.add("open");   // recovery-key offer, then refresh
+    } else if (mode === "recovery") {
+      await invoke("recovery_unlock", { recoveryKey: $("rk").value, newPassword: pw });
+      mode = "login";
+      await refresh();
+      toast("Password reset");
+    } else {
+      await invoke("unlock", { password: pw });
+      await refresh();
+    }
+  } catch (err) {
+    $("autherr").textContent = err;
+  } finally {
+    $("authbtn").disabled = false;
+  }
+});
+
+$("offeryes").onclick = async () => {
+  $("offermodal").classList.remove("open");
+  try {
+    showRecoveryKey(await invoke("recovery_generate"), true);
+  } catch (err) {
+    toast("" + err);
+    await refresh();
+  }
+};
+$("offerno").onclick = async () => {
+  $("offermodal").classList.remove("open");
+  await refresh();
+};
+
+let keyModalThenRefresh = false;
+function showRecoveryKey(key, thenRefresh) {
+  keyModalThenRefresh = !!thenRefresh;
+  $("rkey").textContent = key;
+  $("keymodal").classList.add("open");
+}
+$("rkcopy").onclick = async () => {
+  const text = $("rkey").textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
+  toast("Copied — remember to store it somewhere safe");
+};
+$("rkdone").onclick = async () => {
+  $("keymodal").classList.remove("open");
+  $("rkey").textContent = "";
+  if (keyModalThenRefresh) await refresh();
+  else refreshRecoveryStatus();
+};
+
+// ----------------------------------------------------------- prompt modal ---
+
+let pmResolve = null;
+function promptText(title, initial = "") {
+  return new Promise(resolve => {
+    pmResolve = resolve;
+    $("pmtitle").textContent = title;
+    $("pminput").value = initial;
+    $("promptmodal").classList.add("open");
+    $("pminput").focus();
+    $("pminput").select();
+  });
+}
+$("promptform").addEventListener("submit", e => {
+  e.preventDefault();
+  $("promptmodal").classList.remove("open");
+  pmResolve?.($("pminput").value);
+  pmResolve = null;
+});
+$("pmcancel").onclick = () => {
+  $("promptmodal").classList.remove("open");
+  pmResolve?.(null);
+  pmResolve = null;
+};
+
+// -------------------------------------------------------------- thumbnails ---
+
+// Thumbnails are windowed: loaded when a tile nears the viewport and
+// released once it scrolls far away, so memory stays flat even with tens of
+// thousands of photos.
+const observer = new IntersectionObserver(entries => {
+  for (const entry of entries) {
+    const el = entry.target;
+    const img = el.querySelector("img");
+    if (!img) continue;
+    if (entry.isIntersecting) {
+      if (!img.getAttribute("src")) img.src = mediaURL(el.dataset.id, true);
+    } else if (img.getAttribute("src")) {
+      img.removeAttribute("src");
+    }
+  }
+}, { rootMargin: "1200px" });
+
+// -------------------------------------------------------------- rendering ---
+
+let layout = localStorage.getItem("pv-view") || "grid";
+let [sortKey, sortDir] = (localStorage.getItem("pv-sort") || "added-desc").split("-");
+
+function sortPhotos(list) {
+  const dir = sortDir === "asc" ? 1 : -1;
+  list.sort((a, b) => {
+    let va, vb;
+    if (sortKey === "name") { va = a.name.toLowerCase(); vb = b.name.toLowerCase(); }
+    else if (sortKey === "size") { va = a.size || 0; vb = b.size || 0; }
+    else if (sortKey === "type") { va = ext(a.name); vb = ext(b.name); }
+    else if (sortKey === "taken") { va = a.taken ?? a.added; vb = b.taken ?? b.added; }
+    else { va = a.added; vb = b.added; }
+    return va < vb ? -dir : va > vb ? dir : 0;
+  });
+}
+
+function setSort(key, dirOverride) {
+  if (dirOverride) sortDir = dirOverride;
+  else if (key === sortKey) sortDir = sortDir === "asc" ? "desc" : "asc";
+  else sortDir = key === "name" || key === "type" ? "asc" : "desc";
+  sortKey = key;
+  localStorage.setItem("pv-sort", `${sortKey}-${sortDir}`);
+  renderPhotos();
+}
+
+function computeVisible() {
+  let v = photos.filter(p => currentView.type === "trash" ? p.deleted : !p.deleted);
+  if (currentView.type === "favorites") v = v.filter(p => p.favorite);
+  if (currentView.type === "videos") v = v.filter(isVideo);
+  if (currentView.type === "album") v = v.filter(p => p.albums.includes(currentView.album));
+  if (query) v = v.filter(p => p.name.toLowerCase().includes(query));
+  sortPhotos(v);
+  return v;
+}
+
+function emptyMessage() {
+  if (query) return "No matches for “" + esc(query) + "”.";
+  switch (currentView.type) {
+    case "favorites": return "No favorites yet.<br>Open a photo and tap ♡, or select photos and favorite them.";
+    case "videos": return "No videos yet.<br>Import .mp4, .mov or .m4v files.";
+    case "trash": return "Recently Deleted is empty.";
+    case "album": return "This album is empty.<br>Select photos and use Album ▾ to add them.";
+    default: return "Your vault is empty.<br>Drag photos here or click Import.<br><br>" +
+      "Tip: save downloads into the <b>PhotoVault Inbox</b> folder in your home " +
+      "directory — they're pulled into the vault automatically.";
+  }
+}
+
+function renderSidebar() {
+  const live = photos.filter(p => !p.deleted);
+  const counts = {
+    all: live.length,
+    favorites: live.filter(p => p.favorite).length,
+    videos: live.filter(isVideo).length,
+    trash: photos.length - live.length,
+  };
+  const active = t => (currentView.type === t ? " active" : "");
+  let html =
+    `<div class="item${active("all")}" data-v="all">&#128444; All Photos<span class="n">${counts.all}</span></div>` +
+    `<div class="item${active("favorites")}" data-v="favorites">&#9825; Favorites<span class="n">${counts.favorites}</span></div>` +
+    `<div class="item${active("videos")}" data-v="videos">&#9654; Videos<span class="n">${counts.videos}</span></div>` +
+    `<div class="item${active("trash")}" data-v="trash">&#128465; Recently Deleted<span class="n">${counts.trash}</span></div>` +
+    `<div class="head">Albums<button id="albadd" title="New album">+</button></div>`;
+  for (const a of albums) {
+    const n = live.filter(p => p.albums.includes(a.id)).length;
+    const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
+    html += `<div class="item${act}" data-v="album" data-id="${a.id}">&#128193; ` +
+      `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.name)}</span>` +
+      `<span class="n">${n}</span>` +
+      `<span class="tools"><button data-act="ren" title="Rename">&#9998;</button>` +
+      `<button data-act="del" title="Delete album">&#10005;</button></span></div>`;
+  }
+  const sb = $("sidebar");
+  sb.innerHTML = html;
+  sb.querySelectorAll(".item").forEach(el => {
+    el.onclick = e => {
+      const act = e.target.dataset?.act;
+      const id = el.dataset.id;
+      if (act === "ren") { renameAlbum(id); return; }
+      if (act === "del") { deleteAlbum(id); return; }
+      currentView = { type: el.dataset.v, album: id || null };
+      clearSelection();
+      renderPhotos();
+      renderSidebar();
+    };
+  });
+  $("albadd").onclick = async e => {
+    e.stopPropagation();
+    const name = await promptText("New album");
+    if (!name?.trim()) return;
+    try {
+      const id = await invoke("album_create", { name });
+      await loadAlbums();
+      currentView = { type: "album", album: id };
+      renderPhotos();
+      renderSidebar();
+    } catch (err) { toast("" + err); }
+  };
+}
+
+async function renameAlbum(id) {
+  const a = albums.find(x => x.id === id);
+  const name = await promptText("Rename album", a?.name || "");
+  if (!name?.trim() || name === a?.name) return;
+  try {
+    await invoke("album_rename", { id, name });
+    await loadAlbums();
+    renderSidebar();
+  } catch (err) { toast("" + err); }
+}
+
+async function deleteAlbum(id) {
+  const a = albums.find(x => x.id === id);
+  const ok = await ask(`Delete the album "${a?.name}"?\nPhotos in it stay in your library.`,
+    { title: "Delete album", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel" });
+  if (!ok) return;
+  await invoke("album_delete", { id }).catch(err => toast("" + err));
+  if (currentView.type === "album" && currentView.album === id)
+    currentView = { type: "all", album: null };
+  await loadAlbums();
+  await loadGrid();
+}
+
+function tileClick(i, e) {
+  focusIdx = i;
+  if (selectMode || e.metaKey || e.ctrlKey) {
+    toggleSelect(visible[i].id);
+    lastClick = i;
+  } else if (e.shiftKey && lastClick >= 0) {
+    const [a, b] = [Math.min(lastClick, i), Math.max(lastClick, i)];
+    for (let j = a; j <= b; j++) selection.add(visible[j].id);
+    updateSelectionUI();
+  } else {
+    show(i);
+    lastClick = i;
+  }
+}
+
+function renderPhotos() {
+  visible = computeVisible();
+  focusIdx = Math.min(focusIdx, visible.length - 1);
+  const total = photos.filter(p => !p.deleted).length;
+  $("count").textContent = visible.length === total
+    ? `${total.toLocaleString()} item${total === 1 ? "" : "s"}`
+    : `${visible.length.toLocaleString()} of ${total.toLocaleString()}`;
+  $("empty").style.display = visible.length ? "none" : "block";
+  $("empty").innerHTML = emptyMessage();
+  $("trashbanner").style.display =
+    currentView.type === "trash" && visible.length ? "flex" : "none";
+  $("viewbtn").textContent = layout === "grid" ? "List" : "Grid";
+  const sel = $("sortsel");
+  sel.value = `${sortKey}-${sortDir}`;
+  if (sel.selectedIndex === -1) sel.value = "added-desc";
+  document.documentElement.style.setProperty("--hh",
+    document.querySelector("header").offsetHeight + "px");
+  const grid = $("grid");
+  observer.disconnect();
+  grid.innerHTML = "";
+  if (layout === "grid") {
+    grid.className = "grid";
+    const frag = document.createDocumentFragment();
+    for (const [i, p] of visible.entries()) {
+      const div = document.createElement("div");
+      div.className = "ph" + (selection.has(p.id) ? " sel" : "")
+        + (i === focusIdx ? " focused" : "");
+      div.dataset.id = p.id;
+      div.appendChild(document.createElement("img"));
+      if (isVideo(p)) div.insertAdjacentHTML("beforeend", `<div class="vbadge">&#9654;</div>`);
+      if (p.favorite) div.insertAdjacentHTML("beforeend", `<div class="fbadge">&#9829;</div>`);
+      div.insertAdjacentHTML("beforeend", `<div class="check">&#10003;</div>`);
+      div.onclick = e => tileClick(i, e);
+      frag.appendChild(div);
+      observer.observe(div);
+    }
+    grid.appendChild(frag);
+  } else {
+    grid.className = "";
+    const arrow = k => sortKey === k ? (sortDir === "asc" ? " ▲" : " ▼") : "";
+    const table = document.createElement("table");
+    table.className = "list";
+    table.innerHTML = `<thead><tr><th style="width:58px"></th>
+      <th data-k="name">Name${arrow("name")}</th>
+      <th data-k="taken" style="width:170px">Taken${arrow("taken")}</th>
+      <th data-k="added" style="width:170px">Added${arrow("added")}</th>
+      <th data-k="size" style="width:90px">Size${arrow("size")}</th>
+      <th data-k="type" style="width:70px">Type${arrow("type")}</th></tr></thead>`;
+    table.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => setSort(th.dataset.k));
+    const tbody = document.createElement("tbody");
+    for (const [i, p] of visible.entries()) {
+      const tr = document.createElement("tr");
+      tr.className = "row" + (selection.has(p.id) ? " sel" : "")
+        + (i === focusIdx ? " focused" : "");
+      tr.dataset.id = p.id;
+      tr.innerHTML = `<td><img class="mini"></td>` +
+        `<td>${p.favorite ? '<span class="fav">&#9829;</span>' : ""}${esc(p.name)}</td>` +
+        `<td class="dim">${fmtDate(p.taken)}</td>` +
+        `<td class="dim">${fmtDate(p.added)}</td>` +
+        `<td class="dim">${fmtSize(p.size)}</td>` +
+        `<td class="dim">${ext(p.name)}</td>`;
+      tr.onclick = e => tileClick(i, e);
+      tbody.appendChild(tr);
+      observer.observe(tr);
+    }
+    table.appendChild(tbody);
+    grid.appendChild(table);
+  }
+  updateSelectionUI();
+}
+
+async function loadGrid() {
+  photos = await invoke("list_photos");
+  renderPhotos();
+  renderSidebar();
+}
+
+async function loadAlbums() {
+  albums = await invoke("list_albums").catch(() => []);
+}
+
+$("sortsel").onchange = e => {
+  const [k, d] = e.target.value.split("-");
+  setSort(k, d);
+};
+
+$("viewbtn").onclick = () => {
+  layout = layout === "grid" ? "list" : "grid";
+  localStorage.setItem("pv-view", layout);
+  renderPhotos();
+};
+
+$("search").addEventListener("input", e => {
+  query = e.target.value.trim().toLowerCase();
+  renderPhotos();
+});
+
+// -------------------------------------------------------------- selection ---
+
+function toggleSelect(id) {
+  selection.has(id) ? selection.delete(id) : selection.add(id);
+  updateSelectionUI();
+}
+
+function clearSelection() {
+  selection.clear();
+  selectMode = false;
+  $("selectbtn").classList.remove("on");
+  updateSelectionUI();
+}
+
+function selectedIds() { return [...selection]; }
+
+function updateSelectionUI() {
+  // Keep tile classes in sync without a full re-render.
+  document.querySelectorAll("#grid [data-id]").forEach(el => {
+    el.classList.toggle("sel", selection.has(el.dataset.id));
+  });
+  const n = selection.size;
+  $("selbar").classList.toggle("open", n > 0);
+  if (n > 0) {
+    $("selcount").textContent = `${n} selected`;
+    const inTrash = currentView.type === "trash";
+    $("selfav").style.display = inTrash ? "none" : "";
+    $("selalbum").parentElement.style.display = inTrash ? "none" : "";
+    $("seldelete").style.display = inTrash ? "none" : "";
+    $("selrestore").style.display = inTrash ? "" : "none";
+    $("selpurge").style.display = inTrash ? "" : "none";
+    const sel = photos.filter(p => selection.has(p.id));
+    const allFav = sel.length > 0 && sel.every(p => p.favorite);
+    $("selfav").innerHTML = allFav ? "&#9829; Unfavorite" : "&#9825; Favorite";
+    $("selfav")._fav = !allFav;
+  }
+}
+
+$("selectbtn").onclick = () => {
+  selectMode = !selectMode;
+  $("selectbtn").classList.toggle("on", selectMode);
+  if (!selectMode) { selection.clear(); updateSelectionUI(); }
+};
+$("selclear").onclick = clearSelection;
+
+$("selfav").onclick = async () => {
+  await invoke("set_favorite", { ids: selectedIds(), favorite: $("selfav")._fav })
+    .catch(err => toast("" + err));
+  await loadGrid();
+};
+
+$("seldelete").onclick = () => trashIds(selectedIds());
+$("selrestore").onclick = async () => {
+  await invoke("restore_photos", { ids: selectedIds() }).catch(err => toast("" + err));
+  clearSelection();
+  await loadGrid();
+};
+$("selpurge").onclick = async () => {
+  const ids = selectedIds();
+  const ok = await ask(`Permanently delete ${ids.length} item${ids.length === 1 ? "" : "s"}?\nThis cannot be undone.`,
+    { title: "Delete forever", kind: "warning", okLabel: "Delete Forever", cancelLabel: "Cancel" });
+  if (!ok) return;
+  await invoke("purge_photos", { ids }).catch(err => toast("" + err));
+  clearSelection();
+  await loadGrid();
+};
+
+$("selexport").onclick = async () => {
+  const ids = selectedIds();
+  const dest = await open({ directory: true, title: "Export selection to…" });
+  if (!dest) return;
+  try {
+    const n = await invoke("export_photos", { dest, ids });
+    toast(`Exported ${n.toLocaleString()} item${n === 1 ? "" : "s"}`);
+  } catch (err) { toast("Export failed: " + err); }
+};
+
+async function trashIds(ids) {
+  if (!ids.length) return;
+  await invoke("trash_photos", { ids }).catch(err => toast("" + err));
+  clearSelection();
+  await loadGrid();
+  toast(`Moved ${ids.length} to Recently Deleted`, "Undo", async () => {
+    await invoke("restore_photos", { ids }).catch(() => {});
+    await loadGrid();
+  });
+}
+
+// Album menu in the selection bar.
+$("selalbum").onclick = e => {
+  e.stopPropagation();
+  const menu = $("albummenu");
+  if (menu.classList.contains("open")) { menu.classList.remove("open"); return; }
+  let html = "";
+  for (const a of albums)
+    html += `<button data-id="${a.id}">${esc(a.name)}</button>`;
+  if (albums.length) html += `<div class="sep"></div>`;
+  html += `<button data-new="1">New album…</button>`;
+  if (currentView.type === "album")
+    html += `<div class="sep"></div><button data-remove="1">Remove from this album</button>`;
+  menu.innerHTML = html;
+  menu.querySelectorAll("button").forEach(b => {
+    b.onclick = async () => {
+      menu.classList.remove("open");
+      const ids = selectedIds();
+      try {
+        if (b.dataset.new) {
+          const name = await promptText("New album");
+          if (!name?.trim()) return;
+          const id = await invoke("album_create", { name });
+          await loadAlbums();
+          await invoke("albums_assign", { ids, album: id, add: true });
+        } else if (b.dataset.remove) {
+          await invoke("albums_assign", { ids, album: currentView.album, add: false });
+        } else {
+          await invoke("albums_assign", { ids, album: b.dataset.id, add: true });
+        }
+        clearSelection();
+        await loadGrid();
+      } catch (err) { toast("" + err); }
+    };
+  });
+  menu.classList.add("open");
+};
+
+// Close any open dropdown on outside click.
+document.addEventListener("click", e => {
+  if (!e.target.closest(".menuwrap"))
+    document.querySelectorAll(".menu.open").forEach(m => m.classList.remove("open"));
+});
+
+// ---------------------------------------------------------------- lightbox ---
+
+let zoom = { s: 1, x: 0, y: 0 };
+let slideTimer = null;
+
+function applyZoom() {
+  $("lbimg").style.transform = `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})`;
+}
+function resetZoom() {
+  zoom = { s: 1, x: 0, y: 0 };
+  applyZoom();
+}
+
+async function show(i) {
+  if (i < 0 || i >= visible.length) return;
+  cur = i;
+  const p = visible[i];
+  const video = isVideo(p);
+  cancelRename();
+  resetZoom();
+  $("lbname").textContent = p.name;
+  $("lbfav").innerHTML = p.favorite ? "&#9829;" : "&#9825;";
+  const inTrash = currentView.type === "trash";
+  $("lbdel").style.display = inTrash ? "none" : "";
+  $("lbrestore").style.display = inTrash ? "" : "none";
+  $("lbpurge").style.display = inTrash ? "" : "none";
+  $("lbplay").style.display = inTrash ? "none" : "";
+  const img = $("lbimg"), vid = $("lbvid");
+  vid.pause();
+  if (video) {
+    img.style.display = "none";
+    img.removeAttribute("src");
+    vid.style.display = "block";
+    vid.src = mediaURL(p.id);
+  } else {
+    vid.style.display = "none";
+    vid.removeAttribute("src");
+    vid.load();
+    img.style.display = "block";
+    img.src = mediaURL(p.id);
+  }
+  $("lightbox").classList.add("open");
+  if ($("lbinfo").classList.contains("open")) renderInfo();
+}
+
+function closeLightbox() {
+  stopSlideshow();
+  cancelRename();
+  const vid = $("lbvid");
+  vid.pause();
+  vid.removeAttribute("src");
+  vid.load(); // actually release the decoder/buffer
+  $("lbimg").removeAttribute("src");
+  $("lightbox").classList.remove("open");
+  $("lbinfo").classList.remove("open");
+  cur = -1;
+}
+
+$("lbclose").onclick = closeLightbox;
+$("lbprev").onclick = () => show(cur - 1);
+$("lbnext").onclick = () => show(cur + 1);
+
+$("lbfav").onclick = async () => {
+  if (cur < 0) return;
+  const p = visible[cur];
+  await invoke("set_favorite", { ids: [p.id], favorite: !p.favorite }).catch(() => {});
+  await loadGrid();
+  // The photo may have left the current view (e.g. unfavorited in Favorites).
+  const idx = visible.findIndex(x => x.id === p.id);
+  if (idx >= 0) {
+    cur = idx;
+    $("lbfav").innerHTML = visible[cur].favorite ? "&#9829;" : "&#9825;";
+    if ($("lbinfo").classList.contains("open")) renderInfo();
+  } else if (visible.length) {
+    show(Math.min(cur, visible.length - 1));
+  } else {
+    closeLightbox();
+  }
+};
+
+$("lbdel").onclick = async () => {
+  if (cur < 0) return;
+  const id = visible[cur].id;
+  const next = cur;
+  closeLightboxIfLast();
+  await trashIds([id]);
+  if ($("lightbox").classList.contains("open")) show(Math.min(next, visible.length - 1));
+};
+function closeLightboxIfLast() {
+  if (visible.length <= 1) closeLightbox();
+}
+$("lbrestore").onclick = async () => {
+  if (cur < 0) return;
+  const id = visible[cur].id;
+  const next = cur;
+  closeLightboxIfLast();
+  await invoke("restore_photos", { ids: [id] }).catch(err => toast("" + err));
+  await loadGrid();
+  if ($("lightbox").classList.contains("open")) show(Math.min(next, visible.length - 1));
+};
+$("lbpurge").onclick = async () => {
+  if (cur < 0) return;
+  const p = visible[cur];
+  const ok = await ask(`Permanently delete "${p.name}"?\nThis cannot be undone.`,
+    { title: "Delete forever", kind: "warning", okLabel: "Delete Forever", cancelLabel: "Cancel" });
+  if (!ok) return;
+  const next = cur;
+  closeLightboxIfLast();
+  await invoke("purge_photos", { ids: [p.id] }).catch(err => toast("" + err));
+  await loadGrid();
+  if ($("lightbox").classList.contains("open")) show(Math.min(next, visible.length - 1));
+};
+
+$("lbexport").onclick = async () => {
+  if (cur < 0) return;
+  const dest = await save({ defaultPath: visible[cur].name });
+  if (!dest) return;
+  try {
+    await invoke("export_photo", { id: visible[cur].id, dest });
+    toast("Exported " + visible[cur].name);
+  } catch (err) { toast("Export failed: " + err); }
+};
+
+// Rename: click the name, edit inline.
+$("lbname").onclick = () => {
+  if (cur < 0) return;
+  $("lbname").style.display = "none";
+  const inp = $("lbrename");
+  inp.value = visible[cur].name;
+  inp.style.display = "block";
+  inp.focus();
+  inp.select();
+};
+function cancelRename() {
+  $("lbrename").style.display = "none";
+  $("lbname").style.display = "";
+}
+$("lbrename").addEventListener("keydown", async e => {
+  e.stopPropagation();
+  if (e.key === "Escape") { cancelRename(); return; }
+  if (e.key !== "Enter") return;
+  const name = $("lbrename").value.trim();
+  const p = visible[cur];
+  cancelRename();
+  if (!name || name === p.name) return;
+  try {
+    await invoke("rename_photo", { id: p.id, name });
+    const keep = cur;
+    await loadGrid();
+    cur = keep;
+    $("lbname").textContent = name;
+    if ($("lbinfo").classList.contains("open")) renderInfo();
+  } catch (err) { toast("" + err); }
+});
+$("lbrename").addEventListener("blur", cancelRename);
+
+// Info panel.
+$("lbinfobtn").onclick = () => {
+  $("lbinfo").classList.toggle("open");
+  if ($("lbinfo").classList.contains("open")) renderInfo();
+};
+function renderInfo() {
+  if (cur < 0) return;
+  const p = visible[cur];
+  const img = $("lbimg");
+  const dims = p.width && p.height ? `${p.width} × ${p.height}`
+    : (!isVideo(p) && img.naturalWidth ? `${img.naturalWidth} × ${img.naturalHeight}` : "—");
+  const albumChips = p.albums
+    .map(id => albums.find(a => a.id === id))
+    .filter(Boolean)
+    .map(a => `<span class="chip">${esc(a.name)}</span>`)
+    .join("") || "—";
+  $("lbinfo").innerHTML =
+    `<h3>Name</h3><div class="v">${esc(p.name)}</div>` +
+    `<h3>Kind</h3><div class="v">${isVideo(p) ? "Video" : "Image"} · ${ext(p.name)}</div>` +
+    `<h3>Size</h3><div class="v">${fmtSize(p.size)}</div>` +
+    `<h3>Dimensions</h3><div class="v">${dims}</div>` +
+    `<h3>Taken</h3><div class="v">${fmtDate(p.taken)}</div>` +
+    `<h3>Added</h3><div class="v">${fmtDate(p.added)}</div>` +
+    `<h3>Albums</h3><div class="v">${albumChips}</div>`;
+}
+$("lbimg").addEventListener("load", () => {
+  if ($("lbinfo").classList.contains("open")) renderInfo();
+});
+
+// Slideshow.
+function stopSlideshow() {
+  clearInterval(slideTimer);
+  slideTimer = null;
+  $("lightbox").classList.remove("slideshow");
+  $("lbplay").innerHTML = "&#9654; Slideshow";
+}
+$("lbplay").onclick = () => {
+  if (slideTimer) { stopSlideshow(); return; }
+  $("lightbox").classList.add("slideshow");
+  $("lbplay").innerHTML = "&#10074;&#10074; Stop";
+  slideTimer = setInterval(() => {
+    // Skip videos; wrap at the end.
+    let next = cur;
+    for (let hop = 0; hop < visible.length; hop++) {
+      next = (next + 1) % visible.length;
+      if (!isVideo(visible[next])) break;
+    }
+    show(next);
+  }, 4000);
+};
+
+// Zoom & pan (images only).
+const stage = $("lbstage");
+stage.addEventListener("wheel", e => {
+  if (cur < 0 || isVideo(visible[cur])) return;
+  e.preventDefault();
+  const rect = stage.getBoundingClientRect();
+  const cx = e.clientX - rect.left - rect.width / 2;
+  const cy = e.clientY - rect.top - rect.height / 2;
+  const ns = Math.min(8, Math.max(1, zoom.s * Math.exp(-e.deltaY * 0.0022)));
+  const k = ns / zoom.s;
+  zoom.x = cx - k * (cx - zoom.x);
+  zoom.y = cy - k * (cy - zoom.y);
+  zoom.s = ns;
+  if (zoom.s === 1) { zoom.x = 0; zoom.y = 0; }
+  applyZoom();
+}, { passive: false });
+
+stage.addEventListener("dblclick", e => {
+  if (cur < 0 || isVideo(visible[cur]) || e.target.closest("#lbinfo,.nav")) return;
+  const rect = stage.getBoundingClientRect();
+  const cx = e.clientX - rect.left - rect.width / 2;
+  const cy = e.clientY - rect.top - rect.height / 2;
+  if (zoom.s > 1) resetZoom();
+  else {
+    const k = 2.5;
+    zoom = { s: k, x: cx - k * cx, y: cy - k * cy };
+    applyZoom();
+  }
+});
+
+let panning = null;
+$("lbimg").addEventListener("pointerdown", e => {
+  if (zoom.s <= 1) return;
+  panning = { px: e.clientX, py: e.clientY, ox: zoom.x, oy: zoom.y };
+  $("lbimg").setPointerCapture(e.pointerId);
+});
+$("lbimg").addEventListener("pointermove", e => {
+  if (!panning) return;
+  zoom.x = panning.ox + (e.clientX - panning.px);
+  zoom.y = panning.oy + (e.clientY - panning.py);
+  applyZoom();
+});
+$("lbimg").addEventListener("pointerup", () => { panning = null; });
+
+// ----------------------------------------------------------------- import ---
+
+listen("import-progress", e => { if (importing) progressToast("Importing")(e); });
+listen("export-progress", progressToast("Exporting"));
+listen("backup-progress", progressToast("Backing up"));
+listen("scan-progress", progressToast("Scanning"));
+
+async function importPaths(paths) {
+  if (!paths || !paths.length) return;
+  if (importing) { toast("Already importing — hang on"); return; }
+  importing = true;
+  toast("Preparing import…");
+  try {
+    const r = await invoke("import_photos", { paths });
+    let msg = r.imported
+      ? `Imported ${r.imported.toLocaleString()} item${r.imported === 1 ? "" : "s"}`
+      : "No new media found";
+    if (r.skipped) msg += ` · ${r.skipped.toLocaleString()} duplicate${r.skipped === 1 ? "" : "s"} skipped`;
+    toast(msg);
+    await loadGrid();
+  } catch (err) {
+    toast("Import failed: " + err);
+  } finally {
+    importing = false;
+  }
+}
+
+$("importbtn").onclick = e => {
+  e.stopPropagation();
+  $("importmenu").classList.toggle("open");
+};
+$("impphotos").onclick = async () => {
+  $("importmenu").classList.remove("open");
+  const sel = await open({
+    multiple: true,
+    filters: [{ name: "Photos & videos",
+      extensions: ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif",
+                   "heic", "heif", "mp4", "mov", "m4v"] }]
+  });
+  if (sel) await importPaths(Array.isArray(sel) ? sel : [sel]);
+};
+$("impfolder").onclick = async () => {
+  $("importmenu").classList.remove("open");
+  const sel = await open({ directory: true, multiple: true });
+  if (sel) await importPaths(Array.isArray(sel) ? sel : [sel]);
+};
+
+listen("tauri://drag-enter", () => {
+  if ($("gallery").style.display !== "none") $("drophint").classList.add("active");
+});
+listen("tauri://drag-leave", () => $("drophint").classList.remove("active"));
+listen("tauri://drag-drop", async e => {
+  $("drophint").classList.remove("active");
+  if ($("gallery").style.display !== "none") await importPaths(e.payload.paths);
+});
+
+listen("inbox-imported", async e => {
+  toast(`Saved ${e.payload.count} item${e.payload.count === 1 ? "" : "s"} from Inbox`);
+  if ($("gallery").style.display !== "none" && !importing) await loadGrid();
+});
+
+// ---------------------------------------------------------------- settings ---
+
+function fillSettings() {
+  if (!settings) return;
+  $("autolocksel").value = String(settings.auto_lock_secs);
+  $("optsleep").checked = settings.lock_on_sleep;
+  $("optprotect").checked = settings.screen_protect;
+  $("optdedupe").checked = settings.skip_duplicates;
+  $("opttouchid").checked = settings.touch_id;
+}
+
+async function pushSettings() {
+  settings = {
+    auto_lock_secs: parseInt($("autolocksel").value, 10),
+    lock_on_sleep: $("optsleep").checked,
+    screen_protect: $("optprotect").checked,
+    skip_duplicates: $("optdedupe").checked,
+    touch_id: settings?.touch_id ?? false,
+  };
+  await invoke("set_settings", { settings }).catch(err => toast("" + err));
+}
+
+$("settingsbtn").onclick = async () => {
+  settings = await invoke("get_settings").catch(() => settings);
+  fillSettings();
+  const bio = await invoke("touchid_available").catch(() => false);
+  $("touchidrow").style.display = bio ? "flex" : "none";
+  $("touchidhint").textContent = "Unlock the vault with your fingerprint";
+  refreshRecoveryStatus();
+  $("cpw0").value = ""; $("cpw1").value = ""; $("cpw2").value = "";
+  $("settings").classList.add("open");
+};
+$("setclose").onclick = () => $("settings").classList.remove("open");
+
+for (const id of ["autolocksel", "optsleep", "optprotect", "optdedupe"])
+  $(id).addEventListener("change", pushSettings);
+
+$("opttouchid").addEventListener("change", async e => {
+  const on = e.target.checked;
+  try {
+    if (on) {
+      await invoke("touchid_enable");
+      toast("Touch ID unlock enabled");
+    } else {
+      await invoke("touchid_disable");
+      toast("Touch ID unlock disabled");
+    }
+    settings = await invoke("get_settings");
+  } catch (err) {
+    e.target.checked = !on;
+    toast("" + err);
+  }
+});
+
+async function refreshRecoveryStatus() {
+  const info = await invoke("lock_screen_info").catch(() => null);
+  const has = !!info?.has_recovery;
+  $("rkhint").textContent = has
+    ? "Set up — can unlock the vault if you forget your password"
+    : "Not set — a forgotten password means the photos are gone";
+  $("rkoff").style.display = has ? "" : "none";
+  $("rkgen").textContent = has ? "Regenerate…" : "Generate…";
+}
+
+$("rkgen").onclick = async () => {
+  try {
+    showRecoveryKey(await invoke("recovery_generate"), false);
+  } catch (err) { toast("" + err); }
+};
+$("rkoff").onclick = async () => {
+  const ok = await ask("Disable the recovery key?\nThe old key stops working immediately.",
+    { title: "Disable recovery key", kind: "warning", okLabel: "Disable", cancelLabel: "Cancel" });
+  if (!ok) return;
+  await invoke("recovery_disable").catch(err => toast("" + err));
+  refreshRecoveryStatus();
+};
+
+$("pwform").addEventListener("submit", async e => {
+  e.preventDefault();
+  if ($("cpw1").value !== $("cpw2").value) { toast("New passwords don't match."); return; }
+  try {
+    await invoke("change_password", {
+      currentPassword: $("cpw0").value,
+      newPassword: $("cpw1").value,
+    });
+    $("cpw0").value = ""; $("cpw1").value = ""; $("cpw2").value = "";
+    toast("Password changed");
+  } catch (err) { toast("" + err); }
+});
+
+$("backupbtn").onclick = async () => {
+  const dest = await save({
+    defaultPath: `PhotoVault-backup-${new Date().toISOString().slice(0, 10)}.zip`,
+    filters: [{ name: "Zip archive", extensions: ["zip"] }],
+  });
+  if (!dest) return;
+  try {
+    await invoke("backup_vault", { dest });
+    toast("Backup written — everything inside stays encrypted");
+  } catch (err) { toast("Backup failed: " + err); }
+};
+
+$("scanbtn").onclick = async () => {
+  try {
+    const n = await invoke("scan_dates");
+    toast(n ? `Found dates for ${n.toLocaleString()} photo${n === 1 ? "" : "s"}`
+            : "No new dates found");
+    await loadGrid();
+  } catch (err) { toast("" + err); }
+};
+
+$("exportallbtn").onclick = async () => {
+  const dest = await open({ directory: true, title: "Export all photos to…" });
+  if (!dest) return;
+  try {
+    const n = await invoke("export_photos", { dest, ids: null });
+    toast(`Exported ${n.toLocaleString()} item${n === 1 ? "" : "s"}`);
+  } catch (err) { toast("Export failed: " + err); }
+};
+
+async function emptyTrash() {
+  const count = photos.filter(p => p.deleted).length;
+  if (!count) { toast("Recently Deleted is empty"); return; }
+  const ok = await ask(`Permanently delete ${count} item${count === 1 ? "" : "s"} in Recently Deleted?`,
+    { title: "Empty Trash", kind: "warning", okLabel: "Delete Forever", cancelLabel: "Cancel" });
+  if (!ok) return;
+  await invoke("empty_trash").catch(err => toast("" + err));
+  await loadGrid();
+}
+$("emptytrashbtn").onclick = emptyTrash;
+$("emptytrashbtn2").onclick = emptyTrash;
+
+$("clearbtn").onclick = async () => {
+  const count = photos.length;
+  if (!count) return;
+  const ok = await ask(
+    `Delete ALL ${count.toLocaleString()} items permanently?\nThis cannot be undone.`,
+    { title: "Delete all photos", kind: "warning", okLabel: "Delete All", cancelLabel: "Cancel" });
+  if (!ok) return;
+  try {
+    const n = await invoke("clear_vault");
+    $("settings").classList.remove("open");
+    toast(`Deleted ${n.toLocaleString()} items`);
+    await loadGrid();
+  } catch (err) { toast("" + err); }
+};
+
+// ---------------------------------------------------------------- keyboard ---
+
+function gridColumns() {
+  if (layout !== "grid") return 1;
+  const cols = getComputedStyle($("grid")).gridTemplateColumns;
+  return cols === "none" ? 1 : cols.split(" ").length;
+}
+
+function setFocus(i) {
+  if (!visible.length) return;
+  focusIdx = Math.max(0, Math.min(visible.length - 1, i));
+  document.querySelectorAll("#grid .focused").forEach(el => el.classList.remove("focused"));
+  const el = document.querySelectorAll("#grid [data-id]")[focusIdx];
+  if (el) {
+    el.classList.add("focused");
+    el.scrollIntoView({ block: "nearest" });
+  }
+}
+
+document.addEventListener("keydown", e => {
+  const inInput = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "");
+  const modalOpen = document.querySelector(".modal.open");
+
+  if ($("lightbox").classList.contains("open")) {
+    if (inInput) return;
+    if (e.key === "Escape") { slideTimer ? stopSlideshow() : closeLightbox(); }
+    else if (e.key === "ArrowRight") show(cur + 1);
+    else if (e.key === "ArrowLeft") show(cur - 1);
+    else if (e.key === "f") $("lbfav").click();
+    else if (e.key === "i") $("lbinfobtn").click();
+    else if ((e.key === "Delete" || e.key === "Backspace") && currentView.type !== "trash")
+      $("lbdel").click();
+    return;
+  }
+  if (modalOpen) {
+    if (e.key === "Escape") {
+      // Close only the topmost modal, and route through handlers that carry
+      // follow-up state (recovery-key confirmation, setup offer, prompt).
+      const top = [...document.querySelectorAll(".modal.open")].pop();
+      if (top.id === "promptmodal") $("pmcancel").click();
+      else if (top.id === "keymodal") $("rkdone").click();
+      else if (top.id === "offermodal") $("offerno").click();
+      else top.classList.remove("open");
+    }
+    return;
+  }
+  if ($("gallery").style.display === "none") return;
+  if (inInput) {
+    if (e.key === "Escape" && document.activeElement === $("search")) {
+      $("search").value = "";
+      query = "";
+      renderPhotos();
+      $("search").blur();
+    }
+    return;
+  }
+
+  if (e.key === "/") { e.preventDefault(); $("search").focus(); return; }
+  if ((e.metaKey || e.ctrlKey) && e.key === "a") {
+    e.preventDefault();
+    visible.forEach(p => selection.add(p.id));
+    updateSelectionUI();
+    return;
+  }
+  if (e.key === "Escape") {
+    if (selection.size || selectMode) clearSelection();
+    return;
+  }
+  if (e.key === "Enter" && focusIdx >= 0) { show(focusIdx); return; }
+  if (e.key === " " && focusIdx >= 0) {
+    e.preventDefault();
+    toggleSelect(visible[focusIdx].id);
+    return;
+  }
+  if (e.key === "Delete" || e.key === "Backspace") {
+    const ids = selection.size ? selectedIds()
+      : focusIdx >= 0 ? [visible[focusIdx].id] : [];
+    if (!ids.length) return;
+    e.preventDefault();
+    if (currentView.type === "trash") {
+      ids.forEach(id => selection.add(id));
+      updateSelectionUI();
+      $("selpurge").click(); // confirms before purging
+    } else {
+      trashIds(ids);
+    }
+    return;
+  }
+  const cols = gridColumns();
+  const moves = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: cols, ArrowUp: -cols };
+  if (e.key in moves) {
+    e.preventDefault();
+    setFocus(focusIdx < 0 ? 0 : focusIdx + moves[e.key]);
+  }
+});
+
+// ------------------------------------------------------------ housekeeping ---
+
+$("lockbtn").onclick = async () => {
+  await invoke("lock");
+  await refresh();
+};
+
+// Backend timer/system event fired: wipe the UI and show login immediately.
+listen("vault-locked", async () => {
+  closeLightbox();
+  await refresh();
+  toast("Vault locked");
+});
+
+// Count mouse/keyboard activity in the window as "in use" (throttled) so
+// the vault doesn't lock mid-browse just because no command ran.
+let lastTouch = 0;
+for (const ev of ["mousemove", "mousedown", "keydown", "wheel"]) {
+  window.addEventListener(ev, () => {
+    const now = Date.now();
+    if (now - lastTouch < 30000) return;
+    lastTouch = now;
+    if ($("gallery").style.display !== "none") invoke("touch_activity").catch(() => {});
+  }, { passive: true });
+}
+
+// Re-check lock state when the window regains focus (idle auto-lock).
+window.addEventListener("focus", async () => {
+  if ($("gallery").style.display !== "none"
+      && (await invoke("vault_status")) !== "unlocked") await refresh();
+});
+
+refresh();
+</script>
+</body>
+</html>
