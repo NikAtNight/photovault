@@ -40,8 +40,8 @@
            border-bottom: 1px solid #22222a; position: sticky; top: 0;
            background: #101014ee; backdrop-filter: blur(8px); z-index: 5;
            flex-wrap: wrap; }
-  header h1 { font-size: 16px; white-space: nowrap; }
   header .count { color: #9a9aa6; font-size: 13px; white-space: nowrap; }
+  header .sel { margin-left: auto; }
   #search { flex: 1; min-width: 120px; max-width: 300px; padding: 7px 12px;
       background: #1a1a21; border: 1px solid #33333e; border-radius: 8px;
       color: #e8e8ec; font-size: 13px; outline: none;
@@ -56,6 +56,9 @@
   .btn.danger { color: #ff8080; border-color: #4a2a2a; }
   .btn.danger:hover { background: #2a1a1a; }
   .btn.on { border-color: #6c6cf5; color: #b0b0ff; }
+  .btn.ghost { border-color: transparent; background: transparent;
+      font-size: 16px; padding: 6px 9px; line-height: 1; color: #c8c8d2; }
+  .btn.ghost:hover { background: #1e1e26; color: #fff; }
   select.sel { padding: 7px 10px; border-radius: 8px; border: 1px solid #33333e;
       background: #1a1a21; color: #e8e8ec; font-size: 13px; outline: none; }
 
@@ -86,6 +89,8 @@
       letter-spacing: .06em; }
   #sidebar .head button { margin-left: auto; background: none; border: 0;
       color: #8a8af5; font-size: 15px; cursor: pointer; line-height: 1; }
+  #sidebar .brand { display: flex; align-items: center; gap: 8px;
+      font-weight: 600; font-size: 15px; padding: 6px 10px 14px; }
   #sidebar .item .tools { display: none; margin-left: auto; gap: 2px; }
   #sidebar .item:hover .tools { display: flex; }
   #sidebar .item:hover .n { display: none; }
@@ -99,7 +104,10 @@
       border-radius: 10px; color: #d9a0a0; font-size: 13px; }
   #trashbanner button { margin-left: auto; }
 
-  table.list { width: 100%; border-collapse: collapse; font-size: 13px; }
+  /* fixed layout + colgroup: header and body columns always line up, and
+     long names truncate instead of stretching the column */
+  table.list { width: 100%; border-collapse: separate; border-spacing: 0;
+      table-layout: fixed; font-size: 13px; }
   .list th { text-align: left; color: #9a9aa6; font-weight: 500;
       padding: 8px 12px; border-bottom: 1px solid #22222a; cursor: pointer;
       position: sticky; top: var(--hh, 57px); background: #101014; z-index: 2;
@@ -251,22 +259,21 @@
 
 <div id="gallery" style="display:none">
   <header>
-    <h1>&#128274; PhotoVault</h1>
     <input id="search" type="search" placeholder="Search photos&hellip;"
            autocomplete="off" spellcheck="false">
-    <span class="count" id="count"></span>
+    <span class="count" id="count" style="display:none"></span>
     <select class="sel" id="sortsel" title="Sort">
-      <option value="added-desc">Newest first</option>
-      <option value="added-asc">Oldest first</option>
+      <option value="added-desc">Newest</option>
+      <option value="added-asc">Oldest</option>
       <option value="taken-desc">Date taken &#8595;</option>
       <option value="taken-asc">Date taken &#8593;</option>
       <option value="name-asc">Name A&ndash;Z</option>
       <option value="name-desc">Name Z&ndash;A</option>
-      <option value="size-desc">Largest first</option>
-      <option value="size-asc">Smallest first</option>
+      <option value="size-desc">Largest</option>
+      <option value="size-asc">Smallest</option>
       <option value="type-asc">Type</option>
     </select>
-    <button class="btn" id="viewbtn">List</button>
+    <button class="btn ghost" id="viewbtn"></button>
     <button class="btn" id="selectbtn">Select</button>
     <div class="menuwrap">
       <button class="btn primary" id="importbtn">+ Import</button>
@@ -275,7 +282,7 @@
         <button id="impfolder">Folder&hellip;</button>
       </div>
     </div>
-    <button class="btn" id="settingsbtn" title="Settings">&#9881;</button>
+    <button class="btn ghost" id="settingsbtn" title="Settings">&#9881;</button>
     <button class="btn" id="lockbtn">Lock</button>
   </header>
   <div class="main">
@@ -311,14 +318,14 @@
   <div class="bar">
     <span id="lbname" title="Click to rename"></span>
     <input id="lbrename" spellcheck="false">
-    <button class="btn" id="lbfav">&#9825;</button>
-    <button class="btn" id="lbinfobtn">Info</button>
-    <button class="btn" id="lbplay" title="Slideshow">&#9654; Slideshow</button>
+    <button class="btn ghost" id="lbfav" title="Favorite (f)">&#9825;</button>
+    <button class="btn ghost" id="lbinfobtn" title="Info (i)">&#9432;</button>
+    <button class="btn ghost" id="lbplay" title="Slideshow">&#9654;</button>
     <button class="btn" id="lbexport">Export</button>
     <button class="btn" id="lbrestore" style="display:none">Restore</button>
     <button class="btn danger" id="lbdel">Delete</button>
     <button class="btn danger" id="lbpurge" style="display:none">Delete Forever</button>
-    <button class="btn" id="lbclose">Close &nbsp;esc</button>
+    <button class="btn ghost" id="lbclose" title="Close (esc)">&#10005;</button>
   </div>
   <div class="stage" id="lbstage">
     <img id="lbimg" alt="">
@@ -760,6 +767,7 @@ function renderSidebar() {
   };
   const active = t => (currentView.type === t ? " active" : "");
   let html =
+    `<div class="brand">&#128274; PhotoVault</div>` +
     `<div class="item${active("all")}" data-v="all">&#128444; All Photos<span class="n">${counts.all}</span></div>` +
     `<div class="item${active("favorites")}" data-v="favorites">&#9825; Favorites<span class="n">${counts.favorites}</span></div>` +
     `<div class="item${active("videos")}" data-v="videos">&#9654; Videos<span class="n">${counts.videos}</span></div>` +
@@ -844,19 +852,20 @@ function renderPhotos() {
   visible = computeVisible();
   focusIdx = Math.min(focusIdx, visible.length - 1);
   const total = photos.filter(p => !p.deleted).length;
-  $("count").textContent = visible.length === total
-    ? `${total.toLocaleString()} item${total === 1 ? "" : "s"}`
-    : `${visible.length.toLocaleString()} of ${total.toLocaleString()}`;
+  // The sidebar already shows per-view counts — only surface a count in the
+  // header when a search is narrowing things down.
+  $("count").style.display = query ? "inline" : "none";
+  $("count").textContent = `${visible.length.toLocaleString()} of ${total.toLocaleString()}`;
   $("empty").style.display = visible.length ? "none" : "block";
   $("empty").innerHTML = emptyMessage();
   $("trashbanner").style.display =
     currentView.type === "trash" && visible.length ? "flex" : "none";
-  $("viewbtn").textContent = layout === "grid" ? "List" : "Grid";
+  $("viewbtn").innerHTML = layout === "grid" ? "&#9776;" : "&#9638;";
+  $("viewbtn").title = layout === "grid" ? "Switch to list view" : "Switch to grid view";
   const sel = $("sortsel");
   sel.value = `${sortKey}-${sortDir}`;
   if (sel.selectedIndex === -1) sel.value = "added-desc";
-  document.documentElement.style.setProperty("--hh",
-    document.querySelector("header").offsetHeight + "px");
+  setHeaderHeight();
   const grid = $("grid");
   observer.disconnect();
   grid.innerHTML = "";
@@ -882,12 +891,18 @@ function renderPhotos() {
     const arrow = k => sortKey === k ? (sortDir === "asc" ? " ▲" : " ▼") : "";
     const table = document.createElement("table");
     table.className = "list";
-    table.innerHTML = `<thead><tr><th style="width:58px"></th>
-      <th data-k="name">Name${arrow("name")}</th>
-      <th data-k="taken" style="width:170px">Taken${arrow("taken")}</th>
-      <th data-k="added" style="width:170px">Added${arrow("added")}</th>
-      <th data-k="size" style="width:90px">Size${arrow("size")}</th>
-      <th data-k="type" style="width:70px">Type${arrow("type")}</th></tr></thead>`;
+    // colgroup + table-layout:fixed pins every column so the sticky header
+    // row can never drift out of alignment with the body.
+    table.innerHTML =
+      `<colgroup><col style="width:66px"><col>` +
+      `<col style="width:150px"><col style="width:150px">` +
+      `<col style="width:86px"><col style="width:64px"></colgroup>` +
+      `<thead><tr><th></th>` +
+      `<th data-k="name">Name${arrow("name")}</th>` +
+      `<th data-k="taken">Taken${arrow("taken")}</th>` +
+      `<th data-k="added">Added${arrow("added")}</th>` +
+      `<th data-k="size">Size${arrow("size")}</th>` +
+      `<th data-k="type">Type${arrow("type")}</th></tr></thead>`;
     table.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => setSort(th.dataset.k));
     const tbody = document.createElement("tbody");
     for (const [i, p] of visible.entries()) {
@@ -1258,12 +1273,12 @@ function stopSlideshow() {
   clearInterval(slideTimer);
   slideTimer = null;
   $("lightbox").classList.remove("slideshow");
-  $("lbplay").innerHTML = "&#9654; Slideshow";
+  $("lbplay").innerHTML = "&#9654;";
 }
 $("lbplay").onclick = () => {
   if (slideTimer) { stopSlideshow(); return; }
   $("lightbox").classList.add("slideshow");
-  $("lbplay").innerHTML = "&#10074;&#10074; Stop";
+  $("lbplay").innerHTML = "&#10074;&#10074;";
   slideTimer = setInterval(() => {
     // Skip videos; wrap at the end.
     let next = cur;
@@ -1654,6 +1669,14 @@ window.addEventListener("focus", async () => {
   if ($("gallery").style.display !== "none"
       && (await invoke("vault_status")) !== "unlocked") await refresh();
 });
+
+// Sticky offsets (list header, sidebar) track the real header height — it
+// changes when the flex header wraps at narrow widths.
+function setHeaderHeight() {
+  const h = document.querySelector("header");
+  if (h) document.documentElement.style.setProperty("--hh", h.offsetHeight + "px");
+}
+new ResizeObserver(setHeaderHeight).observe(document.querySelector("header"));
 
 refresh();
 </script>
