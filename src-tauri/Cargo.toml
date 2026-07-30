@@ -3,6 +3,7 @@ name = "photovault"
 version = "0.2.0"
 description = "Password-locked encrypted photo & video library"
 edition = "2021"
+license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
