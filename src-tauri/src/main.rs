@@ -15,7 +15,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -79,6 +79,10 @@ struct Vault {
     // Last decrypted full object, so video seeking doesn't re-decrypt the
     // whole file per range request. Cleared on lock.
     media_cache: Option<(String, Arc<Vec<u8>>)>,
+    // Decrypted thumbnails (LRU, capped) so scrolling back through the grid
+    // doesn't re-read and re-decrypt from disk. Cleared on lock.
+    thumb_cache: HashMap<String, Arc<Vec<u8>>>,
+    thumb_order: VecDeque<String>,
 }
 
 impl Vault {
@@ -121,6 +125,8 @@ fn wipe_vault(vault: &mut Vault) {
     vault.photos.clear();
     vault.albums.clear();
     vault.media_cache = None;
+    vault.thumb_cache.clear();
+    vault.thumb_order.clear();
 }
 
 type VaultState<'a> = State<'a, Mutex<Vault>>;
@@ -176,6 +182,8 @@ struct PhotoInfo {
     deleted: Option<f64>, // in trash since this timestamp
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     albums: Vec<String>, // album ids
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,6 +214,8 @@ struct PhotoEntry {
     favorite: bool,
     deleted: Option<f64>,
     albums: Vec<String>,
+    tags: Vec<String>,
+    hash: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
 }
@@ -630,7 +640,20 @@ fn prepare_media(path: &std::path::Path, data: &[u8]) -> Option<MediaMeta> {
 }
 
 /// Expand files and folders into a flat list of media-file paths.
-/// Folders are walked recursively; hidden entries are skipped.
+/// Folders are walked recursively; hidden entries are skipped. Files are
+/// ordered by when they appeared on disk so their vault "added" timestamps
+/// preserve download/copy order instead of `read_dir`'s unspecified order.
+fn source_order_time(path: &std::path::Path) -> SystemTime {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.created().or_else(|_| metadata.modified()).ok())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+fn sort_paths_by_source_order(paths: &mut [PathBuf]) {
+    paths.sort_by_cached_key(|path| (source_order_time(path), path.clone()));
+}
+
 fn collect_files(paths: &[String]) -> Vec<PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else { return };
@@ -659,6 +682,7 @@ fn collect_files(paths: &[String]) -> Vec<PathBuf> {
     // parent folder) — import each actual file once per import action.
     let mut unique = HashSet::new();
     out.retain(|p| unique.insert(p.clone()));
+    sort_paths_by_source_order(&mut out);
     out
 }
 
@@ -695,17 +719,11 @@ async fn lock_screen_info(state: VaultState<'_>) -> Result<LockScreenInfo, Strin
         )
     };
     let has_recovery = read_meta(&dir).map(|m| m.recovery.is_some()).unwrap_or(false);
-    let inbox_pending = fs::read_dir(&inbox)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| {
-                    let p = e.path();
-                    !is_hidden(&p) && p.is_file() && is_media_path(&p)
-                })
-                .count()
-        })
-        .unwrap_or(0);
+    let inbox_pending = {
+        let mut found = Vec::new();
+        scan_inbox_media(&inbox, 0, &mut found);
+        found.len()
+    };
     Ok(LockScreenInfo {
         has_recovery,
         touch_id: touch_id_setting && native::biometrics_available(),
@@ -1006,6 +1024,8 @@ async fn list_photos(state: VaultState<'_>) -> Result<Vec<PhotoEntry>, String> {
             favorite: p.favorite,
             deleted: p.deleted,
             albums: p.albums.clone(),
+            tags: p.tags.clone(),
+            hash: p.hash.clone(),
             width: p.width,
             height: p.height,
         })
@@ -1126,6 +1146,27 @@ async fn rename_photo(id: String, name: String, state: VaultState<'_>) -> Result
     persist_index(&vault, &key)
 }
 
+/// Trim, drop empties, dedupe case-insensitively keeping the first spelling.
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for t in tags {
+        let t = t.trim().to_string();
+        if !t.is_empty() && seen.insert(t.to_lowercase()) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+#[tauri::command]
+async fn set_tags(id: String, tags: Vec<String>, state: VaultState<'_>) -> Result<(), String> {
+    let mut vault = vlock(&state);
+    let key = vault.active_key().ok_or("locked")?;
+    vault.photos.get_mut(&id).ok_or("not found")?.tags = normalize_tags(tags);
+    persist_index(&vault, &key)
+}
+
 // ----------------------------------------------------------------- import ---
 
 #[derive(Serialize, Clone)]
@@ -1155,10 +1196,19 @@ fn flush_batch(state: &VaultState<'_>, batch: &mut Vec<(String, PhotoInfo)>) -> 
     // Re-check the key: the vault may have been locked mid-import.
     let key = vault.key.ok_or("locked")?;
     vault.last_activity = Instant::now(); // a running import counts as activity
+    let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
     for (id, info) in batch.drain(..) {
         vault.photos.insert(id, info);
     }
-    persist_index(&vault, &key)
+    // Roll back on a failed persist: entries living only in memory would
+    // satisfy later duplicate checks even though nothing reached disk.
+    if let Err(e) = persist_index(&vault, &key) {
+        for id in &ids {
+            vault.photos.remove(id);
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Encrypt one file into the vault objects dir. `hashes` carries the content
@@ -1206,6 +1256,7 @@ fn import_one(
             favorite: false,
             deleted: None,
             albums: Vec::new(),
+            tags: Vec::new(),
             width: media.width,
             height: media.height,
         },
@@ -1538,6 +1589,70 @@ async fn backup_vault(
     Ok(count)
 }
 
+/// A backup zip entry we're willing to extract: one of the known top-level
+/// files, or objects/<id>[.t] — no absolute paths, no traversal, no nesting.
+fn safe_backup_entry(name: &str) -> bool {
+    if name.contains("..") || name.starts_with('/') || name.contains('\\') {
+        return false;
+    }
+    matches!(name, "meta.json" | "settings.json" | "index.enc" | "index.bak")
+        || name == "objects/"
+        || name
+            .strip_prefix("objects/")
+            .map_or(false, |f| !f.is_empty() && !f.contains('/'))
+}
+
+/// Restore a vault from a backup zip (created by backup_vault). Only allowed
+/// while locked; the existing vault directory is moved aside, never deleted.
+#[tauri::command]
+async fn restore_backup(src: String, state: VaultState<'_>) -> Result<(), String> {
+    let dir = {
+        let mut vault = vlock(&state);
+        if vault.active_key().is_some() {
+            return Err("Lock the vault before restoring a backup.".into());
+        }
+        vault.dir.clone()
+    };
+    let file = fs::File::open(&src).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|_| "That file isn't a readable zip archive.".to_string())?;
+    let mut has_meta = false;
+    for i in 0..zip.len() {
+        let name = zip.by_index(i).map_err(|e| e.to_string())?.name().to_string();
+        if !safe_backup_entry(&name) {
+            return Err("The backup contains unexpected files — not restoring.".into());
+        }
+        has_meta |= name == "meta.json";
+    }
+    if !has_meta {
+        return Err("That zip doesn't look like a PhotoVault backup (no meta.json).".into());
+    }
+    // Keep the current vault as a sibling directory rather than deleting it.
+    if dir.join("meta.json").exists() {
+        let aside = dir.with_file_name(format!("vault.pre-restore-{}", now_secs() as u64));
+        fs::rename(&dir, &aside).map_err(|e| e.to_string())?;
+    }
+    fs::create_dir_all(dir.join("objects")).map_err(|e| e.to_string())?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let mut out = fs::File::create(dir.join(&name)).map_err(|e| e.to_string())?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+    }
+    // Adopt the restored settings (auto-lock, dedupe, …) immediately.
+    let mut vault = vlock(&state);
+    if let Some(s) = fs::read(vault.settings_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
+    {
+        vault.settings = s;
+    }
+    Ok(())
+}
+
 /// Backfill capture dates for photos imported before this feature existed.
 #[tauri::command]
 async fn scan_dates(app: tauri::AppHandle, state: VaultState<'_>) -> Result<usize, String> {
@@ -1662,6 +1777,22 @@ fn media_response(
     }
 }
 
+const THUMB_CACHE_CAP: usize = 1500; // ~60 MB at ~40 KB per thumb
+
+fn cache_thumb(vault: &mut Vault, id: &str, data: Arc<Vec<u8>>) {
+    if vault.thumb_cache.insert(id.to_string(), data).is_none() {
+        vault.thumb_order.push_back(id.to_string());
+    }
+    while vault.thumb_cache.len() > THUMB_CACHE_CAP {
+        match vault.thumb_order.pop_front() {
+            Some(old) => {
+                vault.thumb_cache.remove(&old);
+            }
+            None => break,
+        }
+    }
+}
+
 fn media_error(status: u16) -> tauri::http::Response<Vec<u8>> {
     tauri::http::Response::builder()
         .status(status)
@@ -1698,15 +1829,23 @@ fn serve_media(
         } else {
             id.to_string()
         };
-        let cached = (!thumb)
-            .then(|| {
-                vault
-                    .media_cache
-                    .as_ref()
-                    .filter(|(cid, _)| cid == id)
-                    .map(|(_, d)| d.clone())
-            })
-            .flatten();
+        let cached = if thumb {
+            let hit = vault.thumb_cache.get(id).cloned();
+            if hit.is_some() {
+                // Touch for LRU: move to the back of the eviction order.
+                if let Some(pos) = vault.thumb_order.iter().position(|x| x == id) {
+                    let e = vault.thumb_order.remove(pos).unwrap();
+                    vault.thumb_order.push_back(e);
+                }
+            }
+            hit
+        } else {
+            vault
+                .media_cache
+                .as_ref()
+                .filter(|(cid, _)| cid == id)
+                .map(|(_, d)| d.clone())
+        };
         (key, vault.objects_dir().join(file), name, cached)
     };
     let data: Arc<Vec<u8>> = match cached {
@@ -1719,9 +1858,11 @@ fn serve_media(
                 return media_error(500);
             };
             let plain = Arc::new(plain);
-            if !thumb && is_video_name(&name) {
-                let mut vault = vlock(&state);
-                if vault.key.is_some() {
+            let mut vault = vlock(&state);
+            if vault.key.is_some() {
+                if thumb {
+                    cache_thumb(&mut vault, id, plain.clone());
+                } else if is_video_name(&name) {
                     vault.media_cache = Some((id.to_string(), plain.clone()));
                 }
             }
@@ -1743,30 +1884,197 @@ struct InboxImported {
     count: usize,
 }
 
-/// Watch the inbox folder: media saved there is encrypted into the vault and
-/// the plaintext originals removed. A file is only picked up once its
-/// size/mtime is unchanged across two scans (i.e. the download finished),
-/// and only while the vault is unlocked.
+type FileSig = (u64, SystemTime);
+
+/// Media files anywhere under the inbox — folders dropped in are walked
+/// recursively. Hidden entries and symlinks are skipped; depth is bounded so
+/// a pathological tree can't wedge the watcher.
+fn scan_inbox_media(dir: &std::path::Path, depth: u32, out: &mut Vec<(PathBuf, FileSig)>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if is_hidden(&path) || ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            scan_inbox_media(&path, depth + 1, out);
+        } else if ft.is_file() && is_media_path(&path) {
+            if let Ok(md) = entry.metadata() {
+                out.push((path, (md.len(), md.modified().unwrap_or(UNIX_EPOCH))));
+            }
+        }
+    }
+    if depth == 0 {
+        out.sort_by_cached_key(|(path, _)| (source_order_time(path), path.clone()));
+    }
+}
+
+/// After importing a folder's media, remove the folders it leaves empty,
+/// walking up to (but never into or past) the inbox root. `remove_dir` only
+/// deletes empty directories, so anything still holding files survives —
+/// except a lone Finder .DS_Store, which shouldn't keep a folder alive.
+fn prune_empty_dirs(inbox: &std::path::Path, from: &std::path::Path) {
+    let mut dir = from.to_path_buf();
+    while dir != *inbox && dir.starts_with(inbox) {
+        let ds = dir.join(".DS_Store");
+        let only_ds = ds.exists()
+            && fs::read_dir(&dir).map_or(false, |mut entries| {
+                entries.all(|e| e.map_or(false, |e| e.file_name() == ".DS_Store"))
+            });
+        if only_ds {
+            let _ = fs::remove_file(&ds);
+        }
+        if fs::remove_dir(&dir).is_err() {
+            return; // not empty (or already gone) — parents aren't empty either
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => return,
+        }
+    }
+}
+
+/// Import inbox files and remove only plaintext originals whose encrypted
+/// object and index entry are safely persisted. Failed/undecodable files stay
+/// in the inbox so the user can inspect or replace them.
+fn run_inbox_import(
+    files: Vec<PathBuf>,
+    key: [u8; 32],
+    objects: PathBuf,
+    mut hashes: HashSet<String>,
+    skip_dups: bool,
+    inbox: &std::path::Path,
+    app: &tauri::AppHandle,
+    state: &VaultState<'_>,
+) -> Result<ImportResult, String> {
+    let total = files.len();
+    let mut batch: Vec<(String, PhotoInfo)> = Vec::new();
+    let mut pending: Vec<PathBuf> = Vec::new();
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+
+    let commit = |batch: &mut Vec<(String, PhotoInfo)>,
+                  pending: &mut Vec<PathBuf>,
+                  imported: &mut usize|
+     -> Result<(), String> {
+        flush_batch(state, batch)?;
+        *imported += pending.len();
+        for path in pending.drain(..) {
+            let _ = fs::remove_file(&path);
+            if let Some(parent) = path.parent() {
+                prune_empty_dirs(inbox, parent);
+            }
+        }
+        Ok(())
+    };
+
+    for (i, path) in files.iter().enumerate() {
+        if i % 25 == 0 {
+            let _ = app.emit("import-progress", ImportProgress { done: i, total });
+        }
+        match import_one(&key, &objects, path, &mut hashes, skip_dups) {
+            ImportOutcome::Added(id, info) => {
+                batch.push((id, info));
+                pending.push(path.clone());
+                if batch.len() >= 20 {
+                    commit(&mut batch, &mut pending, &mut imported)?;
+                }
+            }
+            ImportOutcome::Skipped => {
+                skipped += 1;
+                let _ = fs::remove_file(path);
+                if let Some(parent) = path.parent() {
+                    prune_empty_dirs(inbox, parent);
+                }
+            }
+            ImportOutcome::Failed => {}
+        }
+    }
+    commit(&mut batch, &mut pending, &mut imported)?;
+    let _ = app.emit("import-progress", ImportProgress { done: total, total });
+    Ok(ImportResult { imported, skipped })
+}
+
+/// Manually process media that accumulated in PhotoVault Inbox while the
+/// vault was locked or the app was not running. Two scans avoid reading a
+/// file while Finder or a browser is still copying it.
+#[tauri::command]
+async fn process_inbox(
+    app: tauri::AppHandle,
+    state: VaultState<'_>,
+) -> Result<ImportResult, String> {
+    let inbox = vlock(&state).inbox.clone();
+    let mut first = Vec::new();
+    scan_inbox_media(&inbox, 0, &mut first);
+    let first: HashMap<PathBuf, FileSig> = first.into_iter().collect();
+    std::thread::sleep(Duration::from_millis(350));
+    let mut second = Vec::new();
+    scan_inbox_media(&inbox, 0, &mut second);
+    let files: Vec<PathBuf> = second
+        .into_iter()
+        .filter(|(path, sig)| first.get(path) == Some(sig))
+        .map(|(path, _)| path)
+        .collect();
+
+    let (key, objects, hashes, skip_dups) = {
+        let mut vault = vlock(&state);
+        let key = vault.active_key().ok_or("locked")?;
+        if vault.importing {
+            return Err("An import is already running.".into());
+        }
+        vault.importing = true;
+        (
+            key,
+            vault.objects_dir(),
+            existing_hashes(&vault),
+            vault.settings.skip_duplicates,
+        )
+    };
+    let result = run_inbox_import(
+        files,
+        key,
+        objects,
+        hashes,
+        skip_dups,
+        &inbox,
+        &app,
+        &state,
+    );
+    vlock(&state).importing = false;
+    result
+}
+
+/// Watch the inbox folder: media saved there — loose files or entire dropped
+/// folders — is encrypted into the vault and the plaintext originals removed.
+/// A file is only picked up once its size/mtime is unchanged across two scans
+/// (i.e. the download/copy finished), and only while the vault is unlocked.
+///
+/// An original is deleted only after the index entry referencing its
+/// encrypted copy has been persisted — a failure (lock mid-batch, disk full)
+/// leaves the plaintext in place for the next cycle, and the orphaned object
+/// files are swept by cleanup_orphans. Folders emptied by an import are
+/// removed too.
 fn inbox_watcher(app: tauri::AppHandle) {
-    let mut prev: HashMap<PathBuf, (u64, SystemTime)> = HashMap::new();
-    let mut failed: HashSet<PathBuf> = HashSet::new();
+    type Sig = FileSig;
+    let mut prev: HashMap<PathBuf, Sig> = HashMap::new();
+    // Undecodable files, keyed with size+mtime so a same-named replacement
+    // still gets retried.
+    let mut failed: HashSet<(PathBuf, Sig)> = HashSet::new();
     loop {
         std::thread::sleep(Duration::from_secs(2));
         let state: State<Mutex<Vault>> = app.state();
         let inbox = vlock(&state).inbox.clone();
-        let mut ready: Vec<PathBuf> = Vec::new();
-        let mut cur: HashMap<PathBuf, (u64, SystemTime)> = HashMap::new();
-        let Ok(entries) = fs::read_dir(&inbox) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if is_hidden(&path) || !path.is_file() || !is_media_path(&path) || failed.contains(&path)
-            {
-                continue;
-            }
-            let Ok(md) = entry.metadata() else { continue };
-            let sig = (md.len(), md.modified().unwrap_or(UNIX_EPOCH));
-            if prev.get(&path) == Some(&sig) {
-                ready.push(path.clone());
+        let mut ready: Vec<(PathBuf, Sig)> = Vec::new();
+        let mut cur: HashMap<PathBuf, Sig> = HashMap::new();
+        let mut found: Vec<(PathBuf, Sig)> = Vec::new();
+        scan_inbox_media(&inbox, 0, &mut found);
+        for (path, sig) in found {
+            if !failed.contains(&(path.clone(), sig)) && prev.get(&path) == Some(&sig) {
+                ready.push((path.clone(), sig));
             }
             cur.insert(path, sig);
         }
@@ -1789,28 +2097,54 @@ fn inbox_watcher(app: tauri::AppHandle) {
             )
         };
         let mut batch: Vec<(String, PhotoInfo)> = Vec::new();
+        let mut pending: Vec<PathBuf> = Vec::new(); // originals awaiting a flush
         let mut imported = 0usize;
-        for path in &ready {
+        let mut aborted = false;
+        for (path, sig) in &ready {
             match import_one(&key, &objects, path, &mut hashes, skip_dups) {
                 ImportOutcome::Added(id, info) => {
                     batch.push((id, info));
-                    imported += 1;
-                    let _ = fs::remove_file(path);
+                    pending.push(path.clone());
+                    if batch.len() >= 20 {
+                        if flush_batch(&state, &mut batch).is_ok() {
+                            imported += pending.len();
+                            for p in pending.drain(..) {
+                                let _ = fs::remove_file(&p);
+                                if let Some(parent) = p.parent() {
+                                    prune_empty_dirs(&inbox, parent);
+                                }
+                            }
+                        } else {
+                            aborted = true;
+                            break;
+                        }
+                    }
                 }
-                // An identical copy is already in the vault — the plaintext
-                // can go.
+                // An identical copy is already persisted in the vault — the
+                // plaintext can go.
                 ImportOutcome::Skipped => {
                     let _ = fs::remove_file(path);
+                    if let Some(parent) = path.parent() {
+                        prune_empty_dirs(&inbox, parent);
+                    }
                 }
                 // Unreadable/undecodable: leave the file, stop retrying it.
                 ImportOutcome::Failed => {
-                    failed.insert(path.clone());
+                    failed.insert((path.clone(), *sig));
                 }
             }
         }
-        let flush = flush_batch(&state, &mut batch);
+        if !aborted && flush_batch(&state, &mut batch).is_ok() {
+            imported += pending.len();
+            for p in pending.drain(..) {
+                let _ = fs::remove_file(&p);
+                if let Some(parent) = p.parent() {
+                    prune_empty_dirs(&inbox, parent);
+                }
+            }
+        }
         vlock(&state).importing = false;
-        if flush.is_ok() && imported > 0 {
+        if imported > 0 {
             let _ = app.emit("inbox-imported", InboxImported { count: imported });
         }
     }
@@ -1819,15 +2153,28 @@ fn inbox_watcher(app: tauri::AppHandle) {
 // ------------------------------------------------------------------ main ---
 
 fn main() {
+    // Fixed worker pool for media serving: a fast scroll fires dozens of
+    // thumbnail requests at once, and one OS thread per request (the old
+    // scheme) let bursts starve the CPU. Six workers bound the concurrency.
+    type MediaJob = (
+        tauri::AppHandle,
+        tauri::http::Request<Vec<u8>>,
+        tauri::UriSchemeResponder,
+    );
+    let (media_tx, media_rx) = std::sync::mpsc::channel::<MediaJob>();
+    let media_rx = Arc::new(Mutex::new(media_rx));
+    for _ in 0..6 {
+        let rx = media_rx.clone();
+        std::thread::spawn(move || loop {
+            let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            let Ok((app, request, responder)) = job else { return };
+            responder.respond(serve_media(&app, &request));
+        });
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .register_asynchronous_uri_scheme_protocol("pvmedia", |ctx, request, responder| {
-            let app = ctx.app_handle().clone();
-            // Decrypt off the protocol thread so many concurrent thumbnail
-            // loads never queue behind each other.
-            std::thread::spawn(move || {
-                responder.respond(serve_media(&app, &request));
-            });
+        .register_asynchronous_uri_scheme_protocol("pvmedia", move |ctx, request, responder| {
+            let _ = media_tx.send((ctx.app_handle().clone(), request, responder));
         })
         .setup(|app| {
             let dir = app.path().app_data_dir()?.join("vault");
@@ -1849,6 +2196,8 @@ fn main() {
                 importing: false,
                 settings,
                 media_cache: None,
+                thumb_cache: HashMap::new(),
+                thumb_order: VecDeque::new(),
             }));
             if let Some(window) = app.get_webview_window("main") {
                 if screen_protect {
@@ -1896,8 +2245,10 @@ fn main() {
             album_delete,
             albums_assign,
             set_favorite,
+            set_tags,
             rename_photo,
             import_photos,
+            process_inbox,
             cleanup_orphans,
             trash_photos,
             restore_photos,
@@ -1907,6 +2258,7 @@ fn main() {
             export_photo,
             export_photos,
             backup_vault,
+            restore_backup,
             scan_dates
         ])
         .run(tauri::generate_context!())
@@ -2029,6 +2381,131 @@ mod tests {
         fs::write(dir.join("a (1).jpg"), b"x").unwrap();
         assert_eq!(unique_dest(&dir, "a.jpg"), dir.join("a (2).jpg"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collected_files_follow_source_creation_order() {
+        let root = std::env::temp_dir().join(format!("pv-order-{}", random_id()));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("z-first.jpg");
+        let second = root.join("a-second.jpg");
+        fs::write(&first, b"first").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&second, b"second").unwrap();
+
+        let found = collect_files(&[root.to_string_lossy().into_owned()]);
+        assert_eq!(found, [first, second]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn source_order_has_a_deterministic_path_tiebreaker() {
+        let mut paths = vec![
+            PathBuf::from("z-missing.jpg"),
+            PathBuf::from("a-missing.jpg"),
+        ];
+        sort_paths_by_source_order(&mut paths);
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("a-missing.jpg"),
+                PathBuf::from("z-missing.jpg")
+            ]
+        );
+    }
+
+    #[test]
+    fn backup_entry_validation() {
+        for ok in ["meta.json", "settings.json", "index.enc", "index.bak",
+                   "objects/", "objects/aabb01", "objects/aabb01.t"] {
+            assert!(safe_backup_entry(ok), "{ok} should be accepted");
+        }
+        for bad in ["../evil", "/etc/passwd", "objects/../meta.json",
+                    "objects/a/b", "meta.json.bak", "objects", "a\\b", ""] {
+            assert!(!safe_backup_entry(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn tag_normalization() {
+        assert_eq!(
+            normalize_tags(vec![
+                "  Beach ".into(), "beach".into(), "".into(), "  ".into(),
+                "Sunset".into(), "BEACH".into(), "sunset ".into(), "Dog".into(),
+            ]),
+            vec!["Beach".to_string(), "Sunset".to_string(), "Dog".to_string()]
+        );
+        assert!(normalize_tags(vec![]).is_empty());
+    }
+
+    #[test]
+    fn thumb_cache_evicts_lru() {
+        let mut vault = Vault {
+            dir: PathBuf::new(),
+            inbox: PathBuf::new(),
+            key: None,
+            photos: HashMap::new(),
+            albums: HashMap::new(),
+            last_activity: Instant::now(),
+            importing: false,
+            settings: Settings::default(),
+            media_cache: None,
+            thumb_cache: HashMap::new(),
+            thumb_order: VecDeque::new(),
+        };
+        for i in 0..THUMB_CACHE_CAP + 10 {
+            cache_thumb(&mut vault, &format!("id{i}"), Arc::new(vec![0u8]));
+        }
+        assert_eq!(vault.thumb_cache.len(), THUMB_CACHE_CAP);
+        assert!(!vault.thumb_cache.contains_key("id0"));
+        assert!(vault.thumb_cache.contains_key(&format!("id{}", THUMB_CACHE_CAP + 9)));
+        // Re-inserting an existing id must not duplicate its order entry.
+        cache_thumb(&mut vault, &format!("id{}", THUMB_CACHE_CAP + 9), Arc::new(vec![1u8]));
+        assert_eq!(vault.thumb_order.len(), vault.thumb_cache.len());
+    }
+
+    #[test]
+    fn inbox_scan_recurses_and_skips_hidden() {
+        let root = std::env::temp_dir().join(format!("pv-inbox-{}", random_id()));
+        fs::create_dir_all(root.join("Trip/day2")).unwrap();
+        fs::create_dir_all(root.join(".hiddendir")).unwrap();
+        fs::write(root.join("top.jpg"), b"x").unwrap();
+        fs::write(root.join("notes.txt"), b"x").unwrap();
+        fs::write(root.join("Trip/a.png"), b"x").unwrap();
+        fs::write(root.join("Trip/day2/b.mov"), b"x").unwrap();
+        fs::write(root.join("Trip/.DS_Store"), b"x").unwrap();
+        fs::write(root.join(".hiddendir/c.jpg"), b"x").unwrap();
+        let mut found = Vec::new();
+        scan_inbox_media(&root, 0, &mut found);
+        let mut names: Vec<String> = found
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.png", "b.mov", "top.jpg"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_removes_emptied_dirs_but_not_inbox_or_occupied() {
+        let root = std::env::temp_dir().join(format!("pv-prune-{}", random_id()));
+        fs::create_dir_all(root.join("Trip/day2")).unwrap();
+        fs::write(root.join("Trip/.DS_Store"), b"x").unwrap();
+        // Empty leaf + .DS_Store-only parent: both go; the inbox root stays.
+        prune_empty_dirs(&root, &root.join("Trip/day2"));
+        assert!(!root.join("Trip").exists());
+        assert!(root.exists());
+        // A dir still holding a real file survives, .DS_Store or not.
+        fs::create_dir_all(root.join("Keep")).unwrap();
+        fs::write(root.join("Keep/left.jpg"), b"x").unwrap();
+        fs::write(root.join("Keep/.DS_Store"), b"x").unwrap();
+        prune_empty_dirs(&root, &root.join("Keep"));
+        assert!(root.join("Keep/left.jpg").exists());
+        assert!(root.join("Keep/.DS_Store").exists());
+        // Never climbs above the inbox root.
+        prune_empty_dirs(&root.join("nope"), &root);
+        assert!(root.exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -5,6 +5,9 @@
 <title>PhotoVault</title>
 <style>
   * { box-sizing: border-box; margin: 0; }
+  /* In-app images must never start a native macOS drag — that drag session
+     triggers the import drop overlay (see the dragstart handler). */
+  img { -webkit-user-drag: none; }
   body { font: 15px/1.5 -apple-system, system-ui, sans-serif;
          background: #101014; color: #e8e8ec; min-height: 100vh;
          user-select: none; -webkit-user-select: none; overflow-x: hidden; }
@@ -38,7 +41,7 @@
 
   header { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
            border-bottom: 1px solid #22222a; position: sticky; top: 0;
-           background: #101014ee; backdrop-filter: blur(8px); z-index: 5;
+           background: #101014f8; z-index: 5;
            flex-wrap: wrap; }
   header .count { color: #9a9aa6; font-size: 13px; white-space: nowrap; }
   header .sel { margin-left: auto; }
@@ -127,7 +130,11 @@
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
           gap: 6px; padding: 6px; }
   .grid .ph { aspect-ratio: 1; overflow: hidden; border-radius: 6px;
-              background: #1a1a21; cursor: pointer; position: relative; }
+              background: #1a1a21; cursor: pointer; position: relative;
+              content-visibility: auto; contain-intrinsic-size: auto 180px; }
+  .grid .ghead { grid-column: 1 / -1; padding: 14px 6px 2px; font-size: 15px;
+              font-weight: 600; }
+  .render-sentinel { grid-column: 1 / -1; height: 1px; }
   .grid img { width: 100%; height: 100%; object-fit: cover; display: block;
               transition: transform .15s; }
   .grid .ph:hover img { transform: scale(1.03); }
@@ -184,6 +191,19 @@
   #lightbox .nav:hover { background: #000000b0; }
   #lightbox.slideshow .nav { display: none; }
   #lbprev { left: 8px; } #lbnext { right: 8px; }
+  #lbzoom { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 2px; align-items: center; background: #000000a0;
+      border-radius: 9px; padding: 3px 6px; z-index: 5;
+      opacity: 0; transition: opacity .15s; }
+  #lbstage:hover #lbzoom { opacity: 1; }
+  #lbstage.isvideo #lbzoom, #lightbox.slideshow #lbzoom { display: none; }
+  #lbzoom button { background: none; border: 0; color: #fff; font-size: 15px;
+      width: 26px; height: 24px; cursor: pointer; border-radius: 6px; line-height: 1; }
+  #lbzoom button:hover { background: #ffffff22; }
+  #lbzoom #lbzfit { width: auto; padding: 0 8px; font-size: 12px; }
+  #lbzpct { color: #ccc; font-size: 12px; min-width: 44px; text-align: center; }
+  #lbstage.zoomed img { cursor: grab; }
+  #lbstage.panning img { cursor: grabbing; }
   #lbinfo { position: absolute; top: 0; right: 0; bottom: 0; width: 270px;
       background: #16161cf5; border-left: 1px solid #2a2a33; padding: 18px;
       display: none; overflow-y: auto; z-index: 6; }
@@ -194,6 +214,7 @@
   #lbinfo div.v { font-size: 13.5px; word-break: break-all; }
   #lbinfo .chip { display: inline-block; background: #24243a; border-radius: 6px;
       padding: 2px 8px; font-size: 12px; margin: 2px 4px 2px 0; }
+  #lbinfo input.ti { margin: 8px 0 0; padding: 6px 8px; font-size: 12.5px; }
 
   .modal { position: fixed; inset: 0; display: none; place-items: center;
       background: #000000a8; z-index: 200; }
@@ -255,13 +276,15 @@
       Unlock with Touch&nbsp;ID</button>
     <div><button class="linky" id="forgotbtn" type="button" style="display:none">
       Forgot password?</button></div>
+    <div><button class="linky" id="restorebtn" type="button" style="display:none">
+      Restore from backup&hellip;</button></div>
     <div class="note" id="inboxnote" style="display:none"></div>
   </form>
 </div>
 
 <div id="gallery" style="display:none">
   <header>
-    <input id="search" type="search" placeholder="Search photos&hellip;"
+    <input id="search" type="search" placeholder="Search photos &amp; tags&hellip;"
            autocomplete="off" spellcheck="false">
     <span class="count" id="count" style="display:none"></span>
     <select class="sel" id="sortsel" title="Sort">
@@ -284,6 +307,8 @@
         <button id="impfolder">Folder&hellip;</button>
       </div>
     </div>
+    <button class="btn" id="inboxbtn" title="Encrypt media waiting in PhotoVault Inbox">
+      Process Inbox</button>
     <button class="btn ghost" id="settingsbtn" title="Settings">&#9881;</button>
     <button class="btn" id="lockbtn">Lock</button>
   </header>
@@ -334,6 +359,12 @@
     <video id="lbvid" controls playsinline style="display:none"></video>
     <button class="nav" id="lbprev">&#8249;</button>
     <button class="nav" id="lbnext">&#8250;</button>
+    <div id="lbzoom">
+      <button id="lbzout" title="Zoom out (&minus;)">&minus;</button>
+      <span id="lbzpct">100%</span>
+      <button id="lbzin" title="Zoom in (+)">+</button>
+      <button id="lbzfit" title="Actual size / fit (0)">Fit</button>
+    </div>
     <div id="lbinfo"></div>
   </div>
 </div>
@@ -433,6 +464,23 @@
       <button class="btn" type="button" id="pmcancel">Cancel</button>
     </div>
   </form>
+</div>
+
+<div class="modal" id="helpmodal">
+  <div class="box">
+    <button class="close" id="helpclose">&#10005;</button>
+    <h2>Keyboard shortcuts</h2>
+    <div class="setrow"><span class="grow">Search</span><span class="hint">/</span></div>
+    <div class="setrow"><span class="grow">Select all</span><span class="hint">&#8984;A</span></div>
+    <div class="setrow"><span class="grow">Select focused photo</span><span class="hint">Space</span></div>
+    <div class="setrow"><span class="grow">Open focused photo</span><span class="hint">Enter</span></div>
+    <div class="setrow"><span class="grow">Move focus / previous &amp; next photo</span><span class="hint">Arrows</span></div>
+    <div class="setrow"><span class="grow">Move to Recently Deleted</span><span class="hint">Delete</span></div>
+    <div class="setrow"><span class="grow">Favorite &middot; Info (in viewer)</span><span class="hint">F &middot; I</span></div>
+    <div class="setrow"><span class="grow">Zoom in / out / reset (in viewer)</span><span class="hint">+ / &minus; / 0</span></div>
+    <div class="setrow"><span class="grow">Close viewer &middot; clear selection</span><span class="hint">Esc</span></div>
+    <div class="setrow"><span class="grow">This help</span><span class="hint">?</span></div>
+  </div>
 </div>
 
 <div id="toast"><span id="toastmsg"></span><button id="toastact" style="display:none"></button></div>
@@ -545,6 +593,7 @@ function renderAuth() {
   $("touchidbtn").style.display = "none";
   $("forgotbtn").style.display = "none";
   $("inboxnote").style.display = "none";
+  $("restorebtn").style.display = mode === "recovery" ? "none" : "inline";
   $("rk").style.display = mode === "recovery" ? "block" : "none";
   $("pw2").style.display = mode === "login" ? "none" : "block";
   $("meter").style.display = mode === "login" ? "none" : "flex";
@@ -593,6 +642,23 @@ $("touchidbtn").onclick = async () => {
     await refresh();
   } catch (err) {
     if (!String(err).includes("cancelled")) $("autherr").textContent = err;
+  }
+};
+
+$("restorebtn").onclick = async () => {
+  const ok = await ask(
+    "Restore a vault from a backup zip?\nThe current vault (if any) is set aside, not deleted.",
+    { title: "Restore from backup", kind: "warning", okLabel: "Restore", cancelLabel: "Cancel" });
+  if (!ok) return;
+  const src = await open({ filters: [{ name: "Zip archive", extensions: ["zip"] }] });
+  if (!src) return;
+  $("autherr").textContent = "";
+  try {
+    await invoke("restore_backup", { src });
+    toast("Backup restored — unlock with the password it was created with");
+    await refresh();
+  } catch (err) {
+    $("autherr").textContent = err;
   }
 };
 
@@ -693,21 +759,42 @@ $("pmcancel").onclick = () => {
 
 // -------------------------------------------------------------- thumbnails ---
 
-// Thumbnails are windowed: loaded when a tile nears the viewport and
-// released once it scrolls far away, so memory stays flat even with tens of
-// thousands of photos.
-const observer = new IntersectionObserver(entries => {
+// Thumbnails are windowed with hysteresis: loaded when a tile nears the
+// viewport (1200px) but only released once it scrolls far past that (4000px),
+// so small back-and-forth scrolls never refetch a row while memory still
+// stays flat even with tens of thousands of photos.
+const loadObserver = new IntersectionObserver(entries => {
   for (const entry of entries) {
-    const el = entry.target;
-    const img = el.querySelector("img");
-    if (!img) continue;
-    if (entry.isIntersecting) {
-      if (!img.getAttribute("src")) img.src = mediaURL(el.dataset.id, true);
-    } else if (img.getAttribute("src")) {
-      img.removeAttribute("src");
-    }
+    if (!entry.isIntersecting) continue;
+    const img = entry.target.querySelector("img");
+    if (img && !img.getAttribute("src"))
+      img.src = mediaURL(entry.target.dataset.id, true);
   }
 }, { rootMargin: "1200px" });
+const unloadObserver = new IntersectionObserver(entries => {
+  for (const entry of entries) {
+    if (entry.isIntersecting) continue;
+    const img = entry.target.querySelector("img");
+    if (img && img.getAttribute("src")) img.removeAttribute("src");
+  }
+}, { rootMargin: "4000px" });
+function observeTile(el) {
+  loadObserver.observe(el);
+  unloadObserver.observe(el);
+}
+const tileById = new Map(); // id → tile element, for O(1) per-tile updates
+
+// Stage DOM growth. Building thousands of tiles and attaching two observers
+// to every one made initial renders expensive even though images were lazy-
+// loaded; more rows are appended shortly before scrolling reaches them.
+const RENDER_BATCH = 240;
+let renderedCount = 0;
+let renderSentinel = null;
+let renderBody = null;
+let lastDateGroup = null;
+const renderObserver = new IntersectionObserver(entries => {
+  if (entries.some(e => e.isIntersecting)) renderMore();
+}, { rootMargin: "1400px" });
 
 // -------------------------------------------------------------- rendering ---
 
@@ -741,8 +828,19 @@ function computeVisible() {
   if (currentView.type === "favorites") v = v.filter(p => p.favorite);
   if (currentView.type === "videos") v = v.filter(isVideo);
   if (currentView.type === "album") v = v.filter(p => p.albums.includes(currentView.album));
-  if (query) v = v.filter(p => p.name.toLowerCase().includes(query));
-  sortPhotos(v);
+  if (currentView.type === "duplicates") {
+    const seen = new Map();
+    for (const p of v) if (p.hash) seen.set(p.hash, (seen.get(p.hash) || 0) + 1);
+    v = v.filter(p => p.hash && seen.get(p.hash) > 1);
+  }
+  if (query) v = v.filter(p => p.name.toLowerCase().includes(query)
+    || (p.tags || []).some(t => t.toLowerCase().includes(query)));
+  if (currentView.type === "duplicates") {
+    // Identical copies stay adjacent regardless of the chosen sort.
+    v.sort((a, b) => a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : a.added - b.added);
+  } else {
+    sortPhotos(v);
+  }
   return v;
 }
 
@@ -751,20 +849,28 @@ function emptyMessage() {
   switch (currentView.type) {
     case "favorites": return "No favorites yet.<br>Open a photo and tap ♡, or select photos and favorite them.";
     case "videos": return "No videos yet.<br>Import .mp4, .mov or .m4v files.";
+    case "duplicates": return "No exact duplicates.<br>Photos with identical file contents show up here.";
     case "trash": return "Recently Deleted is empty.";
     case "album": return "This album is empty.<br>Select photos and use Album ▾ to add them.";
     default: return "Your vault is empty.<br>Drag photos here or click Import.<br><br>" +
-      "Tip: save downloads into the <b>PhotoVault Inbox</b> folder in your home " +
-      "directory — they're pulled into the vault automatically.";
+      "Tip: drop files or whole folders into the <b>PhotoVault Inbox</b> folder in " +
+      "your home directory — they're pulled into the vault automatically.";
   }
 }
 
 function renderSidebar() {
   const live = photos.filter(p => !p.deleted);
+  const byHash = new Map();
+  const albumCounts = new Map();
+  for (const p of live) {
+    if (p.hash) byHash.set(p.hash, (byHash.get(p.hash) || 0) + 1);
+    for (const id of p.albums) albumCounts.set(id, (albumCounts.get(id) || 0) + 1);
+  }
   const counts = {
     all: live.length,
     favorites: live.filter(p => p.favorite).length,
     videos: live.filter(isVideo).length,
+    duplicates: live.filter(p => p.hash && byHash.get(p.hash) > 1).length,
     trash: photos.length - live.length,
   };
   const active = t => (currentView.type === t ? " active" : "");
@@ -773,10 +879,12 @@ function renderSidebar() {
     `<div class="item${active("all")}" data-v="all">&#128444; All Photos<span class="n">${counts.all}</span></div>` +
     `<div class="item${active("favorites")}" data-v="favorites">&#9825; Favorites<span class="n">${counts.favorites}</span></div>` +
     `<div class="item${active("videos")}" data-v="videos">&#9654; Videos<span class="n">${counts.videos}</span></div>` +
+    `<div class="item${active("duplicates")}" data-v="duplicates">&#10697; Duplicates` +
+      (counts.duplicates ? `<span class="n">${counts.duplicates}</span>` : "") + `</div>` +
     `<div class="item${active("trash")}" data-v="trash">&#128465; Recently Deleted<span class="n">${counts.trash}</span></div>` +
     `<div class="head">Albums<button id="albadd" title="New album">+</button></div>`;
   for (const a of albums) {
-    const n = live.filter(p => p.albums.includes(a.id)).length;
+    const n = albumCounts.get(a.id) || 0;
     const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
     html += `<div class="item${act}" data-v="album" data-id="${a.id}">&#128193; ` +
       `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.name)}</span>` +
@@ -869,25 +977,19 @@ function renderPhotos() {
   if (sel.selectedIndex === -1) sel.value = "added-desc";
   setHeaderHeight();
   const grid = $("grid");
-  observer.disconnect();
+  loadObserver.disconnect();
+  unloadObserver.disconnect();
+  renderObserver.disconnect();
+  tileById.clear();
   grid.innerHTML = "";
+  renderedCount = 0;
+  renderBody = null;
+  lastDateGroup = null;
   if (layout === "grid") {
     grid.className = "grid";
-    const frag = document.createDocumentFragment();
-    for (const [i, p] of visible.entries()) {
-      const div = document.createElement("div");
-      div.className = "ph" + (selection.has(p.id) ? " sel" : "")
-        + (i === focusIdx ? " focused" : "");
-      div.dataset.id = p.id;
-      div.appendChild(document.createElement("img"));
-      if (isVideo(p)) div.insertAdjacentHTML("beforeend", `<div class="vbadge">&#9654;</div>`);
-      if (p.favorite) div.insertAdjacentHTML("beforeend", `<div class="fbadge">&#9829;</div>`);
-      div.insertAdjacentHTML("beforeend", `<div class="check">&#10003;</div>`);
-      div.onclick = e => tileClick(i, e);
-      frag.appendChild(div);
-      observer.observe(div);
-    }
-    grid.appendChild(frag);
+    renderSentinel = document.createElement("div");
+    renderSentinel.className = "render-sentinel";
+    grid.appendChild(renderSentinel);
   } else {
     grid.className = "";
     const arrow = k => sortKey === k ? (sortDir === "asc" ? " ▲" : " ▼") : "";
@@ -906,26 +1008,73 @@ function renderPhotos() {
       `<th data-k="size">Size${arrow("size")}</th>` +
       `<th data-k="type">Type${arrow("type")}</th></tr></thead>`;
     table.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => setSort(th.dataset.k));
-    const tbody = document.createElement("tbody");
-    for (const [i, p] of visible.entries()) {
-      const tr = document.createElement("tr");
-      tr.className = "row" + (selection.has(p.id) ? " sel" : "")
+    renderBody = document.createElement("tbody");
+    table.appendChild(renderBody);
+    grid.appendChild(table);
+    renderSentinel = document.createElement("div");
+    renderSentinel.className = "render-sentinel";
+    grid.appendChild(renderSentinel);
+  }
+  renderMore();
+  if (renderedCount < visible.length) renderObserver.observe(renderSentinel);
+  // Tiles were just built with their .sel classes in place.
+  renderedSelection = new Set(selection);
+  updateSelectionUI();
+}
+
+function renderMore(throughIndex = -1) {
+  if (!renderSentinel || renderedCount >= visible.length) return;
+  const end = Math.min(visible.length,
+    Math.max(renderedCount + RENDER_BATCH, throughIndex + 1));
+  const frag = document.createDocumentFragment();
+  const dateGroups = layout === "grid"
+    && (sortKey === "added" || sortKey === "taken")
+    && currentView.type !== "duplicates";
+
+  for (let i = renderedCount; i < end; i++) {
+    const p = visible[i];
+    if (dateGroups) {
+      const t = sortKey === "taken" ? p.taken ?? p.added : p.added;
+      const group = new Date(t * 1000).toLocaleString([], { month: "long", year: "numeric" });
+      if (group !== lastDateGroup) {
+        lastDateGroup = group;
+        const h = document.createElement("div");
+        h.className = "ghead";
+        h.textContent = group;
+        frag.appendChild(h);
+      }
+    }
+
+    let tile;
+    if (layout === "grid") {
+      tile = document.createElement("div");
+      tile.className = "ph" + (selection.has(p.id) ? " sel" : "")
         + (i === focusIdx ? " focused" : "");
-      tr.dataset.id = p.id;
-      tr.innerHTML = `<td><img class="mini"></td>` +
+      tile.innerHTML = `<img decoding="async">` +
+        (isVideo(p) ? `<div class="vbadge">&#9654;</div>` : "") +
+        (p.favorite ? `<div class="fbadge">&#9829;</div>` : "") +
+        `<div class="check">&#10003;</div>`;
+    } else {
+      tile = document.createElement("tr");
+      tile.className = "row" + (selection.has(p.id) ? " sel" : "")
+        + (i === focusIdx ? " focused" : "");
+      tile.innerHTML = `<td><img class="mini" decoding="async"></td>` +
         `<td>${p.favorite ? '<span class="fav">&#9829;</span>' : ""}${esc(p.name)}</td>` +
         `<td class="dim">${fmtDate(p.taken)}</td>` +
         `<td class="dim">${fmtDate(p.added)}</td>` +
         `<td class="dim">${fmtSize(p.size)}</td>` +
         `<td class="dim">${ext(p.name)}</td>`;
-      tr.onclick = e => tileClick(i, e);
-      tbody.appendChild(tr);
-      observer.observe(tr);
     }
-    table.appendChild(tbody);
-    grid.appendChild(table);
+    tile.dataset.id = p.id;
+    tile.onclick = e => tileClick(i, e);
+    frag.appendChild(tile);
+    tileById.set(p.id, tile);
+    observeTile(tile);
   }
-  updateSelectionUI();
+  renderedCount = end;
+  if (layout === "grid") $("grid").insertBefore(frag, renderSentinel);
+  else renderBody.appendChild(frag);
+  if (renderedCount >= visible.length) renderObserver.unobserve(renderSentinel);
 }
 
 async function loadGrid() {
@@ -949,9 +1098,13 @@ $("viewbtn").onclick = () => {
   renderPhotos();
 };
 
+let searchTimer = null;
 $("search").addEventListener("input", e => {
-  query = e.target.value.trim().toLowerCase();
-  renderPhotos();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    query = e.target.value.trim().toLowerCase();
+    renderPhotos();
+  }, 150);
 });
 
 // -------------------------------------------------------------- selection ---
@@ -970,11 +1123,36 @@ function clearSelection() {
 
 function selectedIds() { return [...selection]; }
 
+// Favorite is never a sort key, so tiles don't move — patch state and the
+// affected tiles instead of a full reload. Favorites view is the exception:
+// membership itself changed there.
+function applyFavorite(ids, favorite) {
+  const idset = new Set(ids);
+  for (const p of photos) {
+    if (!idset.has(p.id)) continue;
+    p.favorite = favorite;
+    const el = tileById.get(p.id);
+    if (!el || currentView.type === "favorites") continue;
+    if (el.tagName === "TR") {
+      el.children[1].innerHTML =
+        (favorite ? '<span class="fav">&#9829;</span>' : "") + esc(p.name);
+    } else {
+      el.querySelector(".fbadge")?.remove();
+      if (favorite) el.insertAdjacentHTML("beforeend", `<div class="fbadge">&#9829;</div>`);
+    }
+  }
+  if (currentView.type === "favorites") renderPhotos();
+  renderSidebar();
+}
+
+let renderedSelection = new Set(); // ids whose tiles currently carry .sel
 function updateSelectionUI() {
-  // Keep tile classes in sync without a full re-render.
-  document.querySelectorAll("#grid [data-id]").forEach(el => {
-    el.classList.toggle("sel", selection.has(el.dataset.id));
-  });
+  // Diff against what's rendered instead of walking every tile.
+  for (const id of renderedSelection)
+    if (!selection.has(id)) tileById.get(id)?.classList.remove("sel");
+  for (const id of selection)
+    if (!renderedSelection.has(id)) tileById.get(id)?.classList.add("sel");
+  renderedSelection = new Set(selection);
   const n = selection.size;
   $("selbar").classList.toggle("open", n > 0);
   if (n > 0) {
@@ -1000,9 +1178,12 @@ $("selectbtn").onclick = () => {
 $("selclear").onclick = clearSelection;
 
 $("selfav").onclick = async () => {
-  await invoke("set_favorite", { ids: selectedIds(), favorite: $("selfav")._fav })
-    .catch(err => toast("" + err));
-  await loadGrid();
+  const ids = selectedIds(), fav = $("selfav")._fav;
+  try {
+    await invoke("set_favorite", { ids, favorite: fav });
+    applyFavorite(ids, fav);
+    updateSelectionUI(); // flip the Favorite/Unfavorite label
+  } catch (err) { toast("" + err); }
 };
 
 $("seldelete").onclick = () => trashIds(selectedIds());
@@ -1087,13 +1268,56 @@ document.addEventListener("click", e => {
 
 // ---------------------------------------------------------------- lightbox ---
 
+const stage = $("lbstage");
 let zoom = { s: 1, x: 0, y: 0 };
 let slideTimer = null;
+let panning = null;
+let panRaf = 0;
 
+// Rendered size of the contained image at scale 1, plus the stage box. Pan
+// clamping must use this, not the element box — the <img> fills the whole
+// stage, letterboxing included.
+function fittedSize() {
+  const r = stage.getBoundingClientRect();
+  const iw = $("lbimg").naturalWidth, ih = $("lbimg").naturalHeight;
+  if (!iw || !ih) return { w: r.width, h: r.height, sw: r.width, sh: r.height };
+  const f = Math.min(r.width / iw, r.height / ih);
+  return { w: iw * f, h: ih * f, sw: r.width, sh: r.height };
+}
+// Scale at which one image pixel maps to one CSS pixel.
+function nativeScale() {
+  const f = fittedSize();
+  return $("lbimg").naturalWidth ? $("lbimg").naturalWidth / f.w : 1;
+}
+function clampPan() {
+  const f = fittedSize();
+  const mx = Math.max(0, (f.w * zoom.s - f.sw) / 2);
+  const my = Math.max(0, (f.h * zoom.s - f.sh) / 2);
+  zoom.x = Math.max(-mx, Math.min(mx, zoom.x));
+  zoom.y = Math.max(-my, Math.min(my, zoom.y));
+}
 function applyZoom() {
+  clampPan();
   $("lbimg").style.transform = `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})`;
+  $("lbzpct").textContent = Math.round(zoom.s * 100) + "%";
+  stage.classList.toggle("zoomed", zoom.s > 1);
+}
+// cx/cy: the point to keep fixed while scaling, relative to the stage centre.
+function setZoom(ns, cx = 0, cy = 0) {
+  ns = Math.max(1, Math.min(Math.max(8, nativeScale() * 4), ns));
+  const k = ns / zoom.s;
+  zoom.x = cx - k * (cx - zoom.x);
+  zoom.y = cy - k * (cy - zoom.y);
+  zoom.s = ns;
+  if (ns === 1) { zoom.x = 0; zoom.y = 0; }
+  applyZoom();
+}
+function endPan() {
+  panning = null;
+  stage.classList.remove("panning");
 }
 function resetZoom() {
+  endPan();
   zoom = { s: 1, x: 0, y: 0 };
   applyZoom();
 }
@@ -1105,6 +1329,7 @@ async function show(i) {
   const video = isVideo(p);
   cancelRename();
   resetZoom();
+  stage.classList.toggle("isvideo", video);
   $("lbname").textContent = p.name;
   $("lbfav").innerHTML = p.favorite ? "&#9829;" : "&#9825;";
   const inTrash = currentView.type === "trash";
@@ -1150,8 +1375,9 @@ $("lbnext").onclick = () => show(cur + 1);
 $("lbfav").onclick = async () => {
   if (cur < 0) return;
   const p = visible[cur];
-  await invoke("set_favorite", { ids: [p.id], favorite: !p.favorite }).catch(() => {});
-  await loadGrid();
+  const fav = !p.favorite;
+  await invoke("set_favorite", { ids: [p.id], favorite: fav }).catch(() => {});
+  applyFavorite([p.id], fav);
   // The photo may have left the current view (e.g. unfavorited in Favorites).
   const idx = visible.findIndex(x => x.id === p.id);
   if (idx >= 0) {
@@ -1232,11 +1458,19 @@ $("lbrename").addEventListener("keydown", async e => {
   if (!name || name === p.name) return;
   try {
     await invoke("rename_photo", { id: p.id, name });
-    const keep = cur;
     await loadGrid();
-    cur = keep;
-    $("lbname").textContent = name;
-    if ($("lbinfo").classList.contains("open")) renderInfo();
+    // Re-sorting may have moved the photo, or a search filter dropped it —
+    // restore by id, never by index.
+    const idx = visible.findIndex(x => x.id === p.id);
+    if (idx >= 0) {
+      cur = idx;
+      $("lbname").textContent = name;
+      if ($("lbinfo").classList.contains("open")) renderInfo();
+    } else if (visible.length) {
+      show(Math.min(cur, visible.length - 1));
+    } else {
+      closeLightbox();
+    }
   } catch (err) { toast("" + err); }
 });
 $("lbrename").addEventListener("blur", cancelRename);
@@ -1257,6 +1491,9 @@ function renderInfo() {
     .filter(Boolean)
     .map(a => `<span class="chip">${esc(a.name)}</span>`)
     .join("") || "—";
+  const tagChips = (p.tags || [])
+    .map(t => `<span class="chip">${esc(t)}</span>`)
+    .join("") || "—";
   $("lbinfo").innerHTML =
     `<h3>Name</h3><div class="v">${esc(p.name)}</div>` +
     `<h3>Kind</h3><div class="v">${isVideo(p) ? "Video" : "Image"} · ${ext(p.name)}</div>` +
@@ -1264,7 +1501,23 @@ function renderInfo() {
     `<h3>Dimensions</h3><div class="v">${dims}</div>` +
     `<h3>Taken</h3><div class="v">${fmtDate(p.taken)}</div>` +
     `<h3>Added</h3><div class="v">${fmtDate(p.added)}</div>` +
-    `<h3>Albums</h3><div class="v">${albumChips}</div>`;
+    `<h3>Albums</h3><div class="v">${albumChips}</div>` +
+    `<h3>Tags</h3><div class="v">${tagChips}</div>` +
+    `<input type="text" class="ti" id="lbtags" placeholder="tag, another tag — Enter saves" ` +
+    `autocomplete="off" spellcheck="false">`;
+  const ti = $("lbtags");
+  ti.value = (p.tags || []).join(", ");
+  ti.addEventListener("keydown", async e => {
+    e.stopPropagation();
+    if (e.key === "Escape") { ti.blur(); return; }
+    if (e.key !== "Enter") return;
+    const tags = [...new Set(ti.value.split(",").map(s => s.trim()).filter(Boolean))];
+    try {
+      await invoke("set_tags", { id: p.id, tags });
+      p.tags = tags;
+      renderInfo();
+    } catch (err) { toast("" + err); }
+  });
 }
 $("lbimg").addEventListener("load", () => {
   if ($("lbinfo").classList.contains("open")) renderInfo();
@@ -1292,49 +1545,57 @@ $("lbplay").onclick = () => {
   }, 4000);
 };
 
-// Zoom & pan (images only).
-const stage = $("lbstage");
+// Zoom & pan (images only). Wheel and pinch zoom about the cursor; drags pan
+// once zoomed in.
+const stagePoint = e => {
+  const r = stage.getBoundingClientRect();
+  return [e.clientX - r.left - r.width / 2, e.clientY - r.top - r.height / 2];
+};
 stage.addEventListener("wheel", e => {
-  if (cur < 0 || isVideo(visible[cur])) return;
+  if (cur < 0 || isVideo(visible[cur]) || e.target.closest("#lbinfo")) return;
   e.preventDefault();
-  const rect = stage.getBoundingClientRect();
-  const cx = e.clientX - rect.left - rect.width / 2;
-  const cy = e.clientY - rect.top - rect.height / 2;
-  const ns = Math.min(8, Math.max(1, zoom.s * Math.exp(-e.deltaY * 0.0022)));
-  const k = ns / zoom.s;
-  zoom.x = cx - k * (cx - zoom.x);
-  zoom.y = cy - k * (cy - zoom.y);
-  zoom.s = ns;
-  if (zoom.s === 1) { zoom.x = 0; zoom.y = 0; }
-  applyZoom();
+  const d = e.deltaMode === 1 ? e.deltaY * 20 : e.deltaY; // line-scroll mice
+  setZoom(zoom.s * Math.exp(-d * 0.0022), ...stagePoint(e));
 }, { passive: false });
 
+// WKWebView reports trackpad pinches as gesture* events, not ctrl+wheel;
+// preventDefault also stops the webview's page-level magnification.
+let pinchBase = 1;
+stage.addEventListener("gesturestart", e => { e.preventDefault(); pinchBase = zoom.s; });
+stage.addEventListener("gesturechange", e => {
+  e.preventDefault();
+  if (cur < 0 || isVideo(visible[cur])) return;
+  setZoom(pinchBase * e.scale, ...stagePoint(e));
+});
+stage.addEventListener("gestureend", e => e.preventDefault());
+
+// Double-click toggles fit ↔ actual size (small images get 2× so it always acts).
 stage.addEventListener("dblclick", e => {
-  if (cur < 0 || isVideo(visible[cur]) || e.target.closest("#lbinfo,.nav")) return;
-  const rect = stage.getBoundingClientRect();
-  const cx = e.clientX - rect.left - rect.width / 2;
-  const cy = e.clientY - rect.top - rect.height / 2;
-  if (zoom.s > 1) resetZoom();
-  else {
-    const k = 2.5;
-    zoom = { s: k, x: cx - k * cx, y: cy - k * cy };
-    applyZoom();
-  }
+  if (cur < 0 || isVideo(visible[cur]) || e.target.closest("#lbinfo,.nav,#lbzoom")) return;
+  setZoom(zoom.s > 1 ? 1 : Math.max(2, nativeScale()), ...stagePoint(e));
 });
 
-let panning = null;
-$("lbimg").addEventListener("pointerdown", e => {
-  if (zoom.s <= 1) return;
+$("lbzin").onclick = () => setZoom(zoom.s * 1.5);
+$("lbzout").onclick = () => setZoom(zoom.s / 1.5);
+$("lbzfit").onclick = () => setZoom(zoom.s > 1 ? 1 : Math.max(2, nativeScale()));
+
+stage.addEventListener("pointerdown", e => {
+  if (zoom.s <= 1 || e.button !== 0 || e.target.closest(".nav,#lbinfo,#lbzoom")) return;
+  e.preventDefault();
   panning = { px: e.clientX, py: e.clientY, ox: zoom.x, oy: zoom.y };
-  $("lbimg").setPointerCapture(e.pointerId);
+  stage.setPointerCapture(e.pointerId);
+  stage.classList.add("panning");
 });
-$("lbimg").addEventListener("pointermove", e => {
+stage.addEventListener("pointermove", e => {
   if (!panning) return;
   zoom.x = panning.ox + (e.clientX - panning.px);
   zoom.y = panning.oy + (e.clientY - panning.py);
-  applyZoom();
+  if (!panRaf) panRaf = requestAnimationFrame(() => { panRaf = 0; applyZoom(); });
 });
-$("lbimg").addEventListener("pointerup", () => { panning = null; });
+// pointercancel matters: a gesture WebKit takes over would otherwise leave
+// `panning` stale and the image panning on hover.
+for (const ev of ["pointerup", "pointercancel", "lostpointercapture"])
+  stage.addEventListener(ev, endPan);
 
 // ----------------------------------------------------------------- import ---
 
@@ -1383,6 +1644,30 @@ $("impfolder").onclick = async () => {
   if (sel) await importPaths(Array.isArray(sel) ? sel : [sel]);
 };
 
+$("inboxbtn").onclick = async () => {
+  if (importing) { toast("Already importing — hang on"); return; }
+  importing = true;
+  toast("Checking PhotoVault Inbox…");
+  try {
+    const r = await invoke("process_inbox");
+    let msg = r.imported
+      ? `Processed ${r.imported.toLocaleString()} item${r.imported === 1 ? "" : "s"} from Inbox`
+      : "No ready media found in Inbox";
+    if (r.skipped) msg += ` · ${r.skipped.toLocaleString()} duplicate${r.skipped === 1 ? "" : "s"} removed`;
+    toast(msg);
+    if (r.imported) await loadGrid();
+  } catch (err) {
+    toast("Inbox processing failed: " + err);
+  } finally {
+    importing = false;
+  }
+};
+
+// A native drag of an in-app <img> would start a macOS drag session and pop
+// the import drop overlay; nothing in the app is ever drag-out-able, and
+// Finder drops arrive via tauri events, not DOM dragstart.
+document.addEventListener("dragstart", e => e.preventDefault());
+
 listen("tauri://drag-enter", () => {
   if ($("gallery").style.display !== "none") $("drophint").classList.add("active");
 });
@@ -1430,6 +1715,7 @@ $("settingsbtn").onclick = async () => {
   $("settings").classList.add("open");
 };
 $("setclose").onclick = () => $("settings").classList.remove("open");
+$("helpclose").onclick = () => $("helpmodal").classList.remove("open");
 
 for (const id of ["autolocksel", "optsleep", "optprotect", "optdedupe"])
   $(id).addEventListener("change", pushSettings);
@@ -1555,6 +1841,9 @@ function gridColumns() {
 function setFocus(i) {
   if (!visible.length) return;
   focusIdx = Math.max(0, Math.min(visible.length - 1, i));
+  // Keyboard navigation can reach an item before its DOM batch has been
+  // appended; materialize through that item before looking it up.
+  if (focusIdx >= renderedCount) renderMore(focusIdx);
   document.querySelectorAll("#grid .focused").forEach(el => el.classList.remove("focused"));
   const el = document.querySelectorAll("#grid [data-id]")[focusIdx];
   if (el) {
@@ -1570,8 +1859,14 @@ document.addEventListener("keydown", e => {
   if ($("lightbox").classList.contains("open")) {
     if (inInput) return;
     if (e.key === "Escape") { slideTimer ? stopSlideshow() : closeLightbox(); }
-    else if (e.key === "ArrowRight") show(cur + 1);
-    else if (e.key === "ArrowLeft") show(cur - 1);
+    else if ((e.key === "+" || e.key === "=") && !isVideo(visible[cur])) setZoom(zoom.s * 1.5);
+    else if (e.key === "-" && !isVideo(visible[cur])) setZoom(zoom.s / 1.5);
+    else if (e.key === "0" && !isVideo(visible[cur])) setZoom(1);
+    // Arrows pan while zoomed in, navigate otherwise.
+    else if (e.key === "ArrowRight") zoom.s > 1 ? (zoom.x -= 60, applyZoom()) : show(cur + 1);
+    else if (e.key === "ArrowLeft") zoom.s > 1 ? (zoom.x += 60, applyZoom()) : show(cur - 1);
+    else if (e.key === "ArrowUp" && zoom.s > 1) { zoom.y += 60; applyZoom(); }
+    else if (e.key === "ArrowDown" && zoom.s > 1) { zoom.y -= 60; applyZoom(); }
     else if (e.key === "f") $("lbfav").click();
     else if (e.key === "i") $("lbinfobtn").click();
     else if ((e.key === "Delete" || e.key === "Backspace") && currentView.type !== "trash")
@@ -1593,6 +1888,7 @@ document.addEventListener("keydown", e => {
   if ($("gallery").style.display === "none") return;
   if (inInput) {
     if (e.key === "Escape" && document.activeElement === $("search")) {
+      clearTimeout(searchTimer);
       $("search").value = "";
       query = "";
       renderPhotos();
@@ -1602,6 +1898,7 @@ document.addEventListener("keydown", e => {
   }
 
   if (e.key === "/") { e.preventDefault(); $("search").focus(); return; }
+  if (e.key === "?") { $("helpmodal").classList.add("open"); return; }
   if ((e.metaKey || e.ctrlKey) && e.key === "a") {
     e.preventDefault();
     visible.forEach(p => selection.add(p.id));

@@ -70,7 +70,8 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   this folder and the app encrypts it into the vault and deletes the plaintext
   file, usually within a couple of seconds. If the app is locked or not
   running, files wait (unencrypted!) until the next unlock — the lock screen
-  shows how many are waiting.
+  shows how many are waiting. Once unlocked, click **Process Inbox** to process
+  waiting files immediately (the automatic watcher continues to run too).
 
 ## Settings
 
@@ -97,3 +98,7 @@ Notes:
   build and the keychain ACL is tied to them.
 - HEIC decoding for thumbnails shells out to `/usr/bin/sips`; video poster
   frames to `/usr/bin/qlmanage`. Both ship with macOS.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
