@@ -17,6 +17,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,13 @@ const DEFAULT_AUTO_LOCK_SECS: u64 = 15 * 60;
 const THUMB_SIZE: u32 = 480;
 const MIN_PASSWORD_LEN: usize = 8;
 const TRASH_RETENTION_SECS: f64 = 30.0 * 86400.0;
+const LEGACY_SCRYPT_LOG_N: u8 = 15;
+const CURRENT_SCRYPT_LOG_N: u8 = 17;
+const DEFAULT_SCRYPT_R: u32 = 8;
+const DEFAULT_SCRYPT_P: u32 = 1;
+const MAX_PHOTO_NAME_BYTES: usize = 255;
+const HELPER_TIMEOUT: Duration = Duration::from_secs(20);
+const INBOX_MIN_FILE_AGE: Duration = Duration::from_secs(2);
 
 fn yes() -> bool {
     true
@@ -76,6 +84,9 @@ struct Vault {
     last_activity: Instant,
     importing: bool,
     settings: Settings,
+    // Serializes read-modify-write operations on meta.json without holding
+    // the vault lock across the intentionally slow scrypt operation.
+    meta_lock: Arc<Mutex<()>>,
     // Last decrypted full object, so video seeking doesn't re-decrypt the
     // whole file per range request. Cleared on lock.
     media_cache: Option<(String, Arc<Vec<u8>>)>,
@@ -106,6 +117,7 @@ impl Vault {
     fn active_key(&mut self) -> Option<[u8; 32]> {
         if self.key.is_some()
             && self.settings.auto_lock_secs > 0
+            && !self.importing
             && self.last_activity.elapsed().as_secs() > self.settings.auto_lock_secs
         {
             wipe_vault(self);
@@ -119,9 +131,10 @@ impl Vault {
 
 /// Clear all secrets and decrypted state from memory.
 fn wipe_vault(vault: &mut Vault) {
-    if let Some(mut k) = vault.key.take() {
+    if let Some(k) = vault.key.as_mut() {
         k.zeroize();
     }
+    vault.key = None;
     vault.photos.clear();
     vault.albums.clear();
     vault.media_cache = None;
@@ -135,6 +148,10 @@ type VaultState<'a> = State<'a, Mutex<Vault>>;
 /// not brick the whole app — Vault state stays consistent either way).
 fn vlock(m: &Mutex<Vault>) -> MutexGuard<'_, Vault> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn meta_lock(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn do_system_lock(app: &tauri::AppHandle) {
@@ -151,6 +168,14 @@ fn do_system_lock(app: &tauri::AppHandle) {
 struct Meta {
     salt: String,     // scrypt salt for the password KEK
     verifier: String, // encrypt(master, VERIFIER_PLAINTEXT)
+    // Missing fields are the original v1 parameters. New writes use the
+    // current parameters in rewrap_master, so old vaults remain readable.
+    #[serde(default = "legacy_scrypt_log_n")]
+    n: u8,
+    #[serde(default = "default_scrypt_r")]
+    r: u32,
+    #[serde(default = "default_scrypt_p")]
+    p: u32,
     // encrypt(kek, master). Absent = v1 layout (master derived directly
     // from the password); migrated in place on first unlock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,6 +183,18 @@ struct Meta {
     // encrypt(recovery_key_bytes, master)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery: Option<String>,
+}
+
+fn legacy_scrypt_log_n() -> u8 {
+    LEGACY_SCRYPT_LOG_N
+}
+
+fn default_scrypt_r() -> u32 {
+    DEFAULT_SCRYPT_R
+}
+
+fn default_scrypt_p() -> u32 {
+    DEFAULT_SCRYPT_P
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -229,11 +266,27 @@ struct AlbumEntry {
 
 // ---------------------------------------------------------------- crypto ---
 
-fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
-    let params = scrypt::Params::new(15, 8, 1, 32).map_err(|e| e.to_string())?;
+fn derive_key_with_params(
+    password: &str,
+    salt: &[u8],
+    n: u8,
+    r: u32,
+    p: u32,
+) -> Result<[u8; 32], String> {
+    let params = scrypt::Params::new(n, r, p, 32).map_err(|e| e.to_string())?;
     let mut key = [0u8; 32];
     scrypt::scrypt(password.as_bytes(), salt, &params, &mut key).map_err(|e| e.to_string())?;
     Ok(key)
+}
+
+fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    derive_key_with_params(
+        password,
+        salt,
+        LEGACY_SCRYPT_LOG_N,
+        DEFAULT_SCRYPT_R,
+        DEFAULT_SCRYPT_P,
+    )
 }
 
 fn encrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
@@ -301,33 +354,125 @@ fn parse_recovery_key(text: &str) -> Result<[u8; 32], String> {
 // ------------------------------------------------------------------ meta ---
 
 fn read_meta(dir: &std::path::Path) -> Result<Meta, String> {
-    let raw = fs::read(dir.join("meta.json")).map_err(|e| e.to_string())?;
-    serde_json::from_slice(&raw).map_err(|e| e.to_string())
+    let primary = fs::read(dir.join("meta.json"))
+        .and_then(|raw| serde_json::from_slice(&raw).map_err(std::io::Error::other));
+    match primary {
+        Ok(meta) => Ok(meta),
+        Err(primary_err) => fs::read(dir.join("meta.bak"))
+            .and_then(|raw| serde_json::from_slice(&raw).map_err(std::io::Error::other))
+            .map_err(|backup_err| format!("{primary_err}; backup: {backup_err}")),
+    }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static AFTER_SOURCE_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn sync_dir(dir: &std::path::Path) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow().as_deref() == Some(dir)) {
+        return Err("Simulated directory sync failure.".into());
+    }
+    fs::File::open(dir)
+        .map_err(|e| e.to_string())?
+        .sync_all()
+        .map_err(|e| e.to_string())
+}
+
+fn write_file_durably(
+    tmp: &std::path::Path,
+    dest: &std::path::Path,
+    data: &[u8],
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    let mut file = fs::File::create(tmp).map_err(|e| e.to_string())?;
+    file.write_all(data).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    fs::rename(tmp, dest).map_err(|e| e.to_string())?;
+    sync_dir(dir)
+}
+
+/// Persist meta durably, without ever retaining a superseded wrapping.
+///
+/// `meta.bak` holds the *same* generation as `meta.json`, never the previous
+/// one. The master key survives a password change (only its wrapping is
+/// replaced), so an older meta — old salt plus old `wrapped_master` — would
+/// let the old password recover the master key forever, and changing your
+/// password would revoke nothing. That is the `meta.v1.bak` hole; rotating
+/// generations here would simply recreate it on every password change, and
+/// ship it to cloud storage inside every backup zip.
+///
+/// The backup is written first, so a crash mid-write leaves `meta.json`
+/// authoritative and intact; once both renames land, neither file holds a
+/// wrapping that a retired password can open.
 fn write_meta(dir: &std::path::Path, meta: &Meta) -> Result<(), String> {
     let json = serde_json::to_vec(meta).map_err(|e| e.to_string())?;
-    let tmp = dir.join("meta.json.tmp");
-    fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    fs::rename(tmp, dir.join("meta.json")).map_err(|e| e.to_string())
+    write_file_durably(
+        &dir.join("meta.bak.tmp"),
+        &dir.join("meta.bak"),
+        &json,
+        dir,
+    )?;
+    write_file_durably(
+        &dir.join("meta.json.tmp"),
+        &dir.join("meta.json"),
+        &json,
+        dir,
+    )
+}
+
+fn remove_legacy_meta_backup(dir: &std::path::Path) {
+    if fs::remove_file(dir.join("meta.v1.bak")).is_ok() {
+        let _ = sync_dir(dir);
+    }
 }
 
 /// Unwrap the master key with a password against the given meta.
 /// Handles both the v2 envelope layout and the v1 direct-derivation layout.
 fn master_from_password(password: &str, meta: &Meta) -> Result<[u8; 32], String> {
     let salt = hex::decode(&meta.salt).map_err(|e| e.to_string())?;
-    let derived = derive_key(password, &salt)?;
-    let master = match &meta.wrapped_master {
+    let mut derived = derive_key_with_params(password, &salt, meta.n, meta.r, meta.p)?;
+    let mut master = match &meta.wrapped_master {
         Some(wm) => {
-            let blob = hex::decode(wm).map_err(|e| e.to_string())?;
-            key_from_slice(&decrypt(&derived, &blob).map_err(|_| "Wrong password.".to_string())?)?
+            let blob = match hex::decode(wm) {
+                Ok(blob) => blob,
+                Err(e) => {
+                    derived.zeroize();
+                    return Err(e.to_string());
+                }
+            };
+            let mut unwrapped = match decrypt(&derived, &blob) {
+                Ok(unwrapped) => unwrapped,
+                Err(_) => {
+                    derived.zeroize();
+                    return Err("Wrong password.".to_string());
+                }
+            };
+            let result = key_from_slice(&unwrapped);
+            unwrapped.zeroize();
+            derived.zeroize();
+            result?
         }
         None => derived, // v1: the derived key IS the master key
     };
-    let verifier = hex::decode(&meta.verifier).map_err(|e| e.to_string())?;
-    match decrypt(&master, &verifier) {
-        Ok(pt) if pt == VERIFIER_PLAINTEXT => Ok(master),
-        _ => Err("Wrong password.".into()),
+    let verifier = match hex::decode(&meta.verifier) {
+        Ok(verifier) => verifier,
+        Err(e) => {
+            master.zeroize();
+            return Err(e.to_string());
+        }
+    };
+    let mut plaintext = decrypt(&master, &verifier).unwrap_or_default();
+    let valid = plaintext == VERIFIER_PLAINTEXT;
+    plaintext.zeroize();
+    if valid {
+        Ok(master)
+    } else {
+        master.zeroize();
+        Err("Wrong password.".into())
     }
 }
 
@@ -336,9 +481,20 @@ fn master_from_password(password: &str, meta: &Meta) -> Result<[u8; 32], String>
 fn rewrap_master(meta: &mut Meta, password: &str, master: &[u8; 32]) -> Result<(), String> {
     let mut salt = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt);
-    let kek = derive_key(password, &salt)?;
+    let mut kek = derive_key_with_params(
+        password,
+        &salt,
+        CURRENT_SCRYPT_LOG_N,
+        DEFAULT_SCRYPT_R,
+        DEFAULT_SCRYPT_P,
+    )?;
+    let wrapped = encrypt(&kek, master)?;
+    kek.zeroize();
     meta.salt = hex::encode(salt);
-    meta.wrapped_master = Some(hex::encode(encrypt(&kek, master)?));
+    meta.n = CURRENT_SCRYPT_LOG_N;
+    meta.r = DEFAULT_SCRYPT_R;
+    meta.p = DEFAULT_SCRYPT_P;
+    meta.wrapped_master = Some(hex::encode(wrapped));
     meta.verifier = hex::encode(encrypt(master, VERIFIER_PLAINTEXT)?);
     Ok(())
 }
@@ -381,9 +537,13 @@ fn persist_index(vault: &Vault, key: &[u8; 32]) -> Result<(), String> {
     let json = serde_json::to_vec(&out).map_err(|e| e.to_string())?;
     let blob = encrypt(key, &json)?;
     let tmp = vault.index_path().with_extension("tmp");
-    fs::write(&tmp, blob).map_err(|e| e.to_string())?;
+    let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    file.write_all(&blob).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
     let _ = fs::rename(vault.index_path(), vault.index_bak_path());
-    fs::rename(tmp, vault.index_path()).map_err(|e| e.to_string())
+    fs::rename(tmp, vault.index_path()).map_err(|e| e.to_string())?;
+    sync_dir(&vault.dir)
 }
 
 fn save_settings(vault: &Vault) -> Result<(), String> {
@@ -408,13 +568,33 @@ fn finish_unlock(state: &Mutex<Vault>, master: [u8; 32]) -> Result<(), String> {
         .filter(|(_, p)| p.deleted.map_or(false, |d| d < cutoff))
         .map(|(id, _)| id.clone())
         .collect();
+    let expired_blobs: Vec<PathBuf> = expired
+        .iter()
+        .flat_map(|id| {
+            [
+                vault.objects_dir().join(id),
+                vault.objects_dir().join(format!("{id}.t")),
+            ]
+        })
+        .collect();
     for id in &expired {
-        let _ = fs::remove_file(vault.objects_dir().join(id));
-        let _ = fs::remove_file(vault.objects_dir().join(format!("{id}.t")));
         vault.photos.remove(id);
+        vault.media_cache = vault
+            .media_cache
+            .take()
+            .filter(|(cached_id, _)| !expired.contains(cached_id));
+        vault
+            .thumb_cache
+            .retain(|cached_id, _| !expired.contains(cached_id));
+        vault
+            .thumb_order
+            .retain(|cached_id| !expired.contains(cached_id));
     }
     if !expired.is_empty() {
-        let _ = persist_index(&vault, &master);
+        persist_index(&vault, &master)?;
+        for path in expired_blobs {
+            let _ = fs::remove_file(path);
+        }
     }
     vault.key = Some(master);
     vault.last_activity = Instant::now();
@@ -537,43 +717,86 @@ fn encode_thumb(img: &image::DynamicImage) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
+/// Run a macOS helper without allowing a hung QuickLook or image conversion
+/// process to wedge the import worker forever.
+fn command_status_with_timeout(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Convert an image the decoder can't read (HEIC from iPhones) to JPEG using
 /// macOS's built-in `sips`. The source is already plaintext on disk, so the
 /// short-lived plaintext conversion in the private temp dir doesn't weaken
 /// the at-rest story.
-fn sips_to_jpeg(src: &std::path::Path) -> Option<Vec<u8>> {
+fn sips_to_jpeg(src: &std::path::Path) -> Result<Vec<u8>, ImportFailure> {
     let dir = std::env::temp_dir().join(format!("pv-conv-{}", random_id()));
-    fs::create_dir_all(&dir).ok()?;
+    fs::create_dir_all(&dir).map_err(ImportFailure::temporary)?;
     let out = dir.join("converted.jpg");
-    let status = std::process::Command::new("/usr/bin/sips")
-        .args(["-s", "format", "jpeg"])
+    let mut command = std::process::Command::new("/usr/bin/sips");
+    command
+        .args(["-s", "format", "jpeg", "--"])
         .arg(src)
         .arg("--out")
         .arg(&out)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let bytes = match status {
-        Ok(s) if s.success() => fs::read(&out).ok(),
-        _ => None,
-    };
+        .stderr(std::process::Stdio::null());
+    let bytes = converted_image_output(command_status_with_timeout(command, HELPER_TIMEOUT), &out);
     let _ = fs::remove_dir_all(&dir);
     bytes
+}
+
+// A helper exit code does not distinguish invalid media from an output I/O failure.
+fn converted_image_output(
+    status: Option<std::process::ExitStatus>,
+    output: &std::path::Path,
+) -> Result<Vec<u8>, ImportFailure> {
+    match status {
+        Some(status) if status.success() => fs::read(output).map_err(ImportFailure::temporary),
+        None => Err(ImportFailure::temporary(
+            "Image conversion could not start or timed out.",
+        )),
+        Some(status) => Err(ImportFailure::temporary(format!(
+            "Image conversion failed ({status})."
+        ))),
+    }
 }
 
 /// Poster frame for a video via QuickLook's thumbnailer.
 fn video_thumbnail(src: &std::path::Path) -> Option<Vec<u8>> {
     let dir = std::env::temp_dir().join(format!("pv-thumb-{}", random_id()));
     fs::create_dir_all(&dir).ok()?;
-    let status = std::process::Command::new("/usr/bin/qlmanage")
+    let mut command = std::process::Command::new("/usr/bin/qlmanage");
+    command
         .args(["-t", "-s", "960", "-o"])
         .arg(&dir)
+        .arg("--")
         .arg(src)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+    let status = command_status_with_timeout(command, HELPER_TIMEOUT);
     let mut png = None;
-    if matches!(status, Ok(s) if s.success()) {
+    if matches!(status, Some(s) if s.success()) {
         if let Ok(entries) = fs::read_dir(&dir) {
             png = entries
                 .flatten()
@@ -602,16 +825,23 @@ struct MediaMeta {
 }
 
 /// Decode, orient, and thumbnail one media file; extract capture date and
-/// dimensions along the way. Returns None only for undecodable images.
-fn prepare_media(path: &std::path::Path, data: &[u8]) -> Option<MediaMeta> {
-    if is_media_path(path) && is_video_name(&path.file_name()?.to_string_lossy()) {
+/// dimensions along the way. Conversion I/O and timeouts remain retryable.
+fn prepare_media(path: &std::path::Path, data: &[u8]) -> Result<MediaMeta, ImportFailure> {
+    if is_media_path(path)
+        && is_video_name(
+            &path
+                .file_name()
+                .ok_or_else(|| ImportFailure::temporary("Source has no filename."))?
+                .to_string_lossy(),
+        )
+    {
         let thumb = video_thumbnail(path).unwrap_or_else(placeholder_thumb);
         let taken = fs::metadata(path)
             .ok()
             .and_then(|m| m.created().or_else(|_| m.modified()).ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs_f64());
-        return Some(MediaMeta {
+        return Ok(MediaMeta {
             thumb,
             width: None,
             height: None,
@@ -621,17 +851,36 @@ fn prepare_media(path: &std::path::Path, data: &[u8]) -> Option<MediaMeta> {
     let (img, converted) = match image::load_from_memory(data) {
         Ok(img) => (img, None),
         Err(_) => {
+            let extension = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            // These formats have recognizable signatures. HEIC/HEIF still need the native decoder.
+            if matches!(
+                extension.as_str(),
+                "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff"
+            ) && image::guess_format(data).is_err()
+            {
+                return Err(ImportFailure {
+                    reason: "File contents are not a supported image.".into(),
+                    retryable: false,
+                });
+            }
             let jpg = sips_to_jpeg(path)?;
-            let img = image::load_from_memory(&jpg).ok()?;
+            let img = image::load_from_memory(&jpg).map_err(|e| {
+                ImportFailure::temporary(format!("Cannot read converted image: {e}"))
+            })?;
             (img, Some(jpg))
         }
     };
     let orient_src: &[u8] = converted.as_deref().unwrap_or(data);
     let img = apply_orientation(img, exif_orientation(orient_src));
     let (width, height) = (img.width(), img.height());
-    let thumb = encode_thumb(&img)?;
+    let thumb =
+        encode_thumb(&img).ok_or_else(|| ImportFailure::temporary("Cannot encode thumbnail."))?;
     let taken = exif_taken(data).or_else(|| converted.as_deref().and_then(exif_taken));
-    Some(MediaMeta {
+    Ok(MediaMeta {
         thumb,
         width: Some(width),
         height: Some(height),
@@ -639,32 +888,108 @@ fn prepare_media(path: &std::path::Path, data: &[u8]) -> Option<MediaMeta> {
     })
 }
 
+/// One run of a name. Digit runs compare numerically (by digit count then
+/// lexically, so arbitrarily long runs work without parsing into an integer);
+/// everything else compares case-insensitively. Numbers sort before text,
+/// matching how Finder orders a folder.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum NamePart {
+    Number(usize, String, String),
+    Text(String),
+}
+
+fn name_key(s: &str) -> Vec<NamePart> {
+    let mut parts = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut digits = String::new();
+            while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                digits.push(chars.next().unwrap());
+            }
+            let significant = digits.trim_start_matches('0');
+            parts.push(NamePart::Number(
+                significant.len(),
+                significant.to_string(),
+                digits,
+            ));
+        } else {
+            let mut text = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    break;
+                }
+                text.extend(c.to_lowercase());
+                chars.next();
+            }
+            parts.push(NamePart::Text(text));
+        }
+    }
+    parts
+}
+
+/// Import order is the order the files read in a file browser: components
+/// compared one level at a time so a folder's contents stay together, each
+/// naturally (`IMG_2` before `IMG_10`). The path itself breaks ties that
+/// case-folding creates, so the order never depends on `read_dir`.
+fn path_sort_key(path: &std::path::Path) -> (Vec<Vec<NamePart>>, PathBuf) {
+    let parts = path
+        .components()
+        .map(|c| name_key(&c.as_os_str().to_string_lossy()))
+        .collect();
+    (parts, path.to_path_buf())
+}
+
+fn sort_paths_by_name(paths: &mut [PathBuf]) {
+    paths.sort_by_cached_key(|path| path_sort_key(path));
+}
+
 /// Expand files and folders into a flat list of media-file paths.
-/// Folders are walked recursively; hidden entries are skipped. Files are
-/// ordered by when they appeared on disk so their vault "added" timestamps
-/// preserve download/copy order instead of `read_dir`'s unspecified order.
-fn source_order_time(path: &std::path::Path) -> SystemTime {
-    fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.created().or_else(|_| metadata.modified()).ok())
-        .unwrap_or(UNIX_EPOCH)
-}
+/// Folders are walked recursively; hidden entries are skipped.
 
-fn sort_paths_by_source_order(paths: &mut [PathBuf]) {
-    paths.sort_by_cached_key(|path| (source_order_time(path), path.clone()));
-}
-
-fn collect_files(paths: &[String]) -> Vec<PathBuf> {
-    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
-        for entry in entries.flatten() {
+fn collect_files(paths: &[String], result: &mut ImportResult) -> Vec<PathBuf> {
+    fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>, result: &mut ImportResult) {
+        if depth > 8 {
+            result.issue(
+                dir,
+                "Folder exceeds the supported nesting depth.".into(),
+                "import",
+                false,
+            );
+            return;
+        }
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                result.issue(dir, e.to_string(), "import", true);
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    result.issue(dir, e.to_string(), "import", true);
+                    continue;
+                }
+            };
             let path = entry.path();
             if is_hidden(&path) {
                 continue;
             }
-            if path.is_dir() {
-                walk(&path, out);
-            } else if is_media_path(&path) {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) => {
+                    result.issue(&path, e.to_string(), "import", true);
+                    continue;
+                }
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                walk(&path, depth + 1, out, result);
+            } else if ft.is_file() && is_media_path(&path) {
                 out.push(path);
             }
         }
@@ -672,9 +997,19 @@ fn collect_files(paths: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for p in paths {
         let path = PathBuf::from(p);
-        if path.is_dir() {
-            walk(&path, &mut out);
-        } else {
+        let ft = match fs::symlink_metadata(&path).map(|m| m.file_type()) {
+            Ok(ft) => ft,
+            Err(e) => {
+                result.issue(&path, e.to_string(), "import", true);
+                continue;
+            }
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            walk(&path, 0, &mut out, result);
+        } else if ft.is_file() {
             out.push(path); // direct files: let the decoder decide
         }
     }
@@ -682,7 +1017,7 @@ fn collect_files(paths: &[String]) -> Vec<PathBuf> {
     // parent folder) — import each actual file once per import action.
     let mut unique = HashSet::new();
     out.retain(|p| unique.insert(p.clone()));
-    sort_paths_by_source_order(&mut out);
+    sort_paths_by_name(&mut out);
     out
 }
 
@@ -718,7 +1053,9 @@ async fn lock_screen_info(state: VaultState<'_>) -> Result<LockScreenInfo, Strin
             vault.settings.touch_id,
         )
     };
-    let has_recovery = read_meta(&dir).map(|m| m.recovery.is_some()).unwrap_or(false);
+    let has_recovery = read_meta(&dir)
+        .map(|m| m.recovery.is_some())
+        .unwrap_or(false);
     let inbox_pending = {
         let mut found = Vec::new();
         scan_inbox_media(&inbox, 0, &mut found);
@@ -748,6 +1085,9 @@ async fn create_vault(password: String, state: VaultState<'_>) -> Result<(), Str
     let mut meta = Meta {
         salt: String::new(),
         verifier: String::new(),
+        n: LEGACY_SCRYPT_LOG_N,
+        r: DEFAULT_SCRYPT_R,
+        p: DEFAULT_SCRYPT_P,
         wrapped_master: None,
         recovery: None,
     };
@@ -765,7 +1105,11 @@ async fn create_vault(password: String, state: VaultState<'_>) -> Result<(), Str
 
 #[tauri::command]
 async fn unlock(password: String, state: VaultState<'_>) -> Result<(), String> {
-    let dir = vlock(&state).dir.clone();
+    let (dir, meta_mutex) = {
+        let vault = vlock(&state);
+        (vault.dir.clone(), vault.meta_lock.clone())
+    };
+    let _meta_guard = meta_lock(&meta_mutex);
     let meta = read_meta(&dir)?;
     let master = match master_from_password(&password, &meta) {
         Ok(m) => m,
@@ -775,17 +1119,12 @@ async fn unlock(password: String, state: VaultState<'_>) -> Result<(), String> {
         }
     };
     // Seamless v1 → v2 migration: wrap the existing key as the master key.
-    // The original meta is kept once as meta.v1.bak, so an older build of the
-    // app can still open the vault if needed.
     if meta.wrapped_master.is_none() {
-        let bak = dir.join("meta.v1.bak");
-        if !bak.exists() {
-            let _ = fs::copy(dir.join("meta.json"), bak);
-        }
         let mut meta = meta;
         rewrap_master(&mut meta, &password, &master)?;
         write_meta(&dir, &meta)?;
     }
+    remove_legacy_meta_backup(&dir);
     finish_unlock(&state, master)
 }
 
@@ -800,27 +1139,31 @@ async fn change_password(
             "New password must be at least {MIN_PASSWORD_LEN} characters."
         ));
     }
-    let (dir, master) = {
+    let (dir, master, meta_mutex) = {
         let mut vault = vlock(&state);
         let key = vault.active_key().ok_or("locked")?;
-        (vault.dir.clone(), key)
+        (vault.dir.clone(), key, vault.meta_lock.clone())
     };
+    let _meta_guard = meta_lock(&meta_mutex);
     let mut meta = read_meta(&dir)?;
     master_from_password(&current_password, &meta)
         .map_err(|_| "Current password is incorrect.".to_string())?;
     rewrap_master(&mut meta, &new_password, &master)?;
-    write_meta(&dir, &meta)
+    write_meta(&dir, &meta)?;
+    remove_legacy_meta_backup(&dir);
+    Ok(())
 }
 
 /// Generate (or replace) the recovery key. Returns it formatted for humans —
 /// shown exactly once, never stored in plaintext.
 #[tauri::command]
 async fn recovery_generate(state: VaultState<'_>) -> Result<String, String> {
-    let (dir, master) = {
+    let (dir, master, meta_mutex) = {
         let mut vault = vlock(&state);
         let key = vault.active_key().ok_or("locked")?;
-        (vault.dir.clone(), key)
+        (vault.dir.clone(), key, vault.meta_lock.clone())
     };
+    let _meta_guard = meta_lock(&meta_mutex);
     let rk = random_key();
     let mut meta = read_meta(&dir)?;
     meta.recovery = Some(hex::encode(encrypt(&rk, &master)?));
@@ -830,14 +1173,17 @@ async fn recovery_generate(state: VaultState<'_>) -> Result<String, String> {
 
 #[tauri::command]
 async fn recovery_disable(state: VaultState<'_>) -> Result<(), String> {
-    let dir = {
+    let (dir, meta_mutex) = {
         let mut vault = vlock(&state);
         vault.active_key().ok_or("locked")?;
-        vault.dir.clone()
+        (vault.dir.clone(), vault.meta_lock.clone())
     };
+    let _meta_guard = meta_lock(&meta_mutex);
     let mut meta = read_meta(&dir)?;
     meta.recovery = None;
-    write_meta(&dir, &meta)
+    write_meta(&dir, &meta)?;
+    remove_legacy_meta_backup(&dir);
+    Ok(())
 }
 
 /// Forgot-password path: the recovery key unwraps the master key, and the
@@ -854,27 +1200,44 @@ async fn recovery_unlock(
         ));
     }
     let rk = parse_recovery_key(&recovery_key)?;
-    let dir = vlock(&state).dir.clone();
+    let (dir, meta_mutex) = {
+        let vault = vlock(&state);
+        (vault.dir.clone(), vault.meta_lock.clone())
+    };
+    let _meta_guard = meta_lock(&meta_mutex);
     let mut meta = read_meta(&dir)?;
     let wrapped = meta
         .recovery
         .clone()
         .ok_or("No recovery key is set up for this vault.")?;
     let blob = hex::decode(&wrapped).map_err(|e| e.to_string())?;
-    let master = match decrypt(&rk, &blob).and_then(|m| key_from_slice(&m)) {
+    let mut master_bytes = match decrypt(&rk, &blob) {
         Ok(m) => m,
         Err(_) => {
             std::thread::sleep(Duration::from_millis(500));
             return Err("Wrong recovery key.".into());
         }
     };
+    let master = match key_from_slice(&master_bytes) {
+        Ok(m) => {
+            master_bytes.zeroize();
+            m
+        }
+        Err(_) => {
+            master_bytes.zeroize();
+            return Err("Wrong recovery key.".into());
+        }
+    };
     let verifier = hex::decode(&meta.verifier).map_err(|e| e.to_string())?;
-    match decrypt(&master, &verifier) {
-        Ok(pt) if pt == VERIFIER_PLAINTEXT => {}
-        _ => return Err("Wrong recovery key.".into()),
+    let mut plaintext = decrypt(&master, &verifier).unwrap_or_default();
+    let valid = plaintext == VERIFIER_PLAINTEXT;
+    plaintext.zeroize();
+    if !valid {
+        return Err("Wrong recovery key.".into());
     }
     rewrap_master(&mut meta, &new_password, &master)?;
     write_meta(&dir, &meta)?;
+    remove_legacy_meta_backup(&dir);
     finish_unlock(&state, master)
 }
 
@@ -926,7 +1289,10 @@ async fn touchid_unlock(state: VaultState<'_>) -> Result<(), String> {
     let verifier = hex::decode(&meta.verifier).map_err(|e| e.to_string())?;
     match decrypt(&master, &verifier) {
         Ok(pt) if pt == VERIFIER_PLAINTEXT => finish_unlock(&state, master),
-        _ => Err("The stored Touch ID key no longer matches this vault — re-enable it in Settings.".into()),
+        _ => Err(
+            "The stored Touch ID key no longer matches this vault — re-enable it in Settings."
+                .into(),
+        ),
     }
 }
 
@@ -987,10 +1353,11 @@ fn lock_timer(app: tauri::AppHandle) {
         prev_wall = wall;
         let state: State<Mutex<Vault>> = app.state();
         let mut vault = vlock(&state);
-        if vault.key.is_none() || vault.importing {
-            continue; // never yank the key mid-import
+        if vault.key.is_none() {
+            continue;
         }
         let idle = vault.settings.auto_lock_secs > 0
+            && !vault.importing
             && vault.last_activity.elapsed().as_secs() > vault.settings.auto_lock_secs;
         if idle || (slept && vault.settings.lock_on_sleep) {
             wipe_vault(&mut vault);
@@ -1077,11 +1444,7 @@ async fn album_rename(id: String, name: String, state: VaultState<'_>) -> Result
     }
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    vault
-        .albums
-        .get_mut(&id)
-        .ok_or("Album not found.")?
-        .name = name;
+    vault.albums.get_mut(&id).ok_or("Album not found.")?.name = name;
     persist_index(&vault, &key)
 }
 
@@ -1123,7 +1486,11 @@ async fn albums_assign(
 }
 
 #[tauri::command]
-async fn set_favorite(ids: Vec<String>, favorite: bool, state: VaultState<'_>) -> Result<(), String> {
+async fn set_favorite(
+    ids: Vec<String>,
+    favorite: bool,
+    state: VaultState<'_>,
+) -> Result<(), String> {
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
     for id in &ids {
@@ -1136,10 +1503,7 @@ async fn set_favorite(ids: Vec<String>, favorite: bool, state: VaultState<'_>) -
 
 #[tauri::command]
 async fn rename_photo(id: String, name: String, state: VaultState<'_>) -> Result<(), String> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("Name can't be empty.".into());
-    }
+    let name = sanitize_photo_name(&name)?;
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
     vault.photos.get_mut(&id).ok_or("not found")?.name = name;
@@ -1175,20 +1539,146 @@ struct ImportProgress {
     total: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Default)]
 struct ImportResult {
     imported: usize,
     skipped: usize,
+    failed: usize,
+    cleanup_failed: usize,
+    issues: Vec<ImportIssue>,
+}
+
+#[derive(Serialize, Clone)]
+struct ImportIssue {
+    name: String,
+    reason: String,
+    stage: &'static str,
+    retryable: bool,
+    #[serde(skip)]
+    retry_path: Option<PathBuf>,
+}
+
+impl ImportResult {
+    fn issue(
+        &mut self,
+        path: &std::path::Path,
+        reason: String,
+        stage: &'static str,
+        retryable: bool,
+    ) {
+        if stage == "cleanup" {
+            self.cleanup_failed += 1;
+        } else {
+            self.failed += 1;
+        }
+        self.issues.push(ImportIssue {
+            name: path.to_string_lossy().into_owned(),
+            reason,
+            stage,
+            retryable,
+            retry_path: None,
+        });
+    }
+}
+
+#[derive(Debug)]
+struct ImportFailure {
+    reason: String,
+    retryable: bool,
+}
+
+impl ImportFailure {
+    fn temporary(reason: impl ToString) -> Self {
+        Self {
+            reason: reason.to_string(),
+            retryable: true,
+        }
+    }
+}
+
+/// Identity and content belong to the same open file that supplied the imported bytes.
+struct SourceProof {
+    metadata: fs::Metadata,
+    hash: blake3::Hash,
+}
+
+fn same_source(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if a.dev() != b.dev() || a.ino() != b.ino() {
+            return false;
+        }
+    }
+    a.is_file() && b.is_file() && a.len() == b.len() && a.modified().ok() == b.modified().ok()
+}
+
+fn read_source(path: &std::path::Path) -> Result<(Vec<u8>, SourceProof), ImportFailure> {
+    let before = fs::symlink_metadata(path).map_err(ImportFailure::temporary)?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(ImportFailure::temporary(
+            "Source is no longer a regular file.",
+        ));
+    }
+    let mut file = fs::File::open(path).map_err(ImportFailure::temporary)?;
+    let metadata = file.metadata().map_err(ImportFailure::temporary)?;
+    if !same_source(&before, &metadata) {
+        return Err(ImportFailure::temporary(
+            "Source changed before it could be read.",
+        ));
+    }
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .map_err(ImportFailure::temporary)?;
+    if file_signature(&metadata)
+        != file_signature(&file.metadata().map_err(ImportFailure::temporary)?)
+    {
+        return Err(ImportFailure::temporary(
+            "Source changed while it was being read.",
+        ));
+    }
+    let hash = blake3::hash(&data);
+    Ok((data, SourceProof { metadata, hash }))
+}
+
+struct ImportGuard<'a> {
+    state: &'a Mutex<Vault>,
+}
+
+impl Drop for ImportGuard<'_> {
+    fn drop(&mut self) {
+        vlock(self.state).importing = false;
+    }
+}
+
+fn claim_import<'a>(state: &'a Mutex<Vault>) -> Result<ImportGuard<'a>, String> {
+    let mut vault = vlock(state);
+    vault.active_key().ok_or("locked")?;
+    if vault.importing {
+        return Err("An import is already running.".into());
+    }
+    vault.importing = true;
+    Ok(ImportGuard { state })
+}
+
+fn skipped_target_is_live(state: &Mutex<Vault>, id: &str) -> bool {
+    let vault = vlock(state);
+    vault
+        .photos
+        .get(id)
+        .is_some_and(|photo| photo.deleted.is_none())
 }
 
 enum ImportOutcome {
-    Added(String, PhotoInfo),
-    Skipped,
-    Failed,
+    Added(String, PhotoInfo, SourceProof),
+    /// A byte-identical copy is already in the vault; carries its photo id so
+    /// an album-targeted import can still file the existing copy.
+    Skipped(String, SourceProof),
+    Failed(ImportFailure),
 }
 
 /// Merge a batch of imported photos into the index and persist it.
-fn flush_batch(state: &VaultState<'_>, batch: &mut Vec<(String, PhotoInfo)>) -> Result<(), String> {
+fn flush_batch(state: &Mutex<Vault>, batch: &mut Vec<(String, PhotoInfo)>) -> Result<(), String> {
     if batch.is_empty() {
         return Ok(());
     }
@@ -1197,7 +1687,10 @@ fn flush_batch(state: &VaultState<'_>, batch: &mut Vec<(String, PhotoInfo)>) -> 
     let key = vault.key.ok_or("locked")?;
     vault.last_activity = Instant::now(); // a running import counts as activity
     let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
-    for (id, info) in batch.drain(..) {
+    for (id, mut info) in batch.drain(..) {
+        // The target album can be deleted while a long import runs — never
+        // persist a photo pointing at an album that no longer exists.
+        info.albums.retain(|a| vault.albums.contains_key(a));
         vault.photos.insert(id, info);
     }
     // Roll back on a failed persist: entries living only in memory would
@@ -1211,40 +1704,130 @@ fn flush_batch(state: &VaultState<'_>, batch: &mut Vec<(String, PhotoInfo)>) -> 
     Ok(())
 }
 
-/// Encrypt one file into the vault objects dir. `hashes` carries the content
-/// hashes already in the vault (and this batch) for duplicate skipping.
+/// Rename first so replacing the original pathname cannot make cleanup delete the replacement.
+/// A crash or changed source leaves the claimed file in a visible, automatically scanned folder.
+fn delete_inbox_source(
+    inbox: &std::path::Path,
+    path: &std::path::Path,
+    proof: &SourceProof,
+    retained: &mut Option<PathBuf>,
+) -> Result<(), String> {
+    let parent = path.parent().ok_or("Source has no parent directory.")?;
+    let claimed_dir = inbox.join(format!("Pending import {}", random_id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&claimed_dir)
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(&claimed_dir).map_err(|e| e.to_string())?;
+    let claimed = claimed_dir.join(path.file_name().ok_or("Source has no filename.")?);
+    if let Err(e) = fs::rename(path, &claimed) {
+        let _ = fs::remove_dir(&claimed_dir);
+        return Err(e.to_string());
+    }
+    *retained = Some(claimed.clone());
+    #[cfg(test)]
+    AFTER_SOURCE_CLAIM.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let cleanup = || -> Result<(), String> {
+        // Persist the recovery name before doing anything that could remove it.
+        sync_dir(&claimed_dir)?;
+        sync_dir(inbox)?;
+        sync_dir(parent)?;
+        let (_, current) = read_source(&claimed).map_err(|e| e.reason)?;
+        if !same_source(&proof.metadata, &current.metadata) || proof.hash != current.hash {
+            return Err("Source changed after it was read; the changed file was preserved.".into());
+        }
+        fs::remove_file(&claimed).map_err(|e| e.to_string())?;
+        sync_dir(&claimed_dir)?;
+        Ok(())
+    };
+    if let Err(e) = cleanup() {
+        return Err(if claimed.exists() {
+            format!("{e} Original retained at {}.", claimed.display())
+        } else {
+            e
+        });
+    }
+    *retained = None;
+    let _ = fs::remove_dir(&claimed_dir);
+    prune_empty_dirs(inbox, parent);
+    Ok(())
+}
+
+fn write_object(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
+}
+
+/// Encrypt one file into the vault objects dir. `hashes` maps the content
+/// hashes already in the vault (and this batch) to their photo ids, for
+/// duplicate skipping.
 fn import_one(
     key: &[u8; 32],
     objects: &std::path::Path,
     path: &std::path::Path,
-    hashes: &mut HashSet<String>,
+    hashes: &mut HashMap<String, String>,
     skip_dups: bool,
 ) -> ImportOutcome {
-    let Ok(data) = fs::read(path) else {
-        return ImportOutcome::Failed;
+    let (data, proof) = match read_source(path) {
+        Ok(source) => source,
+        Err(e) => return ImportOutcome::Failed(e),
     };
-    let hash = blake3::hash(&data).to_hex().to_string();
-    if skip_dups && hashes.contains(&hash) {
-        return ImportOutcome::Skipped;
+    let hash = proof.hash.to_hex().to_string();
+    if skip_dups {
+        if let Some(existing) = hashes.get(&hash) {
+            return ImportOutcome::Skipped(existing.clone(), proof);
+        }
     }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "photo".into());
-    let Some(media) = prepare_media(path, &data) else {
-        return ImportOutcome::Failed;
+    let media = prepare_media(path, &data);
+    // Native media helpers use the pathname; reject a changed source before saving their output.
+    match read_source(path) {
+        Ok((_, current))
+            if same_source(&proof.metadata, &current.metadata) && proof.hash == current.hash => {}
+        _ => {
+            return ImportOutcome::Failed(ImportFailure::temporary(
+                "Source changed while preparing media.",
+            ))
+        }
+    }
+    let media = match media {
+        Ok(media) => media,
+        Err(e) => return ImportOutcome::Failed(e),
     };
     let (Ok(enc), Ok(enc_thumb)) = (encrypt(key, &data), encrypt(key, &media.thumb)) else {
-        return ImportOutcome::Failed;
+        return ImportOutcome::Failed(ImportFailure::temporary("Could not encrypt media."));
     };
     let id = random_id();
-    if fs::write(objects.join(&id), enc).is_err()
-        || fs::write(objects.join(format!("{id}.t")), enc_thumb).is_err()
-    {
-        let _ = fs::remove_file(objects.join(&id));
-        return ImportOutcome::Failed;
+    let original = objects.join(&id);
+    let thumb = objects.join(format!("{id}.t"));
+    let persisted = write_object(&original, &enc)
+        .and_then(|_| write_object(&thumb, &enc_thumb))
+        .and_then(|_| sync_dir(objects));
+    if let Err(e) = persisted {
+        let _ = fs::remove_file(&original);
+        let _ = fs::remove_file(&thumb);
+        return ImportOutcome::Failed(ImportFailure::temporary(format!(
+            "Cannot save encrypted media: {e}"
+        )));
     }
-    hashes.insert(hash.clone());
+    hashes.insert(hash.clone(), id.clone());
     ImportOutcome::Added(
         id,
         PhotoInfo {
@@ -1260,69 +1843,190 @@ fn import_one(
             width: media.width,
             height: media.height,
         },
+        proof,
     )
 }
 
-/// Content hashes eligible for duplicate skipping. Trashed photos don't
-/// count — they're on a purge timer, so a re-import must create a fresh copy
-/// rather than being "skipped" into eventual data loss.
-fn existing_hashes(vault: &Vault) -> HashSet<String> {
+/// Content hashes eligible for duplicate skipping, mapped to the photo that
+/// holds each one. Trashed photos don't count — they're on a purge timer, so a
+/// re-import must create a fresh copy rather than being "skipped" into
+/// eventual data loss.
+fn existing_hashes(vault: &Vault) -> HashMap<String, String> {
     vault
         .photos
-        .values()
-        .filter(|p| p.deleted.is_none())
-        .filter_map(|p| p.hash.clone())
+        .iter()
+        .filter(|(_, p)| p.deleted.is_none())
+        .filter_map(|(id, p)| p.hash.clone().map(|hash| (hash, id.clone())))
         .collect()
+}
+
+/// File photos already in the vault into an album — the duplicates an
+/// album-targeted import skipped. Dropping a photo you already own onto an
+/// album should still put it in that album.
+fn file_existing_into_album(
+    state: &Mutex<Vault>,
+    ids: &[String],
+    album: &str,
+) -> Result<(), String> {
+    let mut vault = vlock(state);
+    let key = vault.key.ok_or("locked")?;
+    // The album can be deleted while a long import runs.
+    if !vault.albums.contains_key(album) {
+        return Ok(());
+    }
+    let original_albums: Vec<_> = ids
+        .iter()
+        .filter_map(|id| {
+            vault
+                .photos
+                .get(id)
+                .map(|photo| (id.clone(), photo.albums.clone()))
+        })
+        .collect();
+    for id in ids {
+        if let Some(p) = vault.photos.get_mut(id) {
+            if !p.albums.iter().any(|a| a == album) {
+                p.albums.push(album.to_string());
+            }
+        }
+    }
+    if let Err(e) = persist_index(&vault, &key) {
+        for (id, albums) in original_albums {
+            if let Some(photo) = vault.photos.get_mut(&id) {
+                photo.albums = albums;
+            }
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn run_import(
     files: Vec<PathBuf>,
     key: [u8; 32],
     objects: PathBuf,
-    mut hashes: HashSet<String>,
+    mut hashes: HashMap<String, String>,
     skip_dups: bool,
-    app: &tauri::AppHandle,
-    state: &VaultState<'_>,
+    album: Option<String>,
+    mut progress: impl FnMut(ImportProgress),
+    state: &Mutex<Vault>,
 ) -> Result<ImportResult, String> {
     let total = files.len();
     let mut batch: Vec<(String, PhotoInfo)> = Vec::new();
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
+    let mut dup_files: Vec<(String, PathBuf)> = Vec::new();
+    let mut result = ImportResult::default();
+    let mut pending = Vec::new();
+    let commit = |batch: &mut Vec<(String, PhotoInfo)>,
+                  pending: &mut Vec<PathBuf>,
+                  result: &mut ImportResult| {
+        match flush_batch(&*state, batch) {
+            Ok(()) => {
+                result.imported += pending.len();
+                pending.clear();
+                true
+            }
+            Err(e) => {
+                // A lock failure leaves the batch intact; do not retry files already reported as failed.
+                batch.clear();
+                for path in pending.drain(..) {
+                    result.issue(
+                        &path,
+                        format!("Could not save library index: {e}"),
+                        "import",
+                        true,
+                    );
+                }
+                false
+            }
+        }
+    };
     for (i, path) in files.iter().enumerate() {
         if i % 25 == 0 {
-            let _ = app.emit("import-progress", ImportProgress { done: i, total });
+            progress(ImportProgress { done: i, total });
         }
         match import_one(&key, &objects, path, &mut hashes, skip_dups) {
-            ImportOutcome::Added(id, info) => {
+            ImportOutcome::Added(id, mut info, _) => {
+                if let Some(album) = &album {
+                    info.albums.push(album.clone());
+                }
                 batch.push((id, info));
-                imported += 1;
-                // Persist periodically so a crash mid-import keeps what's done.
-                if batch.len() >= 100 {
-                    flush_batch(state, &mut batch)?;
+                pending.push(path.clone());
+                if batch.len() >= 100 && !commit(&mut batch, &mut pending, &mut result) {
+                    for path in &files[i + 1..] {
+                        result.issue(
+                            path,
+                            "Not attempted because the index could not be saved.".into(),
+                            "import",
+                            true,
+                        );
+                    }
+                    break;
                 }
             }
-            ImportOutcome::Skipped => skipped += 1,
-            ImportOutcome::Failed => {}
+            ImportOutcome::Skipped(existing, _) => {
+                // Count duplicates only after the source entry has reached the index.
+                if batch.iter().any(|(id, _)| id == &existing)
+                    && !commit(&mut batch, &mut pending, &mut result)
+                {
+                    for path in &files[i..] {
+                        result.issue(
+                            path,
+                            "Not imported because the index could not be saved.".into(),
+                            "import",
+                            true,
+                        );
+                    }
+                    break;
+                }
+                result.skipped += 1;
+                if album.is_some() {
+                    dup_files.push((existing, path.clone()));
+                }
+            }
+            ImportOutcome::Failed(e) => result.issue(path, e.reason, "import", e.retryable),
         }
     }
-    flush_batch(state, &mut batch)?;
-    let _ = app.emit("import-progress", ImportProgress { done: total, total });
-    Ok(ImportResult { imported, skipped })
+    commit(&mut batch, &mut pending, &mut result);
+    if let Some(album) = &album {
+        if !dup_files.is_empty() {
+            let ids: Vec<_> = dup_files.iter().map(|(id, _)| id.clone()).collect();
+            if let Err(e) = file_existing_into_album(&*state, &ids, album) {
+                for (_, path) in dup_files {
+                    result.skipped -= 1;
+                    result.issue(
+                        &path,
+                        format!("Could not add existing photo to album: {e}"),
+                        "import",
+                        true,
+                    );
+                }
+            }
+        }
+    }
+    progress(ImportProgress { done: total, total });
+    Ok(result)
 }
 
+/// Import files/folders into the library, or straight into `album` when the
+/// drop targeted one.
 #[tauri::command]
 async fn import_photos(
     paths: Vec<String>,
+    album: Option<String>,
     app: tauri::AppHandle,
     state: VaultState<'_>,
 ) -> Result<ImportResult, String> {
     let (key, objects, hashes, skip_dups) = {
         let mut vault = vlock(&state);
         let key = vault.active_key().ok_or("locked")?;
-        if vault.importing {
-            return Err("An import is already running.".into());
+        // Checked before claiming the import lock so a bad album id can't
+        // leave `importing` stuck on.
+        if album
+            .as_ref()
+            .is_some_and(|a| !vault.albums.contains_key(a))
+        {
+            return Err("Album not found.".into());
         }
-        vault.importing = true;
         (
             key,
             vault.objects_dir(),
@@ -1330,18 +2034,23 @@ async fn import_photos(
             vault.settings.skip_duplicates,
         )
     };
+    let _import_guard = claim_import(&*state)?;
     // Heavy work (decode + encrypt) happens outside the mutex.
-    let result = run_import(
-        collect_files(&paths),
+    let mut discovery = ImportResult::default();
+    let files = collect_files(&paths, &mut discovery);
+    let mut result = run_import(
+        files,
         key,
         objects,
         hashes,
         skip_dups,
-        &app,
+        album,
+        |progress| { let _ = app.emit("import-progress", progress); },
         &state,
-    );
-    vlock(&state).importing = false;
-    result
+    )?;
+    result.failed += discovery.failed;
+    result.issues.extend(discovery.issues);
+    Ok(result)
 }
 
 /// Sweep orphaned object files (e.g. from an import that crashed before
@@ -1373,6 +2082,9 @@ async fn cleanup_orphans(state: VaultState<'_>) -> Result<usize, String> {
 async fn trash_photos(ids: Vec<String>, state: VaultState<'_>) -> Result<(), String> {
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
+    if vault.importing {
+        return Err("An import is running — wait for it to finish.".into());
+    }
     let now = now_secs();
     for id in &ids {
         if let Some(p) = vault.photos.get_mut(id) {
@@ -1399,12 +2111,15 @@ async fn restore_photos(ids: Vec<String>, state: VaultState<'_>) -> Result<(), S
 async fn purge_photos(ids: Vec<String>, state: VaultState<'_>) -> Result<(), String> {
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
+    if vault.importing {
+        return Err("An import is running — wait for it to finish.".into());
+    }
     let mut changed = false;
+    let mut removed: Vec<(String, PhotoInfo)> = Vec::new();
     for id in &ids {
-        if vault.photos.remove(id).is_some() {
+        if let Some(photo) = vault.photos.remove(id) {
             changed = true;
-            let _ = fs::remove_file(vault.objects_dir().join(id));
-            let _ = fs::remove_file(vault.objects_dir().join(format!("{id}.t")));
+            removed.push((id.clone(), photo));
         }
     }
     if changed {
@@ -1413,7 +2128,20 @@ async fn purge_photos(ids: Vec<String>, state: VaultState<'_>) -> Result<(), Str
                 vault.media_cache = None;
             }
         }
-        persist_index(&vault, &key)?;
+        for id in &ids {
+            vault.thumb_cache.remove(id);
+        }
+        vault.thumb_order.retain(|id| !ids.contains(id));
+        if let Err(e) = persist_index(&vault, &key) {
+            for (id, photo) in removed {
+                vault.photos.insert(id, photo);
+            }
+            return Err(e);
+        }
+        for id in &ids {
+            let _ = fs::remove_file(vault.objects_dir().join(id));
+            let _ = fs::remove_file(vault.objects_dir().join(format!("{id}.t")));
+        }
     }
     Ok(())
 }
@@ -1423,6 +2151,9 @@ async fn empty_trash(state: VaultState<'_>) -> Result<usize, String> {
     let ids: Vec<String> = {
         let mut vault = vlock(&state);
         vault.active_key().ok_or("locked")?;
+        if vault.importing {
+            return Err("An import is running — wait for it to finish.".into());
+        }
         vault
             .photos
             .iter()
@@ -1446,6 +2177,8 @@ async fn clear_vault(state: VaultState<'_>) -> Result<usize, String> {
     vault.photos.clear();
     vault.albums.clear();
     vault.media_cache = None;
+    vault.thumb_cache.clear();
+    vault.thumb_order.clear();
     persist_index(&vault, &key)?;
     if let Ok(entries) = fs::read_dir(vault.objects_dir()) {
         for entry in entries.flatten() {
@@ -1460,18 +2193,41 @@ async fn clear_vault(state: VaultState<'_>) -> Result<usize, String> {
 /// A destination path in `dir` for `name` that doesn't collide:
 /// "photo.jpg", then "photo (1).jpg", "photo (2).jpg", …
 fn unique_dest(dir: &std::path::Path, name: &str) -> PathBuf {
-    let first = dir.join(name);
+    let safe_name = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains('\0'))
+        .unwrap_or("photo");
+    let first = dir.join(safe_name);
     if !first.exists() {
         return first;
     }
-    let (stem, ext) = match name.rsplit_once('.') {
+    let (stem, ext) = match safe_name.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
-        None => (name.to_string(), String::new()),
+        None => (safe_name.to_string(), String::new()),
     };
     (1..)
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
         .find(|p| !p.exists())
         .unwrap()
+}
+
+fn sanitize_photo_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > MAX_PHOTO_NAME_BYTES
+        || name.starts_with('.')
+        || name.starts_with('-')
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(
+            "Name must be a safe filename (1–255 bytes, without separators or a leading dot/dash)."
+                .into(),
+        );
+    }
+    Ok(name.to_string())
 }
 
 #[tauri::command]
@@ -1558,7 +2314,13 @@ async fn backup_vault(
         .compression_method(zip::CompressionMethod::Stored)
         .large_file(true);
     let mut count = 0usize;
-    for name in ["meta.json", "settings.json", "index.enc", "index.bak"] {
+    for name in [
+        "meta.json",
+        "meta.bak",
+        "settings.json",
+        "index.enc",
+        "index.bak",
+    ] {
         if let Ok(bytes) = fs::read(dir.join(name)) {
             zw.start_file(name, opts).map_err(|e| e.to_string())?;
             zw.write_all(&bytes).map_err(|e| e.to_string())?;
@@ -1595,8 +2357,10 @@ fn safe_backup_entry(name: &str) -> bool {
     if name.contains("..") || name.starts_with('/') || name.contains('\\') {
         return false;
     }
-    matches!(name, "meta.json" | "settings.json" | "index.enc" | "index.bak")
-        || name == "objects/"
+    matches!(
+        name,
+        "meta.json" | "meta.bak" | "settings.json" | "index.enc" | "index.bak"
+    ) || name == "objects/"
         || name
             .strip_prefix("objects/")
             .map_or(false, |f| !f.is_empty() && !f.contains('/'))
@@ -1618,7 +2382,11 @@ async fn restore_backup(src: String, state: VaultState<'_>) -> Result<(), String
         .map_err(|_| "That file isn't a readable zip archive.".to_string())?;
     let mut has_meta = false;
     for i in 0..zip.len() {
-        let name = zip.by_index(i).map_err(|e| e.to_string())?.name().to_string();
+        let name = zip
+            .by_index(i)
+            .map_err(|e| e.to_string())?
+            .name()
+            .to_string();
         if !safe_backup_entry(&name) {
             return Err("The backup contains unexpected files — not restoring.".into());
         }
@@ -1761,7 +2529,7 @@ fn media_response(
         .header("Content-Type", mime)
         .header("Accept-Ranges", "bytes")
         .header("Cache-Control", "no-store")
-        .header("Access-Control-Allow-Origin", "*");
+        .header("X-Content-Type-Options", "nosniff");
     match range {
         Some((start, end)) => builder
             .status(206)
@@ -1796,7 +2564,7 @@ fn cache_thumb(vault: &mut Vault, id: &str, data: Arc<Vec<u8>>) {
 fn media_error(status: u16) -> tauri::http::Response<Vec<u8>> {
     tauri::http::Response::builder()
         .status(status)
-        .header("Access-Control-Allow-Origin", "*")
+        .header("X-Content-Type-Options", "nosniff")
         .body(Vec::new())
         .unwrap()
 }
@@ -1879,21 +2647,51 @@ fn serve_media(
 
 // ----------------------------------------------------------------- inbox ---
 
-#[derive(Serialize, Clone)]
-struct InboxImported {
-    count: usize,
+type FileSig = (u64, SystemTime, u64, u64, i64, i64);
+
+fn file_signature(metadata: &fs::Metadata) -> FileSig {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.len(),
+            metadata.modified().unwrap_or(UNIX_EPOCH),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    }
+    #[cfg(not(unix))]
+    (
+        metadata.len(),
+        metadata.modified().unwrap_or(UNIX_EPOCH),
+        0,
+        0,
+        0,
+        0,
+    )
 }
 
-type FileSig = (u64, SystemTime);
-
 /// Media files anywhere under the inbox — folders dropped in are walked
-/// recursively. Hidden entries and symlinks are skipped; depth is bounded so
-/// a pathological tree can't wedge the watcher.
+/// recursively, and the result is sorted by name so files are imported in the
+/// order the inbox folder shows them. Hidden entries and symlinks are skipped;
+/// depth is bounded so a pathological tree can't wedge the watcher.
 fn scan_inbox_media(dir: &std::path::Path, depth: u32, out: &mut Vec<(PathBuf, FileSig)>) {
     if depth > 8 {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    if depth == 0 {
+        let Ok(meta) = fs::symlink_metadata(dir) else {
+            return;
+        };
+        if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
+            return;
+        }
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
@@ -1904,12 +2702,12 @@ fn scan_inbox_media(dir: &std::path::Path, depth: u32, out: &mut Vec<(PathBuf, F
             scan_inbox_media(&path, depth + 1, out);
         } else if ft.is_file() && is_media_path(&path) {
             if let Ok(md) = entry.metadata() {
-                out.push((path, (md.len(), md.modified().unwrap_or(UNIX_EPOCH))));
+                out.push((path, file_signature(&md)));
             }
         }
     }
     if depth == 0 {
-        out.sort_by_cached_key(|(path, _)| (source_order_time(path), path.clone()));
+        out.sort_by_cached_key(|(path, _)| path_sort_key(path));
     }
 }
 
@@ -1945,58 +2743,134 @@ fn run_inbox_import(
     files: Vec<PathBuf>,
     key: [u8; 32],
     objects: PathBuf,
-    mut hashes: HashSet<String>,
+    mut hashes: HashMap<String, String>,
     skip_dups: bool,
     inbox: &std::path::Path,
-    app: &tauri::AppHandle,
-    state: &VaultState<'_>,
-) -> Result<ImportResult, String> {
+    mut progress: impl FnMut(ImportProgress),
+    state: &Mutex<Vault>,
+) -> ImportResult {
     let total = files.len();
-    let mut batch: Vec<(String, PhotoInfo)> = Vec::new();
-    let mut pending: Vec<PathBuf> = Vec::new();
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
-
-    let commit = |batch: &mut Vec<(String, PhotoInfo)>,
-                  pending: &mut Vec<PathBuf>,
-                  imported: &mut usize|
-     -> Result<(), String> {
-        flush_batch(state, batch)?;
-        *imported += pending.len();
-        for path in pending.drain(..) {
-            let _ = fs::remove_file(&path);
-            if let Some(parent) = path.parent() {
-                prune_empty_dirs(inbox, parent);
-            }
-        }
-        Ok(())
-    };
-
+    let mut batch = Vec::new();
+    let mut pending = Vec::new();
+    let mut result = ImportResult::default();
     for (i, path) in files.iter().enumerate() {
         if i % 25 == 0 {
-            let _ = app.emit("import-progress", ImportProgress { done: i, total });
+            progress(ImportProgress { done: i, total });
         }
-        match import_one(&key, &objects, path, &mut hashes, skip_dups) {
-            ImportOutcome::Added(id, info) => {
+        let mut outcome = import_one(&key, &objects, path, &mut hashes, skip_dups);
+        if let ImportOutcome::Skipped(existing, _) = &outcome {
+            if batch.iter().any(|(id, _)| id == existing)
+                && !commit_inbox_batch(state, &mut batch, &mut pending, inbox, &mut result)
+            {
+                for path in &files[i..] {
+                    result.issue(
+                        path,
+                        "Not imported because the index could not be saved.".into(),
+                        "import",
+                        true,
+                    );
+                }
+                return result;
+            }
+            if !skipped_target_is_live(state, existing) {
+                outcome = import_one(&key, &objects, path, &mut hashes, false);
+            }
+        }
+        match outcome {
+            ImportOutcome::Added(id, info, proof) => {
+                pending.push((path.clone(), id.clone(), proof));
                 batch.push((id, info));
-                pending.push(path.clone());
-                if batch.len() >= 20 {
-                    commit(&mut batch, &mut pending, &mut imported)?;
+                if batch.len() >= 20
+                    && !commit_inbox_batch(state, &mut batch, &mut pending, inbox, &mut result)
+                {
+                    for path in &files[i + 1..] {
+                        result.issue(
+                            path,
+                            "Not attempted because the index could not be saved.".into(),
+                            "import",
+                            true,
+                        );
+                    }
+                    return result;
                 }
             }
-            ImportOutcome::Skipped => {
-                skipped += 1;
-                let _ = fs::remove_file(path);
-                if let Some(parent) = path.parent() {
-                    prune_empty_dirs(inbox, parent);
-                }
+            ImportOutcome::Skipped(id, proof) => {
+                result.skipped += 1;
+                cleanup_inbox_source(state, inbox, path, &id, &proof, &mut result);
             }
-            ImportOutcome::Failed => {}
+            ImportOutcome::Failed(e) => result.issue(path, e.reason, "import", e.retryable),
         }
     }
-    commit(&mut batch, &mut pending, &mut imported)?;
-    let _ = app.emit("import-progress", ImportProgress { done: total, total });
-    Ok(ImportResult { imported, skipped })
+    commit_inbox_batch(state, &mut batch, &mut pending, inbox, &mut result);
+    progress(ImportProgress { done: total, total });
+    result
+}
+
+fn cleanup_inbox_source(
+    state: &Mutex<Vault>,
+    inbox: &std::path::Path,
+    path: &std::path::Path,
+    id: &str,
+    proof: &SourceProof,
+    result: &mut ImportResult,
+) {
+    // Keep delete/trash from removing the duplicate target until source cleanup finishes.
+    let vault = vlock(state);
+    let mut retained = None;
+    let mut saved = || -> Result<(), String> {
+        let key = vault.key.ok_or("Vault locked before original cleanup.")?;
+        let info = vault
+            .photos
+            .get(id)
+            .filter(|p| p.deleted.is_none())
+            .ok_or("Saved photo was removed before original cleanup.")?;
+        if info.hash.as_deref() != Some(proof.hash.to_hex().as_str()) {
+            return Err("Saved photo no longer matches the original.".into());
+        }
+        // Old objects may predate durable writes. Verify and sync duplicates before discarding plaintext.
+        let object = vault.objects_dir().join(id);
+        let encrypted = fs::read(&object).map_err(|e| e.to_string())?;
+        if blake3::hash(&decrypt(&key, &encrypted)?) != proof.hash {
+            return Err("Saved encrypted original is damaged.".into());
+        }
+        fs::File::open(&object)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        fs::File::open(vault.objects_dir().join(format!("{id}.t")))
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        sync_dir(&vault.objects_dir())?;
+        delete_inbox_source(inbox, path, proof, &mut retained)
+    };
+    if let Err(e) = saved() {
+        result.issue(path, e, "cleanup", true);
+        result.issues.last_mut().unwrap().retry_path = retained;
+    }
+}
+
+fn commit_inbox_batch(
+    state: &Mutex<Vault>,
+    batch: &mut Vec<(String, PhotoInfo)>,
+    pending: &mut Vec<(PathBuf, String, SourceProof)>,
+    inbox: &std::path::Path,
+    result: &mut ImportResult,
+) -> bool {
+    if let Err(e) = flush_batch(state, batch) {
+        for (path, _, _) in pending.drain(..) {
+            result.issue(
+                &path,
+                format!("Could not save library index: {e}"),
+                "import",
+                true,
+            );
+        }
+        return false;
+    }
+    result.imported += pending.len();
+    for (path, id, proof) in pending.drain(..) {
+        cleanup_inbox_source(state, inbox, &path, &id, &proof, result);
+    }
+    true
 }
 
 /// Manually process media that accumulated in PhotoVault Inbox while the
@@ -2011,22 +2885,24 @@ async fn process_inbox(
     let mut first = Vec::new();
     scan_inbox_media(&inbox, 0, &mut first);
     let first: HashMap<PathBuf, FileSig> = first.into_iter().collect();
-    std::thread::sleep(Duration::from_millis(350));
+    std::thread::sleep(Duration::from_millis(2200));
     let mut second = Vec::new();
     scan_inbox_media(&inbox, 0, &mut second);
     let files: Vec<PathBuf> = second
         .into_iter()
-        .filter(|(path, sig)| first.get(path) == Some(sig))
+        .filter(|(path, sig)| {
+            first.get(path) == Some(sig)
+                && sig
+                    .1
+                    .elapsed()
+                    .map_or(false, |age| age >= INBOX_MIN_FILE_AGE)
+        })
         .map(|(path, _)| path)
         .collect();
 
     let (key, objects, hashes, skip_dups) = {
         let mut vault = vlock(&state);
         let key = vault.active_key().ok_or("locked")?;
-        if vault.importing {
-            return Err("An import is already running.".into());
-        }
-        vault.importing = true;
         (
             key,
             vault.objects_dir(),
@@ -2034,18 +2910,19 @@ async fn process_inbox(
             vault.settings.skip_duplicates,
         )
     };
-    let result = run_inbox_import(
+    let _import_guard = claim_import(&*state)?;
+    Ok(run_inbox_import(
         files,
         key,
         objects,
         hashes,
         skip_dups,
         &inbox,
-        &app,
+        |progress| {
+            let _ = app.emit("import-progress", progress);
+        },
         &state,
-    );
-    vlock(&state).importing = false;
-    result
+    ))
 }
 
 /// Watch the inbox folder: media saved there — loose files or entire dropped
@@ -2058,37 +2935,86 @@ async fn process_inbox(
 /// leaves the plaintext in place for the next cycle, and the orphaned object
 /// files are swept by cleanup_orphans. Folders emptied by an import are
 /// removed too.
+struct InboxRetry {
+    signature: FileSig,
+    attempts: u32,
+    next: Option<Instant>,
+}
+
+impl InboxRetry {
+    fn record(signature: FileSig, previous: Option<&Self>, retryable: bool, now: Instant) -> Self {
+        let attempts = previous
+            .filter(|p| p.signature == signature)
+            .map_or(1, |p| p.attempts.saturating_add(1));
+        let delay = 2u64.saturating_pow(attempts.min(6)).min(60);
+        Self {
+            signature,
+            attempts,
+            next: retryable.then(|| now + Duration::from_secs(delay)),
+        }
+    }
+
+    fn ready(&self, signature: FileSig, now: Instant) -> bool {
+        self.signature != signature || self.next.is_some_and(|next| now >= next)
+    }
+}
+
+fn inbox_retry_after_failure(
+    path: &std::path::Path,
+    signature: FileSig,
+    issue: &ImportIssue,
+    previous: Option<InboxRetry>,
+    now: Instant,
+) -> (PathBuf, InboxRetry) {
+    let retry_path = issue.retry_path.as_deref().unwrap_or(path);
+    // A failure belongs to the scanned file. A replacement must not inherit its suppression.
+    let retry_sig = if issue.retry_path.is_some() {
+        fs::metadata(retry_path)
+            .map(|metadata| file_signature(&metadata))
+            .unwrap_or(signature)
+    } else {
+        signature
+    };
+    let previous = previous.map(|mut retry| {
+        retry.signature = retry_sig;
+        retry
+    });
+    let retry = InboxRetry::record(retry_sig, previous.as_ref(), issue.retryable, now);
+    (retry_path.to_path_buf(), retry)
+}
+
 fn inbox_watcher(app: tauri::AppHandle) {
-    type Sig = FileSig;
-    let mut prev: HashMap<PathBuf, Sig> = HashMap::new();
-    // Undecodable files, keyed with size+mtime so a same-named replacement
-    // still gets retried.
-    let mut failed: HashSet<(PathBuf, Sig)> = HashSet::new();
+    let mut prev = HashMap::new();
+    let mut retries: HashMap<PathBuf, InboxRetry> = HashMap::new();
     loop {
         std::thread::sleep(Duration::from_secs(2));
         let state: State<Mutex<Vault>> = app.state();
         let inbox = vlock(&state).inbox.clone();
-        let mut ready: Vec<(PathBuf, Sig)> = Vec::new();
-        let mut cur: HashMap<PathBuf, Sig> = HashMap::new();
-        let mut found: Vec<(PathBuf, Sig)> = Vec::new();
+        let mut found = Vec::new();
         scan_inbox_media(&inbox, 0, &mut found);
-        for (path, sig) in found {
-            if !failed.contains(&(path.clone(), sig)) && prev.get(&path) == Some(&sig) {
-                ready.push((path.clone(), sig));
-            }
-            cur.insert(path, sig);
-        }
+        let cur: HashMap<_, _> = found.iter().cloned().collect();
+        let ready: Vec<_> = found
+            .into_iter()
+            .filter(|(path, sig)| {
+                prev.get(path) == Some(sig)
+                    && sig.1.elapsed().is_ok_and(|age| age >= INBOX_MIN_FILE_AGE)
+                    && retries
+                        .get(path)
+                        .is_none_or(|retry| retry.ready(*sig, Instant::now()))
+            })
+            .collect();
+        retries.retain(|path, retry| cur.get(path) == Some(&retry.signature));
         prev = cur;
         if ready.is_empty() {
             continue;
         }
-        let (key, objects, mut hashes, skip_dups) = {
-            let mut vault = vlock(&state);
-            let Some(key) = vault.active_key() else { continue };
-            if vault.importing {
-                continue;
-            }
-            vault.importing = true;
+        let _import_guard = match claim_import(&*state) {
+            Ok(guard) => guard,
+            Err(_) => continue,
+        };
+        let (key, objects, hashes, skip_dups) = {
+            let vault = vlock(&state);
+            let Some(key) = vault.key else { continue };
             (
                 key,
                 vault.objects_dir(),
@@ -2096,57 +3022,35 @@ fn inbox_watcher(app: tauri::AppHandle) {
                 vault.settings.skip_duplicates,
             )
         };
-        let mut batch: Vec<(String, PhotoInfo)> = Vec::new();
-        let mut pending: Vec<PathBuf> = Vec::new(); // originals awaiting a flush
-        let mut imported = 0usize;
-        let mut aborted = false;
-        for (path, sig) in &ready {
-            match import_one(&key, &objects, path, &mut hashes, skip_dups) {
-                ImportOutcome::Added(id, info) => {
-                    batch.push((id, info));
-                    pending.push(path.clone());
-                    if batch.len() >= 20 {
-                        if flush_batch(&state, &mut batch).is_ok() {
-                            imported += pending.len();
-                            for p in pending.drain(..) {
-                                let _ = fs::remove_file(&p);
-                                if let Some(parent) = p.parent() {
-                                    prune_empty_dirs(&inbox, parent);
-                                }
-                            }
-                        } else {
-                            aborted = true;
-                            break;
-                        }
-                    }
-                }
-                // An identical copy is already persisted in the vault — the
-                // plaintext can go.
-                ImportOutcome::Skipped => {
-                    let _ = fs::remove_file(path);
-                    if let Some(parent) = path.parent() {
-                        prune_empty_dirs(&inbox, parent);
-                    }
-                }
-                // Unreadable/undecodable: leave the file, stop retrying it.
-                ImportOutcome::Failed => {
-                    failed.insert((path.clone(), *sig));
-                }
+        let result = run_inbox_import(
+            ready.iter().map(|(path, _)| path.clone()).collect(),
+            key,
+            objects,
+            hashes,
+            skip_dups,
+            &inbox,
+            |_| {},
+            &state,
+        );
+        for (path, sig) in ready {
+            if let Some(issue) = result
+                .issues
+                .iter()
+                .find(|issue| issue.name == path.to_string_lossy())
+            {
+                let (retry_path, retry) = inbox_retry_after_failure(
+                    &path,
+                    sig,
+                    issue,
+                    retries.remove(&path),
+                    Instant::now(),
+                );
+                retries.insert(retry_path, retry);
+            } else {
+                retries.remove(&path);
             }
         }
-        if !aborted && flush_batch(&state, &mut batch).is_ok() {
-            imported += pending.len();
-            for p in pending.drain(..) {
-                let _ = fs::remove_file(&p);
-                if let Some(parent) = p.parent() {
-                    prune_empty_dirs(&inbox, parent);
-                }
-            }
-        }
-        vlock(&state).importing = false;
-        if imported > 0 {
-            let _ = app.emit("inbox-imported", InboxImported { count: imported });
-        }
+        let _ = app.emit("inbox-imported", result);
     }
 }
 
@@ -2167,8 +3071,14 @@ fn main() {
         let rx = media_rx.clone();
         std::thread::spawn(move || loop {
             let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-            let Ok((app, request, responder)) = job else { return };
-            responder.respond(serve_media(&app, &request));
+            let Ok((app, request, responder)) = job else {
+                return;
+            };
+            let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                serve_media(&app, &request)
+            }))
+            .unwrap_or_else(|_| media_error(500));
+            responder.respond(response);
         });
     }
     tauri::Builder::default()
@@ -2180,7 +3090,19 @@ fn main() {
             let dir = app.path().app_data_dir()?.join("vault");
             fs::create_dir_all(&dir)?;
             let inbox = app.path().home_dir()?.join("PhotoVault Inbox");
-            fs::create_dir_all(&inbox)?;
+            let inbox_is_real_dir = match fs::symlink_metadata(&inbox) {
+                Ok(meta) => meta.file_type().is_dir() && !meta.file_type().is_symlink(),
+                Err(_) => {
+                    fs::create_dir_all(&inbox)?;
+                    true
+                }
+            };
+            if !inbox_is_real_dir {
+                eprintln!(
+                    "PhotoVault Inbox is not a real directory; inbox watching is disabled: {}",
+                    inbox.display()
+                );
+            }
             let settings: Settings = fs::read(dir.join("settings.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
@@ -2195,6 +3117,7 @@ fn main() {
                 last_activity: Instant::now(),
                 importing: false,
                 settings,
+                meta_lock: Arc::new(Mutex::new(())),
                 media_cache: None,
                 thumb_cache: HashMap::new(),
                 thumb_order: VecDeque::new(),
@@ -2209,14 +3132,16 @@ fn main() {
                 let state: State<Mutex<Vault>> = handle.state();
                 let should = {
                     let vault = vlock(&state);
-                    vault.settings.lock_on_sleep && vault.key.is_some() && !vault.importing
+                    vault.settings.lock_on_sleep && vault.key.is_some()
                 };
                 if should {
                     do_system_lock(&handle);
                 }
             });
-            let handle = app.handle().clone();
-            std::thread::spawn(move || inbox_watcher(handle));
+            if inbox_is_real_dir {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || inbox_watcher(handle));
+            }
             let handle = app.handle().clone();
             std::thread::spawn(move || lock_timer(handle));
             Ok(())
@@ -2271,6 +3196,39 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn test_vault(dir: PathBuf, key: Option<[u8; 32]>) -> Vault {
+        Vault {
+            dir,
+            inbox: PathBuf::new(),
+            key,
+            photos: HashMap::new(),
+            albums: HashMap::new(),
+            last_activity: Instant::now(),
+            importing: false,
+            settings: Settings::default(),
+            meta_lock: Arc::new(Mutex::new(())),
+            media_cache: None,
+            thumb_cache: HashMap::new(),
+            thumb_order: VecDeque::new(),
+        }
+    }
+
+    fn test_photo(deleted: Option<f64>) -> PhotoInfo {
+        PhotoInfo {
+            name: "photo.jpg".into(),
+            added: 1.0,
+            size: Some(3),
+            taken: None,
+            hash: Some("same-hash".into()),
+            favorite: false,
+            deleted,
+            albums: Vec::new(),
+            tags: Vec::new(),
+            width: None,
+            height: None,
+        }
+    }
+
     #[test]
     fn crypto_roundtrip_and_tamper() {
         let key = random_key();
@@ -2284,21 +3242,159 @@ mod tests {
     }
 
     #[test]
+    fn meta_deserializes_legacy_defaults_and_new_parameters() {
+        let legacy: Meta = serde_json::from_slice(br#"{"salt":"00","verifier":"00"}"#).unwrap();
+        assert_eq!(legacy.n, LEGACY_SCRYPT_LOG_N);
+        assert_eq!(legacy.r, DEFAULT_SCRYPT_R);
+        assert_eq!(legacy.p, DEFAULT_SCRYPT_P);
+
+        let new: Meta = serde_json::from_slice(
+            br#"{"salt":"00","verifier":"00","n":17,"r":8,"p":1,"wrapped_master":"aa"}"#,
+        )
+        .unwrap();
+        assert_eq!((new.n, new.r, new.p), (17, 8, 1));
+        assert!(new.wrapped_master.is_some());
+    }
+
+    #[test]
+    fn meta_read_falls_back_to_meta_backup() {
+        let dir = std::env::temp_dir().join(format!("pv-meta-{}", random_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let master = random_key();
+        let mut old = Meta {
+            salt: String::new(),
+            verifier: String::new(),
+            n: LEGACY_SCRYPT_LOG_N,
+            r: DEFAULT_SCRYPT_R,
+            p: DEFAULT_SCRYPT_P,
+            wrapped_master: None,
+            recovery: None,
+        };
+        rewrap_master(&mut old, "old password", &master).unwrap();
+        write_meta(&dir, &old).unwrap();
+        let old_salt = old.salt.clone();
+        let mut current = old;
+        rewrap_master(&mut current, "new password", &master).unwrap();
+        write_meta(&dir, &current).unwrap();
+
+        // The backup is the same generation, not the previous one: the master
+        // key outlives a password change, so a retired salt + wrapped_master
+        // left on disk would keep the old password working forever.
+        let backup: Meta =
+            serde_json::from_slice(&fs::read(dir.join("meta.bak")).unwrap()).unwrap();
+        assert_eq!(backup.salt, current.salt);
+        for name in ["meta.json", "meta.bak"] {
+            let raw = String::from_utf8(fs::read(dir.join(name)).unwrap()).unwrap();
+            assert!(!raw.contains(&old_salt), "{name} still holds the retired salt");
+        }
+
+        // ...and it is still a usable fallback for a torn primary write.
+        fs::write(dir.join("meta.json"), b"truncated").unwrap();
+        assert_eq!(read_meta(&dir).unwrap().salt, current.salt);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_index_falls_back_to_backup_when_current_is_corrupt() {
+        let dir = std::env::temp_dir().join(format!("pv-index-{}", random_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let key = random_key();
+        let vault = test_vault(dir.clone(), Some(key));
+        let json = br#"{"photos":{"id":{"name":"a.jpg","added":1}},"albums":{}}"#;
+        fs::write(dir.join("index.enc"), b"corrupt").unwrap();
+        fs::write(dir.join("index.bak"), encrypt(&key, json).unwrap()).unwrap();
+        let loaded = load_index(&vault, &key).unwrap();
+        assert_eq!(loaded.photos["id"].name, "a.jpg");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_batch_rolls_back_memory_when_persist_fails() {
+        let dir = std::env::temp_dir().join(format!("pv-no-dir-{}", random_id()));
+        let key = random_key();
+        let state = Mutex::new(test_vault(dir, Some(key)));
+        let id = "new-photo".to_string();
+        let mut batch = vec![(id.clone(), test_photo(None))];
+        assert!(flush_batch(&state, &mut batch).is_err());
+        assert!(batch.is_empty());
+        assert!(!vlock(&state).photos.contains_key(&id));
+    }
+
+    #[test]
+    fn inbox_plaintext_survives_when_index_persist_fails() {
+        let inbox = std::env::temp_dir().join(format!("pv-inbox-fail-{}", random_id()));
+        fs::create_dir_all(&inbox).unwrap();
+        let plaintext = inbox.join("photo.jpg");
+        fs::write(&plaintext, b"plaintext").unwrap();
+        let state_dir = std::env::temp_dir().join(format!("pv-no-index-{}", random_id()));
+        let state = Mutex::new(test_vault(state_dir, Some(random_key())));
+        let mut batch = vec![("id".into(), test_photo(None))];
+        let (_, proof) = read_source(&plaintext).unwrap();
+        let mut pending = vec![(plaintext.clone(), "id".into(), proof)];
+        let mut result = ImportResult::default();
+        assert!(!commit_inbox_batch(&state, &mut batch, &mut pending, &inbox, &mut result));
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.failed, 1);
+        assert!(plaintext.exists());
+        let _ = fs::remove_dir_all(&inbox);
+    }
+
+    #[test]
+    fn existing_hashes_excludes_trashed_photos() {
+        let mut vault = test_vault(PathBuf::new(), Some(random_key()));
+        vault.photos.insert("live".into(), test_photo(None));
+        vault.photos.insert("trash".into(), test_photo(Some(10.0)));
+        let hashes = existing_hashes(&vault);
+        assert_eq!(hashes.get("same-hash"), Some(&"live".to_string()));
+        vault.photos.remove("live");
+        assert!(!existing_hashes(&vault).contains_key("same-hash"));
+    }
+
+    #[test]
+    fn album_targeted_duplicate_filing_persists_album_assignment() {
+        let dir = std::env::temp_dir().join(format!("pv-album-{}", random_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let key = random_key();
+        let mut vault = test_vault(dir.clone(), Some(key));
+        vault.albums.insert(
+            "album".into(),
+            Album {
+                name: "Trip".into(),
+                created: 1.0,
+            },
+        );
+        vault.photos.insert("photo".into(), test_photo(None));
+        let state = Mutex::new(vault);
+        file_existing_into_album(&state, &["photo".into()], "album").unwrap();
+        assert_eq!(vlock(&state).photos["photo"].albums, vec!["album"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn envelope_wrap_unwrap_and_password_change() {
         let master = random_key();
         let mut meta = Meta {
             salt: String::new(),
             verifier: String::new(),
+            n: LEGACY_SCRYPT_LOG_N,
+            r: DEFAULT_SCRYPT_R,
+            p: DEFAULT_SCRYPT_P,
             wrapped_master: None,
             recovery: None,
         };
         rewrap_master(&mut meta, "first password", &master).unwrap();
-        assert_eq!(master_from_password("first password", &meta).unwrap(), master);
+        assert_eq!(
+            master_from_password("first password", &meta).unwrap(),
+            master
+        );
         assert!(master_from_password("wrong password", &meta).is_err());
         // Password change re-wraps the same master key.
         rewrap_master(&mut meta, "second password", &master).unwrap();
         assert!(master_from_password("first password", &meta).is_err());
-        assert_eq!(master_from_password("second password", &meta).unwrap(), master);
+        assert_eq!(
+            master_from_password("second password", &meta).unwrap(),
+            master
+        );
     }
 
     #[test]
@@ -2309,10 +3405,16 @@ mod tests {
         let meta = Meta {
             salt: hex::encode(salt),
             verifier: hex::encode(encrypt(&master, VERIFIER_PLAINTEXT).unwrap()),
+            n: LEGACY_SCRYPT_LOG_N,
+            r: DEFAULT_SCRYPT_R,
+            p: DEFAULT_SCRYPT_P,
             wrapped_master: None,
             recovery: None,
         };
-        assert_eq!(master_from_password("legacy password", &meta).unwrap(), master);
+        assert_eq!(
+            master_from_password("legacy password", &meta).unwrap(),
+            master
+        );
         assert!(master_from_password("not it", &meta).is_err());
     }
 
@@ -2384,44 +3486,109 @@ mod tests {
     }
 
     #[test]
-    fn collected_files_follow_source_creation_order() {
-        let root = std::env::temp_dir().join(format!("pv-order-{}", random_id()));
-        fs::create_dir_all(&root).unwrap();
-        let first = root.join("z-first.jpg");
-        let second = root.join("a-second.jpg");
-        fs::write(&first, b"first").unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        fs::write(&second, b"second").unwrap();
+    fn name_key_orders_leading_zero_ties_deterministically() {
+        assert!(name_key("0") < name_key("00"));
+        assert!(name_key("01") < name_key("1"));
+        assert_ne!(name_key("0"), name_key("00"));
+        assert_ne!(name_key("01"), name_key("1"));
+    }
 
-        let found = collect_files(&[root.to_string_lossy().into_owned()]);
-        assert_eq!(found, [first, second]);
+    #[test]
+    fn export_destination_cannot_escape_directory() {
+        let dir = PathBuf::from("/tmp/export");
+        assert_eq!(
+            unique_dest(&dir, "../../outside.jpg"),
+            dir.join("outside.jpg")
+        );
+        assert_eq!(unique_dest(&dir, "/absolute.jpg"), dir.join("absolute.jpg"));
+        assert_eq!(sanitize_photo_name("safe.jpg").unwrap(), "safe.jpg");
+        assert!(sanitize_photo_name("../outside.jpg").is_err());
+        assert!(sanitize_photo_name("-unsafe.jpg").is_err());
+        assert!(sanitize_photo_name(".hidden.jpg").is_err());
+    }
+
+    #[test]
+    fn import_guard_clears_flag_during_unwind() {
+        let state = Mutex::new(test_vault(PathBuf::new(), Some(random_key())));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = claim_import(&state).unwrap();
+            panic!("simulated import panic");
+        }));
+        assert!(result.is_err());
+        assert!(!vlock(&state).importing);
+    }
+
+    #[test]
+    fn collected_files_follow_name_order_not_creation_order() {
+        let root = std::env::temp_dir().join(format!("pv-order-{}", random_id()));
+        fs::create_dir_all(root.join("Trip")).unwrap();
+        // Written newest-name-first so creation order contradicts name order.
+        for name in ["IMG_10.jpg", "IMG_9.jpg", "IMG_2.jpg"] {
+            fs::write(root.join(name), b"x").unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(root.join("Trip/b.jpg"), b"x").unwrap();
+        fs::write(root.join("Trip/a.jpg"), b"x").unwrap();
+
+        let found = collect_files(&[root.to_string_lossy().into_owned()], &mut ImportResult::default());
+        assert_eq!(
+            found,
+            [
+                root.join("IMG_2.jpg"),
+                root.join("IMG_9.jpg"),
+                root.join("IMG_10.jpg"),
+                // A folder's contents stay together, in name order.
+                root.join("Trip/a.jpg"),
+                root.join("Trip/b.jpg"),
+            ]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn source_order_has_a_deterministic_path_tiebreaker() {
-        let mut paths = vec![
-            PathBuf::from("z-missing.jpg"),
-            PathBuf::from("a-missing.jpg"),
-        ];
-        sort_paths_by_source_order(&mut paths);
+    fn name_order_is_natural_and_deterministic() {
+        let mut paths: Vec<PathBuf> = ["b/1.jpg", "a/10.jpg", "a/9.jpg", "A/2.jpg", "a/007.jpg"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        sort_paths_by_name(&mut paths);
         assert_eq!(
             paths,
             [
-                PathBuf::from("a-missing.jpg"),
-                PathBuf::from("z-missing.jpg")
+                // "A" and "a" fold to the same key, so their files interleave
+                // by the next component; digits compare as numbers throughout.
+                PathBuf::from("A/2.jpg"),
+                PathBuf::from("a/007.jpg"),
+                PathBuf::from("a/9.jpg"),
+                PathBuf::from("a/10.jpg"),
+                PathBuf::from("b/1.jpg"),
             ]
         );
     }
 
     #[test]
     fn backup_entry_validation() {
-        for ok in ["meta.json", "settings.json", "index.enc", "index.bak",
-                   "objects/", "objects/aabb01", "objects/aabb01.t"] {
+        for ok in [
+            "meta.json",
+            "settings.json",
+            "index.enc",
+            "index.bak",
+            "objects/",
+            "objects/aabb01",
+            "objects/aabb01.t",
+        ] {
             assert!(safe_backup_entry(ok), "{ok} should be accepted");
         }
-        for bad in ["../evil", "/etc/passwd", "objects/../meta.json",
-                    "objects/a/b", "meta.json.bak", "objects", "a\\b", ""] {
+        for bad in [
+            "../evil",
+            "/etc/passwd",
+            "objects/../meta.json",
+            "objects/a/b",
+            "meta.json.bak",
+            "objects",
+            "a\\b",
+            "",
+        ] {
             assert!(!safe_backup_entry(bad), "{bad} should be rejected");
         }
     }
@@ -2430,8 +3597,14 @@ mod tests {
     fn tag_normalization() {
         assert_eq!(
             normalize_tags(vec![
-                "  Beach ".into(), "beach".into(), "".into(), "  ".into(),
-                "Sunset".into(), "BEACH".into(), "sunset ".into(), "Dog".into(),
+                "  Beach ".into(),
+                "beach".into(),
+                "".into(),
+                "  ".into(),
+                "Sunset".into(),
+                "BEACH".into(),
+                "sunset ".into(),
+                "Dog".into(),
             ]),
             vec!["Beach".to_string(), "Sunset".to_string(), "Dog".to_string()]
         );
@@ -2449,6 +3622,7 @@ mod tests {
             last_activity: Instant::now(),
             importing: false,
             settings: Settings::default(),
+            meta_lock: Arc::new(Mutex::new(())),
             media_cache: None,
             thumb_cache: HashMap::new(),
             thumb_order: VecDeque::new(),
@@ -2458,9 +3632,15 @@ mod tests {
         }
         assert_eq!(vault.thumb_cache.len(), THUMB_CACHE_CAP);
         assert!(!vault.thumb_cache.contains_key("id0"));
-        assert!(vault.thumb_cache.contains_key(&format!("id{}", THUMB_CACHE_CAP + 9)));
+        assert!(vault
+            .thumb_cache
+            .contains_key(&format!("id{}", THUMB_CACHE_CAP + 9)));
         // Re-inserting an existing id must not duplicate its order entry.
-        cache_thumb(&mut vault, &format!("id{}", THUMB_CACHE_CAP + 9), Arc::new(vec![1u8]));
+        cache_thumb(
+            &mut vault,
+            &format!("id{}", THUMB_CACHE_CAP + 9),
+            Arc::new(vec![1u8]),
+        );
         assert_eq!(vault.thumb_order.len(), vault.thumb_cache.len());
     }
 
@@ -2516,5 +3696,377 @@ mod tests {
         assert!(is_media_path(std::path::Path::new("/x/IMG_1.HEIC")));
         assert!(is_media_path(std::path::Path::new("/x/v.m4v")));
         assert!(!is_media_path(std::path::Path::new("/x/notes.txt")));
+    }
+
+
+    struct ImportFixture {
+        root: PathBuf,
+        inbox: PathBuf,
+        key: [u8; 32],
+        state: Mutex<Vault>,
+    }
+
+    impl ImportFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("pv-ingestion-{}", random_id()));
+            let inbox = root.join("inbox");
+            let dir = root.join("vault");
+            fs::create_dir_all(&inbox).unwrap();
+            fs::create_dir_all(dir.join("objects")).unwrap();
+            let key = random_key();
+            Self {
+                root,
+                inbox,
+                key,
+                state: Mutex::new(test_vault(dir, Some(key))),
+            }
+        }
+
+        fn photo(&self, name: &str, color: u8) -> PathBuf {
+            let path = self.inbox.join(name);
+            image::RgbImage::from_pixel(2, 2, image::Rgb([color, 1, 2]))
+                .save(&path)
+                .unwrap();
+            path
+        }
+
+        fn run(&self, files: Vec<PathBuf>, progress: impl FnMut(ImportProgress)) -> ImportResult {
+            let vault = vlock(&self.state);
+            let objects = vault.objects_dir();
+            let hashes = existing_hashes(&vault);
+            drop(vault);
+            run_inbox_import(
+                files,
+                self.key,
+                objects,
+                hashes,
+                true,
+                &self.inbox,
+                progress,
+                &self.state,
+            )
+        }
+    }
+
+    impl Drop for ImportFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn inbox_replacement_and_same_inode_edits_are_preserved() {
+        for replace in [true, false] {
+            let fixture = ImportFixture::new();
+            let path = fixture.photo("source.png", 1);
+            let (_, proof) = read_source(&path).unwrap();
+            if replace {
+                fs::remove_file(&path).unwrap();
+            }
+            fs::write(&path, b"changed source").unwrap();
+            assert!(delete_inbox_source(&fixture.inbox, &path, &proof, &mut None).is_err());
+            let mut found = Vec::new();
+            scan_inbox_media(&fixture.inbox, 0, &mut found);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].0.file_name().unwrap(), "source.png");
+            assert_eq!(fs::read(&found[0].0).unwrap(), b"changed source");
+        }
+    }
+
+    #[test]
+    fn inbox_replacement_after_claim_is_untouched() {
+        let fixture = ImportFixture::new();
+        let path = fixture.photo("source.png", 1);
+        let (_, proof) = read_source(&path).unwrap();
+        let replacement = path.clone();
+        AFTER_SOURCE_CLAIM.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(replacement, b"new original pathname").unwrap();
+            }))
+        });
+        delete_inbox_source(&fixture.inbox, &path, &proof, &mut None).unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"new original pathname");
+    }
+
+    #[test]
+    fn inbox_commits_and_cleans_both_new_and_duplicate_files() {
+        let fixture = ImportFixture::new();
+        let first = fixture.photo("first.png", 1);
+        let second = fixture.photo("second.png", 1);
+        let result = fixture.run(vec![first.clone(), second.clone()], |_| {});
+        assert_eq!(
+            (
+                result.imported,
+                result.skipped,
+                result.failed,
+                result.cleanup_failed
+            ),
+            (1, 1, 0, 0)
+        );
+        assert!(result.issues.is_empty());
+        assert!(!first.exists() && !second.exists());
+        assert_eq!(
+            load_index(&vlock(&fixture.state), &fixture.key)
+                .unwrap()
+                .photos
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn replaced_duplicate_reports_cleanup_failure_and_preserves_new_bytes() {
+        let fixture = ImportFixture::new();
+        fixture.run(vec![fixture.photo("first.png", 1)], |_| {});
+        let duplicate = fixture.photo("duplicate.png", 1);
+        let vault = vlock(&fixture.state);
+        let outcome = import_one(
+            &fixture.key,
+            &vault.objects_dir(),
+            &duplicate,
+            &mut existing_hashes(&vault),
+            true,
+        );
+        drop(vault);
+        let ImportOutcome::Skipped(id, proof) = outcome else {
+            panic!("expected duplicate")
+        };
+        fs::remove_file(&duplicate).unwrap();
+        fs::write(&duplicate, b"replacement").unwrap();
+        let mut result = ImportResult::default();
+        cleanup_inbox_source(
+            &fixture.state,
+            &fixture.inbox,
+            &duplicate,
+            &id,
+            &proof,
+            &mut result,
+        );
+        assert_eq!(result.cleanup_failed, 1);
+        assert_eq!(result.issues[0].stage, "cleanup");
+        let mut found = Vec::new();
+        scan_inbox_media(&fixture.inbox, 0, &mut found);
+        assert_eq!(fs::read(&found[0].0).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_hide_successful_import() {
+        let fixture = ImportFixture::new();
+        let path = fixture.photo("source.png", 1);
+        let original = fs::read(&path).unwrap();
+        FAIL_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(fixture.inbox.clone()));
+        let result = fixture.run(vec![path], |_| {});
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        assert_eq!(
+            (result.imported, result.failed, result.cleanup_failed),
+            (1, 0, 1)
+        );
+        assert!(result.issues[0].retryable);
+        let mut found = Vec::new();
+        scan_inbox_media(&fixture.inbox, 0, &mut found);
+        assert_eq!(found.len(), 1);
+        assert_eq!(result.issues[0].retry_path.as_ref(), Some(&found[0].0));
+        let now = Instant::now();
+        let retry = InboxRetry::record(found[0].1, None, true, now);
+        assert!(!retry.ready(found[0].1, now));
+        assert_eq!(fs::read(&found[0].0).unwrap(), original);
+        let retried = fixture.run(vec![found[0].0.clone()], |_| {});
+        assert_eq!(
+            (retried.imported, retried.skipped, retried.cleanup_failed),
+            (0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn object_sync_failure_prevents_index_commit_and_retries_successfully() {
+        let fixture = ImportFixture::new();
+        let path = fixture.photo("source.png", 1);
+        let objects = vlock(&fixture.state).objects_dir();
+        FAIL_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(objects.clone()));
+        let result = fixture.run(vec![path.clone()], |_| {});
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        assert_eq!((result.imported, result.failed), (0, 1));
+        assert!(result.issues[0].retryable);
+        assert!(path.exists());
+        assert!(vlock(&fixture.state).photos.is_empty());
+        assert!(!vlock(&fixture.state).index_path().exists());
+        assert_eq!(fs::read_dir(objects).unwrap().count(), 0);
+        let retried = fixture.run(vec![path.clone()], |_| {});
+        assert_eq!((retried.imported, retried.failed), (1, 0));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn failed_later_batch_retains_earlier_commits_and_remaining_sources() {
+        let fixture = ImportFixture::new();
+        let files: Vec<_> = (0..30)
+            .map(|i| fixture.photo(&format!("{i}.png"), i))
+            .collect();
+        let index_tmp = vlock(&fixture.state).index_path().with_extension("tmp");
+        let result = fixture.run(files.clone(), |progress| {
+            if progress.done == 25 {
+                fs::create_dir(&index_tmp).unwrap();
+            }
+        });
+        assert_eq!(
+            (result.imported, result.failed, result.cleanup_failed),
+            (20, 10, 0)
+        );
+        assert_eq!(result.issues.len(), 10);
+        assert_eq!(
+            load_index(&vlock(&fixture.state), &fixture.key)
+                .unwrap()
+                .photos
+                .len(),
+            20
+        );
+        assert!(files[..20].iter().all(|path| !path.exists()));
+        assert!(files[20..].iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn unreadable_and_bad_media_have_distinct_retry_policies() {
+        let fixture = ImportFixture::new();
+        let bad = fixture.inbox.join("bad.png");
+        fs::write(&bad, b"not an image").unwrap();
+        let missing = fixture.inbox.join("missing.png");
+        let result = fixture.run(vec![bad.clone(), missing], |_| {});
+        assert_eq!((result.imported, result.failed), (0, 2));
+        assert!(!result.issues[0].retryable);
+        assert!(result.issues[1].retryable);
+        assert!(bad.exists());
+    }
+
+    #[test]
+    fn retry_backoff_is_bounded_and_changed_files_retry_immediately() {
+        let fixture = ImportFixture::new();
+        let path = fixture.photo("source.png", 1);
+        let sig = file_signature(&fs::metadata(&path).unwrap());
+        let now = Instant::now();
+        let mut retry = InboxRetry::record(sig, None, true, now);
+        assert!(!retry.ready(sig, now));
+        assert!(retry.ready(sig, now + Duration::from_secs(2)));
+        for _ in 0..100 {
+            retry = InboxRetry::record(sig, Some(&retry), true, now);
+        }
+        assert!(retry.ready(sig, now + Duration::from_secs(60)));
+        let permanent = InboxRetry::record(sig, None, false, now);
+        assert!(!permanent.ready(sig, now + Duration::from_secs(86400)));
+        fs::remove_file(&path).unwrap();
+        fixture.photo("source.png", 2);
+        let replaced = file_signature(&fs::metadata(path).unwrap());
+        assert!(permanent.ready(replaced, now));
+    }
+
+    #[test]
+    fn selected_missing_paths_report_discovery_failures() {
+        let fixture = ImportFixture::new();
+        let missing = fixture.inbox.join("missing.png");
+        let mut result = ImportResult::default();
+        let files = collect_files(&[missing.to_string_lossy().into_owned()], &mut result);
+        assert!(files.is_empty());
+        assert_eq!(result.failed, 1);
+        assert!(result.issues[0].retryable);
+    }
+
+    #[test]
+    fn failed_album_assignment_restores_memory() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        vault.photos.insert("photo".into(), test_photo(None));
+        vault.albums.insert(
+            "album".into(),
+            Album {
+                name: "Trip".into(),
+                created: 1.0,
+            },
+        );
+        fs::create_dir(vault.index_path().with_extension("tmp")).unwrap();
+        drop(vault);
+        assert!(file_existing_into_album(&fixture.state, &["photo".into()], "album").is_err());
+        assert!(vlock(&fixture.state).photos["photo"].albums.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_conversion_failures_remain_retryable() {
+        use std::os::unix::process::ExitStatusExt;
+        let fixture = ImportFixture::new();
+        let output = fixture.root.join("missing-conversion.jpg");
+        for status in [
+            None,
+            Some(std::process::ExitStatus::from_raw(256)),
+            Some(std::process::ExitStatus::from_raw(0)),
+        ] {
+            assert!(
+                converted_image_output(status, &output)
+                    .unwrap_err()
+                    .retryable
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_does_not_inherit_permanent_failure_after_processing() {
+        let fixture = ImportFixture::new();
+        let path = fixture.inbox.join("source.png");
+        fs::write(&path, b"invalid image").unwrap();
+        let signature = file_signature(&fs::metadata(&path).unwrap());
+        let result = fixture.run(vec![path.clone()], |_| {});
+        assert!(!result.issues[0].retryable);
+        fs::remove_file(&path).unwrap();
+        fixture.photo("source.png", 1);
+        let replacement_signature = file_signature(&fs::metadata(&path).unwrap());
+        let (_, retry) =
+            inbox_retry_after_failure(&path, signature, &result.issues[0], None, Instant::now());
+        assert!(retry.ready(replacement_signature, Instant::now()));
+    }
+
+    #[test]
+    fn failed_import_batch_reports_unfiled_duplicate_album_assignment() {
+        let fixture = ImportFixture::new();
+        fixture.run(vec![fixture.photo("original.png", 200)], |_| {});
+        let mut vault = vlock(&fixture.state);
+        vault.albums.insert(
+            "album".into(),
+            Album {
+                name: "Trip".into(),
+                created: 1.0,
+            },
+        );
+        persist_index(&vault, &fixture.key).unwrap();
+        let hashes = existing_hashes(&vault);
+        let objects = vault.objects_dir();
+        let index_tmp = vault.index_path().with_extension("tmp");
+        drop(vault);
+        let mut files = vec![fixture.photo("duplicate.png", 200)];
+        files.extend((0..100).map(|i| fixture.photo(&format!("new-{i}.png"), i)));
+        let result = run_import(
+            files,
+            fixture.key,
+            objects,
+            hashes,
+            true,
+            Some("album".into()),
+            |progress| {
+                if progress.done == 100 {
+                    fs::create_dir(&index_tmp).unwrap();
+                }
+            },
+            &fixture.state,
+        )
+        .unwrap();
+        assert_eq!(
+            (result.imported, result.skipped, result.failed),
+            (0, 0, 101)
+        );
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.name.ends_with("duplicate.png") && issue.reason.contains("album")));
+        assert!(vlock(&fixture.state)
+            .photos
+            .values()
+            .all(|photo| photo.albums.is_empty()));
     }
 }

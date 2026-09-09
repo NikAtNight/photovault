@@ -38,6 +38,10 @@ folder in Finder or the CLI shows only random-named opaque blobs.
 
 ## Usage
 
+- **Appearance:** follows macOS light or dark mode, with a translucent sidebar,
+  grouped toolbar controls, and system typography. Command-F focuses search.
+  The photo list scrolls horizontally in narrow windows so every sorting
+  column stays available. Styling uses the existing Tauri webview.
 - **Run the built app:** `src-tauri/target/release/bundle/macos/PhotoVault.app`
   (copy it to /Applications if you like).
 - First launch asks you to create a password (min 8 characters) and offers a
@@ -45,12 +49,34 @@ folder in Finder or the CLI shows only random-named opaque blobs.
 - **Import** via the Import menu or drag-and-drop files/folders from Finder
   (folders are walked recursively). Originals are stored losslessly.
   **Duplicate files are skipped** by content hash (toggle in Settings).
+  Files are imported **in name order** (numeric-aware, so `IMG_2` lands before
+  `IMG_10`), a folder at a time.
+- **Import straight into an album:** drop onto an album in the sidebar, or
+  drop anywhere while browsing an album — new photos are filed into it, and
+  duplicates you already own are added to the album too. Importing from the
+  Import menu while browsing an album does the same. (Create an album with the
+  **+** next to *Albums*; it opens right away, ready for a drop.)
+- **Import results** retain the latest 50 batches until dismissed or the vault
+  locks. The report lists imported, duplicate, failed, and cleanup-failed
+  counts, with file paths and reasons.
+  Failed imports keep their source files. Cleanup failures mean the encrypted
+  copy may be saved while removing the original still needs attention.
 - **Formats:** JPEG, PNG, GIF, WebP, BMP, TIFF, **HEIC/HEIF** (iPhone photos,
   converted for thumbnails via macOS `sips`, originals kept), and **video**
   (MP4, MOV, M4V — poster frames via QuickLook, streamed with seeking).
 - **Browse:** sidebar with **All Photos / Favorites / Videos / Recently
   Deleted / Albums**; grid or list view; sort by date added, **date taken**
   (EXIF), name, size, or type; **search** by filename (`/` focuses the box).
+- **Sort by multiple columns:** in list view, click **Added**, then
+  **Shift-click Name**. Photos group by local calendar day, then sort by name
+  within each day. Names use numeric order, so `House_2` precedes `House_10`.
+  Heading arrows show direction and numbers show priority. Shift-click an
+  active column to reverse its direction. A plain click starts a new
+  single-column sort, and clicking it again reverses it. Date-only sorting
+  uses the exact timestamp. The default remains newest day first, then name.
+  Preferences persist and apply to grid, list, and viewer navigation. Grid
+  view keeps the original sort dropdown; choose a new option to reset to one
+  column. Duplicates keep their existing grouping by file contents.
 - **Select** multiple items (Select button, ⌘-click, shift-click, or Space
   with keyboard focus; ⌘A selects all) to favorite, add to an album, export,
   or delete together.
@@ -68,10 +94,16 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   app and unzip it over the vault folder (path above).
 - **PhotoVault Inbox** (`~/PhotoVault Inbox`) — save or download media into
   this folder and the app encrypts it into the vault and deletes the plaintext
-  file, usually within a couple of seconds. If the app is locked or not
+  file, usually within a couple of seconds — a batch that arrives together is
+  imported in name order. If the app is locked or not
   running, files wait (unencrypted!) until the next unlock — the lock screen
   shows how many are waiting. Once unlocked, click **Process Inbox** to process
   waiting files immediately (the automatic watcher continues to run too).
+  Temporary failures retry automatically with increasing delays, up to one
+  minute. Changed or replaced sources are preserved rather than discarded;
+  check the result report for their location. Recovery folders named
+  `Pending import ...` stay inside Inbox and are scanned on subsequent passes.
+  Encrypted files are synced before the index is saved and originals removed.
 
 ## Settings
 
@@ -88,7 +120,11 @@ npm run dev          # dev window with hot reload
 npm run build        # release .app bundle
 ```
 
+Frontend tests: `node --test tests/*.test.cjs` with Node 22 or later.
 Backend tests: `cd src-tauri && cargo test`.
+Behavior and verification: [photo sorting](docs/flows/photo-sorting.md) and
+[photo ingestion](docs/flows/photo-ingestion.md).
+Design and accessibility checks: [macOS appearance](docs/flows/macos-design.md).
 
 Notes:
 - Touch ID uses the login keychain plus a LocalAuthentication prompt (the

@@ -1,276 +1,331 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PhotoVault</title>
 <style>
+  :root {
+    color-scheme: light dark;
+    --sbw: 224px;
+    --bg: #faf9f8; --surface: #fff; --well: #efefef;
+    --text: #242424; --secondary: #666665; --line: #00000016;
+    --glass: #f1f0eeeb; --control: #ffffffc9; --hover: #00000008;
+    --accent: #0068d9; --selected: #0068d912; --danger: #ba2727;
+    --shadow: 0 2px 8px #00000007, 0 12px 30px #00000008;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1c1e; --surface: #252527; --well: #303032;
+      --text: #f3f3f5; --secondary: #a7a7ac; --line: #ffffff19;
+      --glass: #29292ce8; --control: #454548b8; --hover: #ffffff0b;
+      --accent: #409cff; --selected: #409cff25; --danger: #ff827a;
+      --shadow: 0 2px 8px #00000018, 0 12px 30px #00000020;
+    }
+  }
   * { box-sizing: border-box; margin: 0; }
-  /* In-app images must never start a native macOS drag — that drag session
-     triggers the import drop overlay (see the dragstart handler). */
+  [hidden] { display: none !important; }
+  body { font: 13px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    user-select: none; -webkit-user-select: none; overflow-x: hidden; }
+  button, input, select { font: inherit; }
+  button { cursor: default; }
+  button:disabled, select:disabled { opacity: .45; }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
   img { -webkit-user-drag: none; }
-  body { font: 15px/1.5 -apple-system, system-ui, sans-serif;
-         background: #101014; color: #e8e8ec; min-height: 100vh;
-         user-select: none; -webkit-user-select: none; overflow-x: hidden; }
-  .center { min-height: 100vh; display: grid; place-items: center; }
-  .card { background: #1a1a21; border: 1px solid #2a2a33; border-radius: 14px;
-          padding: 36px; width: 360px; text-align: center; }
-  .card h1 { font-size: 20px; margin-bottom: 4px; }
-  .card p { color: #9a9aa6; font-size: 13px; margin-bottom: 20px; }
+  .icon { width: 18px; height: 18px; flex: none; vertical-align: middle;
+    fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+  .symbols { position: absolute; width: 0; height: 0; overflow: hidden; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden;
+    clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+  .btn, select.sel { padding: 6px 12px; min-height: 32px; border-radius: 9px;
+    border: 1px solid var(--line); background: var(--control); color: var(--text);
+    white-space: nowrap; box-shadow: 0 1px 2px #00000005; }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+  .btn:hover, .btn.ghost:hover { background: var(--hover); }
+  .btn.primary, .wide { background: #0068d9; border-color: transparent; color: white; }
+  .btn.primary:hover, .wide:hover { background: #005cbe; }
+  .btn.danger { color: var(--danger); }
+  .btn.on { color: var(--accent); background: var(--selected); }
+  .btn.ghost { border-color: transparent; background: transparent; box-shadow: none; padding: 6px 8px; }
+  .btnrow { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
   input[type=password], input[type=text].ti {
-          width: 100%; padding: 10px 12px; margin-bottom: 12px;
-          background: #101014; border: 1px solid #33333e; border-radius: 8px;
-          color: #e8e8ec; font-size: 15px; outline: none;
-          user-select: text; -webkit-user-select: text; }
-  input[type=password]:focus, input[type=text].ti:focus { border-color: #6c6cf5; }
-  .wide { width: 100%; padding: 10px; border: 0; border-radius: 8px;
-          background: #5656e8; color: #fff; font-size: 15px; cursor: pointer; }
-  .wide:hover { background: #6a6af0; }
-  .wide:disabled { opacity: .6; cursor: default; }
-  .wide.ghost { background: #24242d; color: #e8e8ec; margin-top: 10px; }
-  .wide.ghost:hover { background: #2c2c36; }
-  .err { color: #ff7070; font-size: 13px; margin-bottom: 12px; min-height: 20px; }
-  .linky { color: #8a8af5; font-size: 13px; cursor: pointer; background: none;
-           border: 0; padding: 0; margin-top: 14px; }
+    width: 100%; padding: 10px 12px; margin-bottom: 12px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 9px; color: var(--text);
+    user-select: text; -webkit-user-select: text; }
+  input::placeholder { color: var(--secondary); opacity: 1; }
+  input:focus-visible, select:focus-visible { outline-offset: 1px; }
+  .center { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 24px;
+    padding: 32px; width: 360px; max-width: 100%; text-align: center; box-shadow: var(--shadow); }
+  .vault-mark { display: grid; place-items: center; width: 64px; height: 64px; margin: 0 auto 16px;
+    border-radius: 18px; background: var(--selected); color: var(--accent); }
+  .vault-mark .icon { width: 30px; height: 30px; stroke-width: 1.4; }
+  .card h1 { font-size: 23px; font-weight: 650; letter-spacing: -.5px; margin-bottom: 6px; }
+  .card p { color: var(--secondary); margin-bottom: 16px; }
+  .wide { width: 100%; padding: 10px; border: 0; border-radius: 10px; font-weight: 600; }
+  .wide.ghost { background: var(--well); color: var(--text); margin-top: 10px; }
+  .wide.ghost:hover { background: var(--hover); }
+  .err { color: var(--danger); font-size: 12px; margin-bottom: 8px; min-height: 18px; }
+  .linky { color: var(--accent); background: none; border: 0; padding: 0; margin-top: 14px; }
   .linky:hover { text-decoration: underline; }
-  .note { color: #c9a54a; font-size: 12px; margin-top: 14px; }
+  .note { color: var(--secondary); font-size: 12px; margin-top: 14px; }
   .meter { display: flex; gap: 4px; margin: -4px 0 12px; }
-  .meter span { flex: 1; height: 4px; border-radius: 2px; background: #2a2a33; }
-  .meter.s1 span:nth-child(1) { background: #e05555; }
-  .meter.s2 span:nth-child(-n+2) { background: #c9a54a; }
-  .meter.s3 span { background: #4fae62; }
+  .meter span { flex: 1; height: 4px; border-radius: 2px; background: var(--well); }
+  .meter.s1 span:nth-child(1) { background: #d14545; }
+  .meter.s2 span:nth-child(-n+2) { background: #af801e; }
+  .meter.s3 span { background: #388846; }
 
-  header { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
-           border-bottom: 1px solid #22222a; position: sticky; top: 0;
-           background: #101014f8; z-index: 5;
-           flex-wrap: wrap; }
-  header .count { color: #9a9aa6; font-size: 13px; white-space: nowrap; }
-  header .sel { margin-left: auto; }
-  #search { flex: 1; min-width: 120px; max-width: 300px; padding: 7px 12px;
-      background: #1a1a21; border: 1px solid #33333e; border-radius: 8px;
-      color: #e8e8ec; font-size: 13px; outline: none;
-      user-select: text; -webkit-user-select: text; }
-  #search:focus { border-color: #6c6cf5; }
-  .btn { padding: 7px 14px; border-radius: 8px; border: 1px solid #33333e;
-         background: #1a1a21; color: #e8e8ec; font-size: 13px; cursor: pointer;
-         white-space: nowrap; }
-  .btn:hover { background: #24242d; }
-  .btn.primary { background: #5656e8; border-color: #5656e8; }
-  .btn.primary:hover { background: #6a6af0; }
-  .btn.danger { color: #ff8080; border-color: #4a2a2a; }
-  .btn.danger:hover { background: #2a1a1a; }
-  .btn.on { border-color: #6c6cf5; color: #b0b0ff; }
-  .btn.ghost { border-color: transparent; background: transparent;
-      font-size: 16px; padding: 6px 9px; line-height: 1; color: #c8c8d2; }
-  .btn.ghost:hover { background: #1e1e26; color: #fff; }
-  select.sel { padding: 7px 10px; border-radius: 8px; border: 1px solid #33333e;
-      background: #1a1a21; color: #e8e8ec; font-size: 13px; outline: none; }
+  /* The native title bar owns the window controls. Navigation stays beneath it. */
+  header { display: flex; align-items: center; gap: 12px; padding: 18px 24px 14px;
+    position: sticky; top: 0; margin-left: var(--sbw); z-index: 10; flex-wrap: wrap;
+    background: var(--bg); border-bottom: 1px solid var(--line); }
+  .view-heading { flex: 1; min-width: 120px; }
+  #viewtitle { font-size: 21px; line-height: 1.2; font-weight: 650; letter-spacing: -.5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 350px; }
+  #count { display: block; color: var(--secondary); font-size: 11px; margin-top: 4px; }
+  .toolbar-actions { display: flex; align-items: center; gap: 8px; }
+  .control-group { display: flex; align-items: center; padding: 3px; gap: 2px;
+    background: var(--control); border: 1px solid var(--line); border-radius: 99px; box-shadow: 0 2px 5px #00000006; }
+  .control-group .btn { min-width: 32px; min-height: 30px; padding: 5px 8px; border-radius: 99px;
+    border: 0; background: transparent; box-shadow: none; }
+  .control-group .btn:hover { background: var(--hover); }
+  .control-group .btn.on { background: var(--selected); }
+  #importbtn { border-radius: 99px; min-height: 38px; padding: 7px 14px; }
+  #inboxbtn .icon { width: 18px; }
+  #inboxbtn:disabled { opacity: .5; }
+  .search-field { display: flex; align-items: center; gap: 7px; color: var(--secondary);
+    background: var(--control); border: 1px solid var(--line); border-radius: 99px; padding: 0 11px;
+    width: 180px; height: 36px; }
+  .search-field:focus-within { outline: 3px solid var(--accent); outline-offset: 1px; }
+  #search { min-width: 0; width: 100%; border: 0; outline: 0; color: var(--text);
+    background: transparent; font-size: 12px; user-select: text; -webkit-user-select: text; }
+  #sortsel { border: 0; background: transparent; box-shadow: none; max-width: 122px; min-height: 30px; padding: 4px 6px; font-size: 12px; }
+  #sorthint { padding: 10px 24px; color: var(--secondary); font-size: 11px; }
+
+  #sidebar { position: fixed; top: 12px; bottom: 12px; left: 12px; width: calc(var(--sbw) - 12px);
+    overflow-y: auto; padding: 10px 8px; border-radius: 18px; background: var(--glass);
+    border: 1px solid var(--line); box-shadow: var(--shadow); z-index: 15;
+    -webkit-backdrop-filter: blur(24px) saturate(1.3); backdrop-filter: blur(24px) saturate(1.3); }
+  #sidebar .brand { display: flex; align-items: center; gap: 9px; font-weight: 650;
+    font-size: 15px; padding: 12px 10px 18px; letter-spacing: -.2px; }
+  #sidebar .brand .icon { color: var(--accent); width: 23px; height: 23px; }
+  #sidebar .item { display: flex; width: 100%; align-items: center; gap: 9px; padding: 8px 10px;
+    border-radius: 9px; font-size: 13px; color: var(--text); border: 0; background: transparent;
+    text-align: left; min-height: 36px; margin: 1px 0; }
+  #sidebar .item:hover { background: var(--hover); }
+  #sidebar .album-open { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; border: 0; padding: 0; background: transparent; color: inherit; text-align: left; font: inherit; }
+  #sidebar .item .icon { color: var(--secondary); }
+  #sidebar .item.active { background: var(--selected); font-weight: 600; }
+  #sidebar .item.active .icon { color: var(--accent); }
+  #sidebar .item.droptarget { background: var(--selected); outline: 2px dashed var(--accent); outline-offset: -2px; }
+  #sidebar .item .n { margin-left: auto; color: var(--secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+  #sidebar .head { display: flex; align-items: center; padding: 20px 10px 5px;
+    color: var(--secondary); font-size: 11px; font-weight: 600; }
+  #sidebar .head button { margin-left: auto; background: none; border: 0; color: var(--secondary);
+    min-width: 24px; min-height: 24px; border-radius: 6px; font-size: 18px; }
+  #sidebar .head button:hover { background: var(--hover); }
+  #sidebar .item .tools { display: none; margin-left: auto; gap: 2px; }
+  #sidebar .item:hover .tools, #sidebar .item:focus-within .tools { display: flex; }
+  #sidebar .item:hover .n, #sidebar .item:focus-within .n { display: none; }
+  #sidebar .tools button { background: none; border: 0; color: var(--secondary);
+    min-width: 22px; min-height: 24px; border-radius: 5px; }
+  #sidebar .tools button:hover { background: var(--hover); color: var(--text); }
+  .sidebar-note { padding: 12px 10px; font-size: 11px; color: var(--secondary); }
+  #content { margin-left: var(--sbw); min-width: 0; padding-bottom: 96px; }
+  #trashbanner { display: flex; align-items: center; gap: 12px; margin: 16px 24px 0;
+    padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; color: var(--secondary); }
+  #trashbanner button { margin-left: auto; }
+  #importresults { margin: 16px 24px; padding: 14px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 12px; font-size: 12px; }
+  #importresults > span { font-weight: 600; }
+  #clearimportresults { float: right; font-size: 11px; min-height: 24px; padding: 2px 8px; }
+  #importreports { max-height: 200px; overflow: auto; overflow-wrap: anywhere; clear: both; }
+  #importreports details { margin-top: 10px; }
+  #importreports summary { color: var(--text); }
+  #importreports p, #importreports li { color: var(--secondary); margin-top: 6px; }
+  #importreports ul { padding-left: 18px; }
+
+  .table-scroll { overflow: auto; max-height: max(180px, calc(100vh - var(--hh, 80px) - 56px)); }
+  table.list { min-width: 800px; width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; font-size: 12px; }
+  .list th { text-align: left; color: var(--secondary); font-weight: 500; padding: 10px 12px;
+    border-bottom: 1px solid var(--line); position: sticky; top: 0;
+    background: var(--bg); z-index: 2; white-space: nowrap; }
+  .list th:hover { color: var(--text); background: var(--well); }
+  .list td { padding: 6px 12px; border-bottom: 1px solid var(--line);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .list tr.row:nth-child(even) { background: var(--hover); }
+  .list tr.row:hover { background: var(--well); }
+  .list tr.row.sel { background: var(--selected); }
+  .list tr.row.focused { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .list img.mini { width: 38px; height: 38px; object-fit: cover; border-radius: 6px; background: var(--well); display: block; }
+  .list td.dim { color: var(--secondary); }
+  .list .fav { color: var(--danger); margin-right: 5px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 6px; padding: 16px 24px; }
+  .grid .ph { aspect-ratio: 1; overflow: hidden; border-radius: 8px; background: var(--well);
+    position: relative; content-visibility: auto; contain-intrinsic-size: auto 180px; }
+  .grid .ghead { grid-column: 1 / -1; padding: 12px 0 6px; font-size: 14px; font-weight: 600; }
+  .render-sentinel { grid-column: 1 / -1; height: 1px; }
+  .grid img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .grid .ph:hover { filter: brightness(.96); }
+  .grid .ph.sel, .grid .ph.focused { outline: 3px solid var(--accent); outline-offset: -3px; }
+  .grid .ph .check { display: none; position: absolute; top: 8px; right: 8px; width: 22px; height: 22px;
+    border-radius: 50%; background: #0068d9; color: white; border: 1px solid #ffffffc0;
+    font-size: 13px; line-height: 20px; text-align: center; }
+  .grid .ph.sel .check { display: block; }
+  .grid .ph .fbadge { position: absolute; top: 8px; left: 8px; color: white; font-size: 15px; text-shadow: 0 1px 4px #000; }
+  .grid .ph .vbadge { position: absolute; inset: 0; display: grid; place-items: center;
+    font-size: 30px; color: #ffffffe0; text-shadow: 0 1px 6px #000; pointer-events: none; }
+  .empty { padding: 100px 28px; text-align: center; color: var(--secondary); line-height: 1.9; }
+  .empty > .icon { display: block; margin: 0 auto 18px; width: 42px; height: 42px; stroke-width: 1.2; opacity: .7; }
+  .empty strong { font-size: 18px; color: var(--text); font-weight: 600; }
 
   .menuwrap { position: relative; }
-  .menu { display: none; position: absolute; right: 0; top: calc(100% + 6px);
-      background: #1e1e26; border: 1px solid #33333e; border-radius: 10px;
-      min-width: 190px; padding: 5px; z-index: 60;
-      box-shadow: 0 8px 30px #00000080; max-height: 320px; overflow-y: auto; }
+  .menu { display: none; position: absolute; right: 0; top: calc(100% + 8px); background: var(--glass);
+    border: 1px solid var(--line); border-radius: 14px; min-width: 200px; padding: 5px; z-index: 60;
+    box-shadow: var(--shadow); max-height: 320px; overflow-y: auto;
+    -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px); }
   .menu.open { display: block; }
-  .menu button { display: block; width: 100%; text-align: left; padding: 8px 12px;
-      background: none; border: 0; border-radius: 7px; color: #e8e8ec;
-      font-size: 13px; cursor: pointer; }
-  .menu button:hover { background: #2a2a35; }
-  .menu .sep { border-top: 1px solid #2a2a33; margin: 5px 0; }
-  #selbar .menu { top: auto; bottom: calc(100% + 6px); }
-
-  .main { display: flex; align-items: flex-start; }
-  #sidebar { width: 200px; flex: none; position: sticky; top: var(--hh, 57px);
-      height: calc(100vh - var(--hh, 57px)); overflow-y: auto; padding: 12px 8px;
-      border-right: 1px solid #1c1c24; }
-  #sidebar .item { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
-      border-radius: 8px; cursor: pointer; font-size: 13.5px; color: #c8c8d2; }
-  #sidebar .item:hover { background: #1a1a21; }
-  #sidebar .item.active { background: #24243a; color: #fff; }
-  #sidebar .item .n { margin-left: auto; color: #9a9aa6; font-size: 12px; }
-  #sidebar .head { display: flex; align-items: center; padding: 14px 10px 4px;
-      color: #9a9aa6; font-size: 11px; text-transform: uppercase;
-      letter-spacing: .06em; }
-  #sidebar .head button { margin-left: auto; background: none; border: 0;
-      color: #8a8af5; font-size: 15px; cursor: pointer; line-height: 1; }
-  #sidebar .brand { display: flex; align-items: center; gap: 8px;
-      font-weight: 600; font-size: 15px; padding: 6px 10px 14px; }
-  #sidebar .item .tools { display: none; margin-left: auto; gap: 2px; }
-  #sidebar .item:hover .tools { display: flex; }
-  #sidebar .item:hover .n { display: none; }
-  #sidebar .tools button { background: none; border: 0; color: #9a9aa6;
-      cursor: pointer; font-size: 12px; padding: 0 3px; }
-  #sidebar .tools button:hover { color: #fff; }
-  #content { flex: 1; min-width: 0; }
-
-  #trashbanner { display: flex; align-items: center; gap: 12px; margin: 10px 12px 0;
-      padding: 9px 14px; background: #241a1a; border: 1px solid #3a2626;
-      border-radius: 10px; color: #d9a0a0; font-size: 13px; }
-  #trashbanner button { margin-left: auto; }
-
-  /* fixed layout + colgroup: header and body columns always line up, and
-     long names truncate instead of stretching the column */
-  table.list { width: 100%; border-collapse: separate; border-spacing: 0;
-      table-layout: fixed; font-size: 13px; }
-  .list th { text-align: left; color: #9a9aa6; font-weight: 500;
-      padding: 8px 12px; border-bottom: 1px solid #22222a; cursor: pointer;
-      position: sticky; top: var(--hh, 57px); background: #101014; z-index: 2;
-      white-space: nowrap; }
-  .list th:hover { color: #e8e8ec; }
-  .list td { padding: 5px 12px; border-bottom: 1px solid #1a1a21;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .list tr.row { cursor: pointer; }
-  .list tr.row:hover { background: #17171d; }
-  .list tr.row.sel { background: #1d1d32; }
-  .list tr.row.focused { outline: 2px solid #6c6cf5; outline-offset: -2px; }
-  .list img.mini { width: 42px; height: 42px; object-fit: cover;
-      border-radius: 4px; background: #1a1a21; display: block; }
-  .list td.dim { color: #9a9aa6; }
-  .list .fav { color: #f06a6a; margin-right: 5px; }
-
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-          gap: 6px; padding: 6px; }
-  .grid .ph { aspect-ratio: 1; overflow: hidden; border-radius: 6px;
-              background: #1a1a21; cursor: pointer; position: relative;
-              content-visibility: auto; contain-intrinsic-size: auto 180px; }
-  .grid .ghead { grid-column: 1 / -1; padding: 14px 6px 2px; font-size: 15px;
-              font-weight: 600; }
-  .render-sentinel { grid-column: 1 / -1; height: 1px; }
-  .grid img { width: 100%; height: 100%; object-fit: cover; display: block;
-              transition: transform .15s; }
-  .grid .ph:hover img { transform: scale(1.03); }
-  .grid .ph.sel { outline: 3px solid #5656e8; outline-offset: -3px; }
-  .grid .ph.focused { outline: 3px solid #8a8af5; outline-offset: -3px; }
-  .grid .ph .check { display: none; position: absolute; top: 6px; right: 6px;
-      width: 22px; height: 22px; border-radius: 50%; background: #5656e8;
-      color: #fff; font-size: 13px; line-height: 22px; text-align: center; }
-  .grid .ph.sel .check { display: block; }
-  .grid .ph .fbadge { position: absolute; top: 6px; left: 6px; color: #f06a6a;
-      font-size: 14px; text-shadow: 0 1px 3px #000; }
-  .grid .ph .vbadge { position: absolute; inset: 0; display: grid;
-      place-items: center; font-size: 30px; color: #ffffffd0;
-      text-shadow: 0 1px 6px #000; pointer-events: none; }
-
-  .empty { padding: 90px 20px; text-align: center; color: #9a9aa6; }
-
-  #selbar { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
-      display: none; align-items: center; gap: 8px; padding: 10px 14px;
-      background: #1e1e26f2; border: 1px solid #33333e; border-radius: 12px;
-      z-index: 90; box-shadow: 0 8px 30px #00000090; flex-wrap: wrap;
-      max-width: 92vw; }
+  .menu button { display: block; width: 100%; text-align: left; padding: 7px 12px;
+    background: none; border: 0; border-radius: 8px; color: var(--text); }
+  .menu button:hover { background: var(--selected); color: var(--accent); }
+  .menu .sep { border-top: 1px solid var(--line); margin: 5px 0; }
+  #selbar { position: fixed; bottom: 20px; left: calc(50% + var(--sbw) / 2); transform: translateX(-50%);
+    display: none; align-items: center; justify-content: center; gap: 6px; padding: 8px 12px;
+    background: var(--glass); border: 1px solid var(--line); border-radius: 22px;
+    z-index: 90; box-shadow: var(--shadow); flex-wrap: wrap; width: max-content;
+    max-width: calc(100vw - var(--sbw) - 28px); -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px); }
   #selbar.open { display: flex; }
-  #selbar .sc { font-size: 13px; color: #c8c8d2; margin-right: 4px; }
+  #selbar .btn { background: transparent; border-color: transparent; box-shadow: none; }
+  #selbar .sc { color: var(--secondary); margin-right: 4px; }
+  #selbar .menu { top: auto; bottom: calc(100% + 8px); }
+  #drophint { display: none; position: fixed; inset: 0 0 0 var(--sbw); place-items: center;
+    text-align: center; padding: 0 24px; font-size: 22px; background: var(--glass);
+    border: 3px dashed var(--accent); z-index: 300; pointer-events: none; }
+  #drophint.active { display: grid; } #drophint.full { inset: 0; }
+  #drophint .sub { font-size: 13px; color: var(--secondary); margin-top: 8px; }
 
-  #drophint { display: none; position: fixed; inset: 0; place-items: center;
-      font-size: 22px; background: #101014dd; border: 2px dashed #5656e8;
-      z-index: 300; pointer-events: none; }
-  #drophint.active { display: grid; }
-
-  #lightbox { position: fixed; inset: 0; background: #000000f2; z-index: 100;
-      display: none; flex-direction: column; }
+  #lightbox { position: fixed; inset: 0; background: var(--bg); z-index: 100; display: none; flex-direction: column; }
   #lightbox.open { display: flex; }
-  #lightbox .bar { display: flex; gap: 8px; padding: 12px 16px;
-      align-items: center; color: #bbb; font-size: 13px; flex-wrap: wrap; }
+  #lightbox .bar { display: flex; gap: 8px; padding: 14px 20px; align-items: center; flex-wrap: wrap; }
+  #lightbox .bar .btn { border-radius: 99px; }
   #lightbox.slideshow .bar { visibility: hidden; }
-  #lbname { margin-right: auto; cursor: text; padding: 2px 6px;
-      border-radius: 6px; }
-  #lbname:hover { background: #ffffff14; }
-  #lbrename { margin-right: auto; width: 300px; padding: 4px 8px;
-      background: #101014; border: 1px solid #6c6cf5; border-radius: 6px;
-      color: #e8e8ec; font-size: 13px; outline: none; display: none;
-      user-select: text; -webkit-user-select: text; }
-  #lightbox .stage { flex: 1; position: relative; min-height: 0;
-      margin: 0 16px 16px; overflow: hidden; }
-  #lightbox .stage img { position: absolute; inset: 0; width: 100%; height: 100%;
-      object-fit: contain; transform-origin: center; }
-  #lightbox .stage video { position: absolute; inset: 0; width: 100%;
-      height: 100%; background: #000; }
-  #lightbox .nav { position: absolute; top: 50%; transform: translateY(-50%);
-      background: #00000070; border: 0; color: #fff; font-size: 26px;
-      width: 44px; height: 60px; cursor: pointer; border-radius: 8px;
-      z-index: 5; }
-  #lightbox .nav:hover { background: #000000b0; }
+  #lbname { margin-right: auto; cursor: text; padding: 4px 8px; border-radius: 8px;
+    font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
+  #lbname:hover { background: var(--hover); }
+  #lbrename { margin-right: auto; width: 260px; max-width: 40vw; padding: 5px 8px;
+    background: var(--surface); border: 1px solid var(--accent); border-radius: 8px; color: var(--text);
+    display: none; user-select: text; -webkit-user-select: text; }
+  #lightbox .stage { flex: 1; position: relative; min-height: 0; margin: 0 16px 16px; overflow: hidden; }
+  #lightbox .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transform-origin: center; }
+  #lightbox .stage video { position: absolute; inset: 0; width: 100%; height: 100%; background: #000; }
+  #lightbox .nav { position: absolute; top: 50%; transform: translateY(-50%); background: #242424b8;
+    border: 1px solid #ffffff28; color: white; font-size: 28px; width: 38px; height: 38px;
+    border-radius: 50%; z-index: 5; -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); }
+  #lightbox .nav:hover { background: #242424e8; }
   #lightbox.slideshow .nav { display: none; }
-  #lbprev { left: 8px; } #lbnext { right: 8px; }
-  #lbzoom { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
-      display: flex; gap: 2px; align-items: center; background: #000000a0;
-      border-radius: 9px; padding: 3px 6px; z-index: 5;
-      opacity: 0; transition: opacity .15s; }
-  #lbstage:hover #lbzoom { opacity: 1; }
+  #lbprev { left: 12px; } #lbnext { right: 12px; }
+  #lbzoom { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); display: flex;
+    gap: 2px; align-items: center; background: #242424d9; border: 1px solid #ffffff28;
+    border-radius: 99px; padding: 5px 8px; z-index: 5; opacity: 0; transition: opacity .15s;
+    -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); }
+  #lbstage:hover #lbzoom, #lbzoom:focus-within { opacity: 1; }
   #lbstage.isvideo #lbzoom, #lightbox.slideshow #lbzoom { display: none; }
-  #lbzoom button { background: none; border: 0; color: #fff; font-size: 15px;
-      width: 26px; height: 24px; cursor: pointer; border-radius: 6px; line-height: 1; }
+  #lbzoom button { background: none; border: 0; color: white; font-size: 15px; width: 28px; height: 26px; border-radius: 99px; }
   #lbzoom button:hover { background: #ffffff22; }
   #lbzoom #lbzfit { width: auto; padding: 0 8px; font-size: 12px; }
-  #lbzpct { color: #ccc; font-size: 12px; min-width: 44px; text-align: center; }
-  #lbstage.zoomed img { cursor: grab; }
-  #lbstage.panning img { cursor: grabbing; }
-  #lbinfo { position: absolute; top: 0; right: 0; bottom: 0; width: 270px;
-      background: #16161cf5; border-left: 1px solid #2a2a33; padding: 18px;
-      display: none; overflow-y: auto; z-index: 6; }
+  #lbzpct { color: #eee; font-size: 11px; min-width: 42px; text-align: center; }
+  #lbstage.zoomed img { cursor: grab; } #lbstage.panning img { cursor: grabbing; }
+  #lbinfo { position: absolute; top: 8px; right: 8px; bottom: 8px; width: 270px;
+    background: var(--glass); border: 1px solid var(--line); border-radius: 16px; padding: 18px;
+    display: none; overflow-y: auto; z-index: 6; box-shadow: var(--shadow);
+    -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px); }
   #lbinfo.open { display: block; }
-  #lbinfo h3 { font-size: 13px; color: #9a9aa6; margin: 14px 0 2px;
-      font-weight: 500; }
+  #lbinfo h3 { font-size: 11px; color: var(--secondary); margin: 16px 0 3px; font-weight: 500; }
   #lbinfo h3:first-child { margin-top: 0; }
-  #lbinfo div.v { font-size: 13.5px; word-break: break-all; }
-  #lbinfo .chip { display: inline-block; background: #24243a; border-radius: 6px;
-      padding: 2px 8px; font-size: 12px; margin: 2px 4px 2px 0; }
-  #lbinfo input.ti { margin: 8px 0 0; padding: 6px 8px; font-size: 12.5px; }
+  #lbinfo div.v { font-size: 13px; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
+  #lbinfo .chip { display: inline-block; background: var(--selected); border-radius: 6px;
+    padding: 2px 8px; font-size: 12px; margin: 2px 4px 2px 0; }
+  #lbinfo input.ti { margin: 8px 0 0; padding: 6px 8px; font-size: 12px; }
 
-  .modal { position: fixed; inset: 0; display: none; place-items: center;
-      background: #000000a8; z-index: 200; }
+  .modal { position: fixed; inset: 0; display: none; place-items: center; background: #00000050; z-index: 200; }
   .modal.open { display: grid; }
-  .modal .box { background: #1a1a21; border: 1px solid #2a2a33;
-      border-radius: 14px; padding: 26px; width: 460px; max-width: 92vw;
-      max-height: 86vh; overflow-y: auto; }
-  .modal .box h2 { font-size: 17px; margin-bottom: 14px; }
-  .modal .box h3 { font-size: 12px; color: #9a9aa6; text-transform: uppercase;
-      letter-spacing: .06em; margin: 20px 0 8px; font-weight: 600; }
+  .modal .box { background: var(--surface); border: 1px solid var(--line); border-radius: 20px;
+    padding: 26px; width: 480px; max-width: 92vw; max-height: 86vh; overflow-y: auto; box-shadow: 0 24px 80px #00000040; }
+  .modal .box h2 { font-size: 20px; letter-spacing: -.4px; margin-bottom: 20px; font-weight: 650; }
+  .modal .box h3 { font-size: 12px; color: var(--secondary); margin: 22px 0 6px; font-weight: 600; }
   .modal .box h3:first-of-type { margin-top: 6px; }
-  /* "setrow", not "row" — the list view's <tr> elements use .row, and a
-     generic flex .row would yank table cells out of column layout */
-  .setrow { display: flex; align-items: center; gap: 10px; padding: 7px 0;
-      font-size: 13.5px; }
+  .setrow { display: flex; align-items: center; gap: 14px; padding: 12px 0; font-size: 13px; border-bottom: 1px solid var(--line); }
   .setrow .grow { margin-right: auto; }
-  .setrow .hint { color: #9a9aa6; font-size: 12px; }
-  .switch { appearance: none; width: 36px; height: 21px; border-radius: 11px;
-      background: #33333e; position: relative; cursor: pointer; flex: none;
-      transition: background .15s; }
-  .switch:checked { background: #5656e8; }
-  .switch::after { content: ""; position: absolute; top: 2.5px; left: 3px;
-      width: 16px; height: 16px; border-radius: 50%; background: #fff;
-      transition: left .15s; }
-  .switch:checked::after { left: 17px; }
-  .modal .close { float: right; background: none; border: 0; color: #9a9aa6;
-      font-size: 18px; cursor: pointer; margin: -6px -6px 0 0; }
-  .modal .close:hover { color: #fff; }
-  #rkey { font: 15px/1.9 ui-monospace, Menlo, monospace; background: #101014;
-      border: 1px solid #33333e; border-radius: 10px; padding: 14px;
-      text-align: center; letter-spacing: .04em; word-break: break-all;
-      user-select: text; -webkit-user-select: text; margin: 10px 0 14px; }
-  .btnrow { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .setrow .hint { color: var(--secondary); font-size: 11px; margin-top: 2px; }
+  .switch { appearance: none; -webkit-appearance: none; width: 34px; height: 20px; border-radius: 99px;
+    background: var(--secondary); position: relative; flex: none; transition: background .15s; }
+  .switch:checked { background: #0068d9; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px;
+    height: 16px; border-radius: 50%; background: white; box-shadow: 0 1px 3px #0003; transition: left .15s; }
+  .switch:checked::after { left: 16px; }
+  .modal .close { float: right; background: var(--well); border: 0; border-radius: 50%;
+    color: var(--secondary); font-size: 13px; width: 26px; height: 26px; margin: -4px -4px 0 0; }
+  .modal .close:hover { color: var(--text); }
+  #rkey { font: 14px/1.9 ui-monospace, Menlo, monospace; background: var(--well); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px; text-align: center; letter-spacing: .04em; word-break: break-all;
+    user-select: text; -webkit-user-select: text; margin: 10px 0 14px; }
   .pwform input { margin-bottom: 8px; }
-
-  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-      background: #24242d; border: 1px solid #33333e; padding: 8px 18px;
-      border-radius: 8px; font-size: 13px; display: none; z-index: 400;
-      align-items: center; gap: 12px; }
-  #toast button { background: none; border: 0; color: #8a8af5; font-size: 13px;
-      cursor: pointer; padding: 0; }
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--glass);
+    border: 1px solid var(--line); padding: 10px 18px; border-radius: 99px; font-size: 12px; display: none;
+    z-index: 400; align-items: center; gap: 12px; max-width: 90vw; box-shadow: var(--shadow);
+    -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px); }
+  #toast button { background: none; border: 0; color: var(--accent); font-size: 12px; padding: 0; }
   #toast button:hover { text-decoration: underline; }
+  @media (max-width: 1000px) {
+    header { gap: 10px; padding: 16px; }
+    .toolbar-actions { justify-content: flex-end; flex: 1; }
+    .search-field { width: 160px; }
+    #viewtitle { max-width: 230px; }
+  }
+  @media (max-width: 760px) {
+    :root { --sbw: 186px; }
+    header { gap: 10px; padding: 14px; }
+    .toolbar-actions { flex-basis: 100%; justify-content: space-between; gap: 5px; }
+    #viewtitle { font-size: 19px; max-width: 176px; }
+    .search-field { width: 140px; }
+    .control-group { gap: 0; padding: 2px; }
+    #importbtn { padding: 6px 10px; }
+    #sidebar { padding: 8px 5px; }
+    #sidebar .item { gap: 7px; padding: 8px; font-size: 12px; }
+    #sidebar .item .icon { width: 16px; }
+    #sidebar .brand { font-size: 14px; }
+    .grid { grid-template-columns: repeat(auto-fill,minmax(135px,1fr)); padding: 12px 14px; }
+    #sorthint { padding: 8px 14px; }
+    #importresults, #trashbanner { margin: 12px 14px; }
+    .list th, .list td { padding-left: 6px; padding-right: 6px; }
+    #lightbox .bar { padding: 10px 12px; gap: 5px; }
+    #lbname { max-width: 28vw; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+  }
+  @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+    :root { --glass: var(--surface); --control: var(--surface); --line: #757575; }
+    #sidebar, .menu, #selbar, #lbinfo, #toast, #lbzoom, #lightbox .nav { -webkit-backdrop-filter: none; backdrop-filter: none; }
+    #lbzoom, #lightbox .nav { background: #242424; }
+  }
 </style>
 </head>
 <body>
+<svg class="symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs><symbol id="icon-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol><symbol id="icon-photos" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.5"/><path d="m5 17 5-5 3 3 3-4 4 6"/></symbol><symbol id="icon-heart" viewBox="0 0 24 24"><path d="M20.8 5.6a5 5 0 0 0-7.1 0L12 7.3l-1.7-1.7a5 5 0 0 0-7.1 7.1L12 21l8.8-8.3a5 5 0 0 0 0-7.1Z"/></symbol><symbol id="icon-video" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="12" rx="3"/><path d="m15 10 6-3v10l-6-3Z"/></symbol><symbol id="icon-duplicate" viewBox="0 0 24 24"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></symbol><symbol id="icon-delete" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></symbol><symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3Z"/></symbol><symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol><symbol id="icon-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol><symbol id="icon-list" viewBox="0 0 24 24"><path d="M8 5h13M8 12h13M8 19h13M3 5h.1M3 12h.1M3 19h.1"/></symbol><symbol id="icon-select" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol><symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="icon-inbox" viewBox="0 0 24 24"><path d="m3 13 3-9h12l3 9v7H3ZM3 13h5l2 3h4l2-3h5"/></symbol><symbol id="icon-settings" viewBox="0 0 24 24"><path d="m10 3-.6 2-2 .9-1.9-.5L3.5 9l1.5 1.5v3L3.5 15l2 3.6 1.9-.5 2 .9.6 2h4l.6-2 2-.9 1.9.5 2-3.6-1.5-1.5v-3L20.5 9l-2-3.6-1.9.5-2-.9L14 3Z"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="icon-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol><symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol><symbol id="icon-play" viewBox="0 0 24 24"><path d="m8 4 12 8-12 8Z"/></symbol><symbol id="icon-export" viewBox="0 0 24 24"><path d="M12 15V3m-4 4 4-4 4 4M6 10H4v11h16V10h-2"/></symbol><symbol id="icon-edit" viewBox="0 0 24 24"><path d="m4 16-1 5 5-1L21 7l-4-4ZM14 6l4 4"/></symbol></defs></svg>
 
 <div id="auth" class="center" style="display:none">
   <form class="card" id="authform">
-    <h1>&#128274; PhotoVault</h1>
+    <div class="vault-mark"><svg class="icon" aria-hidden="true"><use href="#icon-lock"/></svg></div>
+    <h1>PhotoVault</h1>
     <p id="authmsg"></p>
     <div class="err" id="autherr"></div>
-    <input type="text" class="ti" id="rk" placeholder="Recovery key"
+    <input type="text" class="ti" id="rk" aria-label="Recovery key" placeholder="Recovery key"
            autocomplete="off" spellcheck="false" style="display:none">
-    <input type="password" id="pw" placeholder="Password" required>
+    <input type="password" id="pw" aria-label="Password" placeholder="Password" required>
     <div class="meter" id="meter" style="display:none"><span></span><span></span><span></span></div>
-    <input type="password" id="pw2" placeholder="Confirm password" style="display:none">
+    <input type="password" id="pw2" aria-label="Confirm password" placeholder="Confirm password" style="display:none">
     <button class="wide" id="authbtn" type="submit">Unlock</button>
     <button class="wide ghost" id="touchidbtn" type="button" style="display:none">
       Unlock with Touch&nbsp;ID</button>
@@ -283,49 +338,63 @@
 </div>
 
 <div id="gallery" style="display:none">
-  <header>
-    <input id="search" type="search" placeholder="Search photos &amp; tags&hellip;"
-           autocomplete="off" spellcheck="false">
-    <span class="count" id="count" style="display:none"></span>
-    <select class="sel" id="sortsel" title="Sort">
+  <header aria-label="Library toolbar">
+    <div class="view-heading"><h1 id="viewtitle">All Photos</h1><span id="count"></span></div>
+    <label class="search-field"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg>
+      <span class="sr-only">Search photos and tags</span>
+      <input id="search" type="search" placeholder="Search" autocomplete="off" spellcheck="false">
+    </label>
+    <div class="toolbar-actions">
+      <div class="control-group" role="group" aria-label="View options">
+    <select class="sel" id="sortsel" aria-label="Sort photos">
       <option value="added-desc">Newest</option>
       <option value="added-asc">Oldest</option>
       <option value="taken-desc">Date taken &#8595;</option>
       <option value="taken-asc">Date taken &#8593;</option>
-      <option value="name-asc">Name A&ndash;Z</option>
-      <option value="name-desc">Name Z&ndash;A</option>
+      <option value="name-asc">Name A to Z</option>
+      <option value="name-desc">Name Z to A</option>
       <option value="size-desc">Largest</option>
       <option value="size-asc">Smallest</option>
-      <option value="type-asc">Type</option>
+      <option value="type-asc">Type A to Z</option>
+      <option value="type-desc">Type Z to A</option>
     </select>
-    <button class="btn ghost" id="viewbtn"></button>
-    <button class="btn" id="selectbtn">Select</button>
-    <div class="menuwrap">
-      <button class="btn primary" id="importbtn">+ Import</button>
-      <div class="menu" id="importmenu">
-        <button id="impphotos">Photos or videos&hellip;</button>
-        <button id="impfolder">Folder&hellip;</button>
+        <button class="btn ghost" id="viewbtn" aria-label="Switch to list view"></button>
+        <button class="btn ghost" id="selectbtn" aria-pressed="false" title="Select photos" aria-label="Select photos"><svg class="icon" aria-hidden="true"><use href="#icon-select"/></svg></button>
+      </div>
+      <div class="menuwrap">
+        <button class="btn primary" id="importbtn" aria-controls="importmenu"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg><span>Import</span></button>
+        <div class="menu" id="importmenu">
+          <button id="impphotos">Photos or videos&hellip;</button>
+          <button id="impfolder">Folder&hellip;</button>
+        </div>
+      </div>
+      <div class="control-group" role="group" aria-label="Vault actions">
+        <button class="btn ghost" id="inboxbtn" title="Process Inbox" aria-label="Process Inbox"><svg class="icon" aria-hidden="true"><use href="#icon-inbox"/></svg></button>
+        <button class="btn ghost" id="settingsbtn" title="Settings" aria-label="Settings"><svg class="icon" aria-hidden="true"><use href="#icon-settings"/></svg></button>
+        <button class="btn ghost" id="lockbtn" title="Lock vault" aria-label="Lock vault"><svg class="icon" aria-hidden="true"><use href="#icon-lock"/></svg></button>
       </div>
     </div>
-    <button class="btn" id="inboxbtn" title="Encrypt media waiting in PhotoVault Inbox">
-      Process Inbox</button>
-    <button class="btn ghost" id="settingsbtn" title="Settings">&#9881;</button>
-    <button class="btn" id="lockbtn">Lock</button>
   </header>
   <div class="main">
-    <nav id="sidebar"></nav>
-    <div id="content">
+    <nav id="sidebar" aria-label="Photo library"></nav>
+    <main id="content">
       <div id="trashbanner" style="display:none">
         Items in Recently Deleted are permanently removed after 30 days.
         <button class="btn danger" id="emptytrashbtn">Empty Trash</button>
       </div>
+      <section id="importresults" hidden aria-label="Import results">
+        <span>Recent import results, up to 50 batches</span>
+        <button class="btn" id="clearimportresults">Dismiss results</button>
+        <div id="importreports" aria-live="polite"></div>
+      </section>
+      <p id="sorthint" hidden></p>
       <div class="grid" id="grid"></div>
       <div class="empty" id="empty" style="display:none"></div>
-    </div>
+    </main>
   </div>
 </div>
 
-<div id="selbar">
+<div id="selbar" role="group" aria-label="Selected photos">
   <span class="sc" id="selcount"></span>
   <button class="btn" id="selfav">&#9825; Favorite</button>
   <div class="menuwrap">
@@ -336,29 +405,29 @@
   <button class="btn" id="selrestore" style="display:none">Restore</button>
   <button class="btn danger" id="seldelete">Delete</button>
   <button class="btn danger" id="selpurge" style="display:none">Delete Forever</button>
-  <button class="btn" id="selclear">&#10005;</button>
+  <button class="btn" id="selclear" aria-label="Clear selection"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
 </div>
 
 <div id="drophint">Drop photos or videos to import</div>
 
-<div id="lightbox">
+<div id="lightbox" role="dialog" aria-label="Photo viewer" aria-modal="true" tabindex="-1">
   <div class="bar">
     <span id="lbname" title="Click to rename"></span>
-    <input id="lbrename" spellcheck="false">
+    <input id="lbrename" aria-label="Photo name" spellcheck="false">
     <button class="btn ghost" id="lbfav" title="Favorite (f)">&#9825;</button>
-    <button class="btn ghost" id="lbinfobtn" title="Info (i)">&#9432;</button>
-    <button class="btn ghost" id="lbplay" title="Slideshow">&#9654;</button>
+    <button class="btn ghost" id="lbinfobtn" title="Info (i)" aria-label="Photo information"><svg class="icon" aria-hidden="true"><use href="#icon-info"/></svg></button>
+    <button class="btn ghost" id="lbplay" title="Slideshow" aria-label="Start slideshow"><svg class="icon" aria-hidden="true"><use href="#icon-play"/></svg></button>
     <button class="btn" id="lbexport">Export</button>
     <button class="btn" id="lbrestore" style="display:none">Restore</button>
     <button class="btn danger" id="lbdel">Delete</button>
     <button class="btn danger" id="lbpurge" style="display:none">Delete Forever</button>
-    <button class="btn ghost" id="lbclose" title="Close (esc)">&#10005;</button>
+    <button class="btn ghost" id="lbclose" title="Close (esc)" aria-label="Close photo"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
   </div>
   <div class="stage" id="lbstage">
     <img id="lbimg" alt="">
     <video id="lbvid" controls playsinline style="display:none"></video>
-    <button class="nav" id="lbprev">&#8249;</button>
-    <button class="nav" id="lbnext">&#8250;</button>
+    <button class="nav" id="lbprev" aria-label="Previous photo">&#8249;</button>
+    <button class="nav" id="lbnext" aria-label="Next photo">&#8250;</button>
     <div id="lbzoom">
       <button id="lbzout" title="Zoom out (&minus;)">&minus;</button>
       <span id="lbzpct">100%</span>
@@ -369,15 +438,15 @@
   </div>
 </div>
 
-<div class="modal" id="settings">
+<div class="modal" id="settings" role="dialog" aria-modal="true" aria-label="Settings">
   <div class="box">
-    <button class="close" id="setclose">&#10005;</button>
+    <button class="close" id="setclose" aria-label="Close settings"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
     <h2>Settings</h2>
 
     <h3>General</h3>
     <div class="setrow">
       <span class="grow">Auto-lock after inactivity</span>
-      <select class="sel" id="autolocksel">
+      <select class="sel" id="autolocksel" aria-label="Auto-lock after inactivity">
         <option value="60">1 min</option>
         <option value="300">5 min</option>
         <option value="900">15 min</option>
@@ -387,18 +456,18 @@
       </select>
     </div>
     <div class="setrow"><span class="grow">Lock when the Mac sleeps or the screen locks</span>
-      <input type="checkbox" class="switch" id="optsleep"></div>
+      <input type="checkbox" class="switch" id="optsleep" aria-label="Lock when the Mac sleeps or the screen locks"></div>
     <div class="setrow"><span class="grow">Block screenshots &amp; screen sharing</span>
-      <input type="checkbox" class="switch" id="optprotect"></div>
+      <input type="checkbox" class="switch" id="optprotect" aria-label="Block screenshots and screen sharing"></div>
     <div class="setrow"><span class="grow">Skip duplicates when importing
       <div class="hint">Identical files already in the vault are not re-added</div></span>
-      <input type="checkbox" class="switch" id="optdedupe"></div>
+      <input type="checkbox" class="switch" id="optdedupe" aria-label="Skip duplicate imports"></div>
 
     <h3>Security</h3>
     <div class="setrow" id="touchidrow" style="display:none">
       <span class="grow">Touch&nbsp;ID unlock
         <div class="hint" id="touchidhint"></div></span>
-      <input type="checkbox" class="switch" id="opttouchid">
+      <input type="checkbox" class="switch" id="opttouchid" aria-label="Unlock with Touch ID">
     </div>
     <div class="setrow"><span class="grow">Recovery key
       <div class="hint" id="rkhint"></div></span>
@@ -408,9 +477,9 @@
       </span>
     </div>
     <form class="pwform" id="pwform" style="margin-top:10px">
-      <input type="password" id="cpw0" placeholder="Current password" autocomplete="off">
-      <input type="password" id="cpw1" placeholder="New password (min 8 characters)" autocomplete="off">
-      <input type="password" id="cpw2" placeholder="Confirm new password" autocomplete="off">
+      <input type="password" id="cpw0" aria-label="Current password" placeholder="Current password" autocomplete="off">
+      <input type="password" id="cpw1" aria-label="New password" placeholder="New password (min 8 characters)" autocomplete="off">
+      <input type="password" id="cpw2" aria-label="Confirm new password" placeholder="Confirm new password" autocomplete="off">
       <button class="btn" type="submit">Change password</button>
     </form>
 
@@ -427,12 +496,12 @@
   </div>
 </div>
 
-<div class="modal" id="keymodal">
+<div class="modal" id="keymodal" role="dialog" aria-modal="true" aria-label="Recovery key">
   <div class="box">
     <h2>Your recovery key</h2>
-    <p style="color:#9a9aa6;font-size:13px">Write this down or store it in a
+    <p style="color:var(--secondary);font-size:13px">Write this down or store it in a
     password manager. It's the <b>only</b> way back in if you forget your
-    password — it will not be shown again.</p>
+    password. It will not be shown again.</p>
     <div id="rkey"></div>
     <div class="btnrow">
       <button class="btn" id="rkcopy">Copy</button>
@@ -441,10 +510,10 @@
   </div>
 </div>
 
-<div class="modal" id="offermodal">
+<div class="modal" id="offermodal" role="dialog" aria-modal="true" aria-label="Recovery options">
   <div class="box">
     <h2>Set up a recovery key?</h2>
-    <p style="color:#9a9aa6;font-size:13px;margin-bottom:16px">Your password
+    <p style="color:var(--secondary);font-size:13px;margin-bottom:16px">Your password
     can't be recovered. A recovery key is a one-time code that can unlock the
     vault and reset the password if you ever forget it. You can also do this
     later in Settings.</p>
@@ -455,7 +524,7 @@
   </div>
 </div>
 
-<div class="modal" id="promptmodal">
+<div class="modal" id="promptmodal" role="dialog" aria-modal="true" aria-label="Name">
   <form class="box" id="promptform">
     <h2 id="pmtitle"></h2>
     <input type="text" class="ti" id="pminput" autocomplete="off" spellcheck="false">
@@ -466,7 +535,7 @@
   </form>
 </div>
 
-<div class="modal" id="helpmodal">
+<div class="modal" id="helpmodal" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
   <div class="box">
     <button class="close" id="helpclose">&#10005;</button>
     <h2>Keyboard shortcuts</h2>
@@ -490,6 +559,10 @@ const { invoke } = window.__TAURI__.core;
 const { open, save, ask } = window.__TAURI__.dialog;
 const { listen } = window.__TAURI__.event;
 
+function icon(name) {
+  return `<svg class="icon" aria-hidden="true"><use href="#icon-${name}"/></svg>`;
+}
+
 const $ = id => document.getElementById(id);
 const mediaURL = (id, thumb) => `pvmedia://localhost/${id}${thumb ? "/thumb" : ""}`;
 
@@ -504,8 +577,15 @@ let selectMode = false;
 let lastClick = -1;
 let focusIdx = -1;
 let cur = -1;              // lightbox index into `visible`
+let viewerReturnFocus = null;
+let viewerId = null;       // survives insertions and sorting during ingestion
 let settings = null;
 let importing = false;
+let sessionVersion = 0;    // invalidates async work when the vault locks
+let authRequest = 0;
+let gridRequest = 0;
+let pendingImportRefresh = false;
+let importRefresh = null;
 
 // ------------------------------------------------------------------ toast ---
 
@@ -554,37 +634,70 @@ const fmtDate = s => s == null ? "—"
 // ------------------------------------------------------------ auth screen ---
 
 async function refresh() {
+  const request = ++authRequest;
+  const session = sessionVersion;
   const status = await invoke("vault_status");
+  if (request !== authRequest || session !== sessionVersion) return;
   if (status === "unlocked") {
     $("auth").style.display = "none";
     $("gallery").style.display = "block";
-    settings = await invoke("get_settings").catch(() => null);
+    const loadedSettings = await invoke("get_settings").catch(() => null);
+    if (request !== authRequest || session !== sessionVersion) return;
+    settings = loadedSettings;
     await loadAlbums();
+    if (request !== authRequest || session !== sessionVersion) return;
     await loadGrid();
+    if (request !== authRequest || session !== sessionVersion) return;
     invoke("cleanup_orphans").catch(() => {}); // crash-leftover sweep, silent
     return;
   }
   mode = status === "new" ? "setup" : "login";
-  clearSelection();
-  closeLightbox();
-  for (const m of ["settings", "keymodal", "offermodal", "promptmodal"])
-    $(m).classList.remove("open");
-  $("gallery").style.display = "none";
-  $("auth").style.display = "grid";
+  clearVaultUI();
   renderAuth();
+  const lockedSession = sessionVersion;
   if (mode === "login") {
     const info = await invoke("lock_screen_info").catch(() => null);
+    if (lockedSession !== sessionVersion || request !== authRequest) return;
     if (info) {
       $("touchidbtn").style.display = info.touch_id ? "block" : "none";
       $("forgotbtn").style.display = info.has_recovery ? "inline" : "none";
       if (info.inbox_pending > 0) {
         $("inboxnote").style.display = "block";
         $("inboxnote").textContent =
-          `⚠ ${info.inbox_pending} file${info.inbox_pending === 1 ? "" : "s"} waiting ` +
-          `(unencrypted) in PhotoVault Inbox — they'll be imported after unlock.`;
+          `${info.inbox_pending} files waiting unencrypted in PhotoVault Inbox. They will be imported after unlock.`;
       }
     }
   }
+}
+
+function clearVaultUI() {
+  sessionVersion++;
+  importing = false;
+  pendingImportRefresh = false;
+  importRefresh = null;
+  clearImportResults();
+  clearTimeout($("toast")._h);
+  $("toast").style.display = "none";
+  $("toastmsg").textContent = "";
+  clearSelection();
+  closeLightbox();
+  endDrag(); // a drag in flight when the vault locks must not leave its
+             // overlay (which can name an album) painted over the lock screen
+  for (const m of ["settings", "keymodal", "offermodal", "promptmodal"])
+    $(m).classList.remove("open");
+  $("gallery").style.display = "none";
+  $("auth").style.display = "grid";
+  photos = [];
+  albums = [];
+  visible = [];
+  tileById.clear();
+  $("grid").innerHTML = "";
+  $("sidebar").innerHTML = "";
+  $("viewtitle").textContent = "";
+  $("count").textContent = "";
+  $("lbname").textContent = "";
+  $("lbrename").value = "";
+  $("lbinfo").innerHTML = "";
 }
 
 function renderAuth() {
@@ -799,28 +912,71 @@ const renderObserver = new IntersectionObserver(entries => {
 // -------------------------------------------------------------- rendering ---
 
 let layout = localStorage.getItem("pv-view") || "grid";
-let [sortKey, sortDir] = (localStorage.getItem("pv-sort") || "added-desc").split("-");
+const sortColumns = { added: "Date added", taken: "Date taken", name: "Name", size: "Size", type: "Type" };
+const defaultSort = () => ({
+  rules: [{ key: "added", dir: "desc" }, { key: "name", dir: "asc" }],
+});
+
+function loadSort() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("pv-sort-rules"));
+    if (saved && Array.isArray(saved.rules)
+        && saved.rules.length > 0 && saved.rules.length <= Object.keys(sortColumns).length
+        && saved.rules.every(r => r && Object.hasOwn(sortColumns, r.key)
+          && ["asc", "desc"].includes(r.dir))
+        && new Set(saved.rules.map(r => r.key)).size === saved.rules.length) return { rules: saved.rules };
+    const [key, dir] = (localStorage.getItem("pv-sort") || "added-desc").split("-");
+    if (Object.hasOwn(sortColumns, key) && ["asc", "desc"].includes(dir)) {
+      return { rules: [{ key, dir }, ...(key === "added" || key === "taken"
+        ? [{ key: "name", dir: "asc" }] : [])] };
+    }
+  } catch (_) { /* Use the default if saved preferences cannot be read. */ }
+  return defaultSort();
+}
+let photoSort = loadSort();
+const nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
 function sortPhotos(list) {
-  const dir = sortDir === "asc" ? 1 : -1;
+  // Compute local calendar days once per photo, including across DST changes.
+  const values = new Map(list.map(p => [p, photoSort.rules.map(({ key }, i) => {
+    if (key === "name") return p.name;
+    if (key === "type") return ext(p.name);
+    if (key === "size") return p.size || 0;
+    const timestamp = key === "taken" ? p.taken ?? p.added : p.added;
+    if (i === photoSort.rules.length - 1) return timestamp;
+    const d = new Date(timestamp * 1000);
+    return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+  })]));
   list.sort((a, b) => {
-    let va, vb;
-    if (sortKey === "name") { va = a.name.toLowerCase(); vb = b.name.toLowerCase(); }
-    else if (sortKey === "size") { va = a.size || 0; vb = b.size || 0; }
-    else if (sortKey === "type") { va = ext(a.name); vb = ext(b.name); }
-    else if (sortKey === "taken") { va = a.taken ?? a.added; vb = b.taken ?? b.added; }
-    else { va = a.added; vb = b.added; }
-    return va < vb ? -dir : va > vb ? dir : 0;
+    for (const [i, rule] of photoSort.rules.entries()) {
+      const [va, vb] = [values.get(a)[i], values.get(b)[i]];
+      const cmp = rule.key === "name" || rule.key === "type"
+        ? nameCollator.compare(va, vb) : va < vb ? -1 : va > vb ? 1 : 0;
+      if (cmp) return cmp * (rule.dir === "asc" ? 1 : -1);
+    }
+    // An immutable final tie-breaker keeps identical names stable after reloads.
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
 }
 
-function setSort(key, dirOverride) {
-  if (dirOverride) sortDir = dirOverride;
-  else if (key === sortKey) sortDir = sortDir === "asc" ? "desc" : "asc";
-  else sortDir = key === "name" || key === "type" ? "asc" : "desc";
-  sortKey = key;
-  localStorage.setItem("pv-sort", `${sortKey}-${sortDir}`);
+function saveSort() {
+  try { localStorage.setItem("pv-sort-rules", JSON.stringify(photoSort)); }
+  catch (_) { toast("Sort changed, but could not save the preference."); }
+  lastClick = -1;
+  focusIdx = -1;
   renderPhotos();
+}
+
+function setSort(key, append = false, dirOverride) {
+  const existing = photoSort.rules.find(r => r.key === key);
+  if (append && existing) existing.dir = existing.dir === "asc" ? "desc" : "asc";
+  else {
+    const rule = { key, dir: dirOverride || (!append && photoSort.rules[0].key === key
+      ? (photoSort.rules[0].dir === "asc" ? "desc" : "asc")
+      : key === "name" || key === "type" ? "asc" : "desc") };
+    photoSort.rules = append ? [...photoSort.rules, rule] : [rule];
+  }
+  saveSort();
 }
 
 function computeVisible() {
@@ -847,14 +1003,13 @@ function computeVisible() {
 function emptyMessage() {
   if (query) return "No matches for “" + esc(query) + "”.";
   switch (currentView.type) {
-    case "favorites": return "No favorites yet.<br>Open a photo and tap ♡, or select photos and favorite them.";
+    case "favorites": return "No favorites yet.<br>Click the heart on a photo to find it here.";
     case "videos": return "No videos yet.<br>Import .mp4, .mov or .m4v files.";
     case "duplicates": return "No exact duplicates.<br>Photos with identical file contents show up here.";
     case "trash": return "Recently Deleted is empty.";
-    case "album": return "This album is empty.<br>Select photos and use Album ▾ to add them.";
-    default: return "Your vault is empty.<br>Drag photos here or click Import.<br><br>" +
-      "Tip: drop files or whole folders into the <b>PhotoVault Inbox</b> folder in " +
-      "your home directory — they're pulled into the vault automatically.";
+    case "album": return "This album is empty.<br>Drag photos here (or onto the album in the " +
+      "sidebar) to import straight into it,<br>or select photos already in your vault and use Album ▾.";
+    default: return "<strong>Your photos, kept private</strong><br>Import photos and videos, or drag them into this window.";
   }
 }
 
@@ -874,28 +1029,41 @@ function renderSidebar() {
     trash: photos.length - live.length,
   };
   const active = t => (currentView.type === t ? " active" : "");
-  let html =
-    `<div class="brand">&#128274; PhotoVault</div>` +
-    `<div class="item${active("all")}" data-v="all">&#128444; All Photos<span class="n">${counts.all}</span></div>` +
-    `<div class="item${active("favorites")}" data-v="favorites">&#9825; Favorites<span class="n">${counts.favorites}</span></div>` +
-    `<div class="item${active("videos")}" data-v="videos">&#9654; Videos<span class="n">${counts.videos}</span></div>` +
-    `<div class="item${active("duplicates")}" data-v="duplicates">&#10697; Duplicates` +
-      (counts.duplicates ? `<span class="n">${counts.duplicates}</span>` : "") + `</div>` +
-    `<div class="item${active("trash")}" data-v="trash">&#128465; Recently Deleted<span class="n">${counts.trash}</span></div>` +
-    `<div class="head">Albums<button id="albadd" title="New album">+</button></div>`;
+  const row = (view, label, symbol, count) =>
+    `<button class="item${active(view)}" data-v="${view}" aria-current="${currentView.type === view ? "page" : "false"}">` +
+    icon(symbol) + `<span>${label}</span><span class="n">${count.toLocaleString()}</span></button>`;
+  let html = `<div class="brand">${icon("lock")} PhotoVault</div><div class="head">Library</div>`
+    + row("all", "All Photos", "photos", counts.all)
+    + row("favorites", "Favorites", "heart", counts.favorites)
+    + row("videos", "Videos", "video", counts.videos)
+    + `<div class="head">Utilities</div>`
+    + row("duplicates", "Duplicates", "duplicate", counts.duplicates)
+    + row("trash", "Recently Deleted", "delete", counts.trash)
+    + `<div class="head">Albums<button id="albadd" title="New album" aria-label="New album">+</button></div>`;
   for (const a of albums) {
     const n = albumCounts.get(a.id) || 0;
     const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
-    html += `<div class="item${act}" data-v="album" data-id="${a.id}">&#128193; ` +
+    html += `<div class="item${act}" data-v="album" data-id="${a.id}"><button class="album-open" aria-current="${act ? "page" : "false"}">${icon("folder")} ` +
       `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.name)}</span>` +
-      `<span class="n">${n}</span>` +
-      `<span class="tools"><button data-act="ren" title="Rename">&#9998;</button>` +
-      `<button data-act="del" title="Delete album">&#10005;</button></span></div>`;
+      `<span class="n">${n}</span></button>` +
+      `<span class="tools"><button data-act="ren" title="Rename album" aria-label="Rename album">&#9998;</button>` +
+      `<button data-act="del" title="Delete album" aria-label="Delete album">&#10005;</button></span></div>`;
   }
+  if (!albums.length) html += `<p class="sidebar-note">Create an album to organize your photos.</p>`;
   const sb = $("sidebar");
   sb.innerHTML = html;
   sb.querySelectorAll(".item").forEach(el => {
+    el.onkeydown = e => {
+      if (e.target !== el) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        e.stopPropagation();
+        el.click();
+        $("sidebar").querySelector(`[data-v="${currentView.type}"]${currentView.album ? `[data-id="${currentView.album}"]` : ""}`)?.focus();
+      }
+    };
     el.onclick = e => {
+      const keyboard = e.detail === 0;
       const act = e.target.dataset?.act;
       const id = el.dataset.id;
       if (act === "ren") { renameAlbum(id); return; }
@@ -904,6 +1072,10 @@ function renderSidebar() {
       clearSelection();
       renderPhotos();
       renderSidebar();
+      if (keyboard) {
+        const row = $("sidebar").querySelector(`[data-v="${currentView.type}"]${id ? `[data-id="${id}"]` : ""}`);
+        (row?.querySelector(".album-open") || row)?.focus();
+      }
     };
   });
   $("albadd").onclick = async e => {
@@ -928,6 +1100,7 @@ async function renameAlbum(id) {
     await invoke("album_rename", { id, name });
     await loadAlbums();
     renderSidebar();
+    renderPhotos();
   } catch (err) { toast("" + err); }
 }
 
@@ -960,21 +1133,30 @@ function tileClick(i, e) {
 
 function renderPhotos() {
   visible = computeVisible();
+  syncViewer();
   focusIdx = Math.min(focusIdx, visible.length - 1);
-  const total = photos.filter(p => !p.deleted).length;
-  // The sidebar already shows per-view counts — only surface a count in the
-  // header when a search is narrowing things down.
-  $("count").style.display = query ? "inline" : "none";
-  $("count").textContent = `${visible.length.toLocaleString()} of ${total.toLocaleString()}`;
+  const titles = { all: "All Photos", favorites: "Favorites", videos: "Videos", duplicates: "Duplicates", trash: "Recently Deleted" };
+  $("viewtitle").textContent = currentView.type === "album"
+    ? albums.find(a => a.id === currentView.album)?.name || "Album" : titles[currentView.type];
+  $("count").style.display = "block";
+  $("count").textContent = query ? `${visible.length.toLocaleString()} matching items`
+    : `${visible.length.toLocaleString()} item${visible.length === 1 ? "" : "s"}`;
   $("empty").style.display = visible.length ? "none" : "block";
-  $("empty").innerHTML = emptyMessage();
-  $("trashbanner").style.display =
-    currentView.type === "trash" && visible.length ? "flex" : "none";
-  $("viewbtn").innerHTML = layout === "grid" ? "&#9776;" : "&#9638;";
+  $("empty").innerHTML = icon("photos") + emptyMessage();
+  $("trashbanner").style.display = currentView.type === "trash" && visible.length ? "flex" : "none";
+  $("viewbtn").innerHTML = icon(layout === "grid" ? "list" : "grid");
   $("viewbtn").title = layout === "grid" ? "Switch to list view" : "Switch to grid view";
-  const sel = $("sortsel");
-  sel.value = `${sortKey}-${sortDir}`;
-  if (sel.selectedIndex === -1) sel.value = "added-desc";
+  $("viewbtn").setAttribute("aria-label", $("viewbtn").title);
+  const duplicates = currentView.type === "duplicates";
+  $("sortsel").hidden = layout !== "grid";
+  $("sortsel").disabled = duplicates;
+  $("sortsel").value = `${photoSort.rules[0].key}-${photoSort.rules[0].dir}`;
+  $("sortsel").title = duplicates ? "Duplicates stay grouped by file contents"
+    : photoSort.rules.map(r => `${sortColumns[r.key]} ${r.dir === "asc" ? "↑" : "↓"}`).join(", ")
+      + ". Switch to list view to sort by multiple columns.";
+  $("sorthint").hidden = layout !== "list";
+  $("sorthint").textContent = duplicates ? "Duplicates stay grouped by file contents."
+    : "Click a column to sort. Shift-click another to sort within it. Dates then group by day.";
   setHeaderHeight();
   const grid = $("grid");
   loadObserver.disconnect();
@@ -991,8 +1173,12 @@ function renderPhotos() {
     renderSentinel.className = "render-sentinel";
     grid.appendChild(renderSentinel);
   } else {
-    grid.className = "";
-    const arrow = k => sortKey === k ? (sortDir === "asc" ? " ▲" : " ▼") : "";
+    grid.className = "table-scroll";
+    const arrow = k => {
+      const i = photoSort.rules.findIndex(r => r.key === k);
+      return i < 0 || currentView.type === "duplicates" ? ""
+        : ` ${photoSort.rules[i].dir === "asc" ? "▲" : "▼"}${i + 1}`;
+    };
     const table = document.createElement("table");
     table.className = "list";
     // colgroup + table-layout:fixed pins every column so the sticky header
@@ -1007,7 +1193,25 @@ function renderPhotos() {
       `<th data-k="added">Added${arrow("added")}</th>` +
       `<th data-k="size">Size${arrow("size")}</th>` +
       `<th data-k="type">Type${arrow("type")}</th></tr></thead>`;
-    table.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => setSort(th.dataset.k));
+    table.querySelectorAll("th[data-k]").forEach(th => {
+      const disabled = currentView.type === "duplicates";
+      th.title = disabled ? "Duplicates stay grouped by file contents"
+        : "Click to sort by this column only; Shift-click to add or reverse this column";
+      if (disabled) return;
+      const priority = photoSort.rules.findIndex(r => r.key === th.dataset.k);
+      th.setAttribute("aria-label", `${sortColumns[th.dataset.k]}${priority < 0 ? ""
+        : `, sort priority ${priority + 1}, ${photoSort.rules[priority].dir === "asc" ? "ascending" : "descending"}`}. ${th.title}`);
+      th.tabIndex = 0;
+      th.onclick = e => setSort(th.dataset.k, e.shiftKey);
+      th.onkeydown = e => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          setSort(th.dataset.k, e.shiftKey);
+          $("grid").querySelector(`th[data-k="${th.dataset.k}"]`).focus();
+        }
+      };
+    });
     renderBody = document.createElement("tbody");
     table.appendChild(renderBody);
     grid.appendChild(table);
@@ -1027,6 +1231,7 @@ function renderMore(throughIndex = -1) {
   const end = Math.min(visible.length,
     Math.max(renderedCount + RENDER_BATCH, throughIndex + 1));
   const frag = document.createDocumentFragment();
+  const sortKey = photoSort.rules[0].key;
   const dateGroups = layout === "grid"
     && (sortKey === "added" || sortKey === "taken")
     && currentView.type !== "duplicates";
@@ -1063,7 +1268,7 @@ function renderMore(throughIndex = -1) {
         `<td class="dim">${fmtDate(p.taken)}</td>` +
         `<td class="dim">${fmtDate(p.added)}</td>` +
         `<td class="dim">${fmtSize(p.size)}</td>` +
-        `<td class="dim">${ext(p.name)}</td>`;
+        `<td class="dim">${esc(ext(p.name))}</td>`;
     }
     tile.dataset.id = p.id;
     tile.onclick = e => tileClick(i, e);
@@ -1078,18 +1283,25 @@ function renderMore(throughIndex = -1) {
 }
 
 async function loadGrid() {
-  photos = await invoke("list_photos");
+  if ($("gallery").style.display === "none") return;
+  const session = sessionVersion, request = ++gridRequest;
+  const loadedPhotos = await invoke("list_photos");
+  if (session !== sessionVersion || request !== gridRequest
+      || $("gallery").style.display === "none") return;
+  photos = loadedPhotos;
   renderPhotos();
   renderSidebar();
 }
 
 async function loadAlbums() {
-  albums = await invoke("list_albums").catch(() => []);
+  const session = sessionVersion;
+  const loadedAlbums = await invoke("list_albums").catch(() => []);
+  if (session === sessionVersion) albums = loadedAlbums;
 }
 
 $("sortsel").onchange = e => {
-  const [k, d] = e.target.value.split("-");
-  setSort(k, d);
+  const [key, dir] = e.target.value.split("-");
+  setSort(key, false, dir);
 };
 
 $("viewbtn").onclick = () => {
@@ -1118,6 +1330,8 @@ function clearSelection() {
   selection.clear();
   selectMode = false;
   $("selectbtn").classList.remove("on");
+  $("selectbtn").setAttribute("aria-pressed", "false");
+  $("selectbtn").setAttribute("aria-label", "Select photos");
   updateSelectionUI();
 }
 
@@ -1173,6 +1387,8 @@ function updateSelectionUI() {
 $("selectbtn").onclick = () => {
   selectMode = !selectMode;
   $("selectbtn").classList.toggle("on", selectMode);
+  $("selectbtn").setAttribute("aria-pressed", String(selectMode));
+  $("selectbtn").setAttribute("aria-label", selectMode ? "Finish selecting" : "Select photos");
   if (!selectMode) { selection.clear(); updateSelectionUI(); }
 };
 $("selclear").onclick = clearSelection;
@@ -1324,14 +1540,19 @@ function resetZoom() {
 
 async function show(i) {
   if (i < 0 || i >= visible.length) return;
+  const wasOpen = $("lightbox").classList.contains("open");
   cur = i;
   const p = visible[i];
+  viewerId = p.id;
   const video = isVideo(p);
   cancelRename();
   resetZoom();
   stage.classList.toggle("isvideo", video);
   $("lbname").textContent = p.name;
-  $("lbfav").innerHTML = p.favorite ? "&#9829;" : "&#9825;";
+  $("lbfav").innerHTML = icon("heart");
+  $("lbfav").classList.toggle("on", !!p.favorite);
+  $("lbfav").setAttribute("aria-label", p.favorite ? "Remove favorite" : "Favorite photo");
+  $("lbfav").setAttribute("aria-pressed", String(!!p.favorite));
   const inTrash = currentView.type === "trash";
   $("lbdel").style.display = inTrash ? "none" : "";
   $("lbrestore").style.display = inTrash ? "" : "none";
@@ -1352,10 +1573,33 @@ async function show(i) {
     img.src = mediaURL(p.id);
   }
   $("lightbox").classList.add("open");
+  if (!wasOpen) {
+    viewerReturnFocus = document.activeElement;
+    $("lightbox").focus();
+  }
+  if ($("lbinfo").classList.contains("open")) renderInfo();
+}
+
+function syncViewer() {
+  if (viewerId === null) return;
+  const previousIndex = cur;
+  cur = visible.findIndex(p => p.id === viewerId);
+  if (cur < 0) {
+    if (visible.length) show(Math.min(Math.max(previousIndex, 0), visible.length - 1));
+    else closeLightbox();
+    return;
+  }
+  const p = visible[cur];
+  $("lbname").textContent = p.name;
+  $("lbfav").innerHTML = icon("heart");
+  $("lbfav").classList.toggle("on", !!p.favorite);
+  $("lbfav").setAttribute("aria-label", p.favorite ? "Remove favorite" : "Favorite photo");
+  $("lbfav").setAttribute("aria-pressed", String(!!p.favorite));
   if ($("lbinfo").classList.contains("open")) renderInfo();
 }
 
 function closeLightbox() {
+  const wasOpen = $("lightbox").classList.contains("open");
   stopSlideshow();
   cancelRename();
   const vid = $("lbvid");
@@ -1366,6 +1610,11 @@ function closeLightbox() {
   $("lightbox").classList.remove("open");
   $("lbinfo").classList.remove("open");
   cur = -1;
+  viewerId = null;
+  if (wasOpen && $("gallery").style.display !== "none") {
+    (viewerReturnFocus?.isConnected ? viewerReturnFocus : $("viewbtn")).focus();
+  }
+  viewerReturnFocus = null;
 }
 
 $("lbclose").onclick = closeLightbox;
@@ -1376,62 +1625,46 @@ $("lbfav").onclick = async () => {
   if (cur < 0) return;
   const p = visible[cur];
   const fav = !p.favorite;
-  await invoke("set_favorite", { ids: [p.id], favorite: fav }).catch(() => {});
+  const session = sessionVersion;
+  try { await invoke("set_favorite", { ids: [p.id], favorite: fav }); }
+  catch (err) { if (session === sessionVersion) toast(String(err)); return; }
+  if (session !== sessionVersion) return;
   applyFavorite([p.id], fav);
-  // The photo may have left the current view (e.g. unfavorited in Favorites).
-  const idx = visible.findIndex(x => x.id === p.id);
-  if (idx >= 0) {
-    cur = idx;
-    $("lbfav").innerHTML = visible[cur].favorite ? "&#9829;" : "&#9825;";
-    if ($("lbinfo").classList.contains("open")) renderInfo();
-  } else if (visible.length) {
-    show(Math.min(cur, visible.length - 1));
-  } else {
-    closeLightbox();
-  }
+  syncViewer();
 };
 
 $("lbdel").onclick = async () => {
   if (cur < 0) return;
   const id = visible[cur].id;
-  const next = cur;
-  closeLightboxIfLast();
   await trashIds([id]);
-  if ($("lightbox").classList.contains("open")) show(Math.min(next, visible.length - 1));
 };
-function closeLightboxIfLast() {
-  if (visible.length <= 1) closeLightbox();
-}
 $("lbrestore").onclick = async () => {
   if (cur < 0) return;
   const id = visible[cur].id;
-  const next = cur;
-  closeLightboxIfLast();
   await invoke("restore_photos", { ids: [id] }).catch(err => toast("" + err));
   await loadGrid();
-  if ($("lightbox").classList.contains("open")) show(Math.min(next, visible.length - 1));
 };
 $("lbpurge").onclick = async () => {
   if (cur < 0) return;
   const p = visible[cur];
+  const session = sessionVersion;
   const ok = await ask(`Permanently delete "${p.name}"?\nThis cannot be undone.`,
     { title: "Delete forever", kind: "warning", okLabel: "Delete Forever", cancelLabel: "Cancel" });
-  if (!ok) return;
-  const next = cur;
-  closeLightboxIfLast();
+  if (!ok || session !== sessionVersion) return;
   await invoke("purge_photos", { ids: [p.id] }).catch(err => toast("" + err));
   await loadGrid();
-  if ($("lightbox").classList.contains("open")) show(Math.min(next, visible.length - 1));
 };
 
 $("lbexport").onclick = async () => {
   if (cur < 0) return;
-  const dest = await save({ defaultPath: visible[cur].name });
-  if (!dest) return;
+  const { id, name } = visible[cur];
+  const session = sessionVersion;
+  const dest = await save({ defaultPath: name });
+  if (!dest || session !== sessionVersion) return;
   try {
-    await invoke("export_photo", { id: visible[cur].id, dest });
-    toast("Exported " + visible[cur].name);
-  } catch (err) { toast("Export failed: " + err); }
+    await invoke("export_photo", { id, dest });
+    if (session === sessionVersion) toast("Exported " + name);
+  } catch (err) { if (session === sessionVersion) toast("Export failed: " + err); }
 };
 
 // Rename: click the name, edit inline.
@@ -1455,22 +1688,11 @@ $("lbrename").addEventListener("keydown", async e => {
   const name = $("lbrename").value.trim();
   const p = visible[cur];
   cancelRename();
-  if (!name || name === p.name) return;
+  if (!p || !name || name === p.name) return;
   try {
     await invoke("rename_photo", { id: p.id, name });
     await loadGrid();
-    // Re-sorting may have moved the photo, or a search filter dropped it —
-    // restore by id, never by index.
-    const idx = visible.findIndex(x => x.id === p.id);
-    if (idx >= 0) {
-      cur = idx;
-      $("lbname").textContent = name;
-      if ($("lbinfo").classList.contains("open")) renderInfo();
-    } else if (visible.length) {
-      show(Math.min(cur, visible.length - 1));
-    } else {
-      closeLightbox();
-    }
+
   } catch (err) { toast("" + err); }
 });
 $("lbrename").addEventListener("blur", cancelRename);
@@ -1496,7 +1718,7 @@ function renderInfo() {
     .join("") || "—";
   $("lbinfo").innerHTML =
     `<h3>Name</h3><div class="v">${esc(p.name)}</div>` +
-    `<h3>Kind</h3><div class="v">${isVideo(p) ? "Video" : "Image"} · ${ext(p.name)}</div>` +
+    `<h3>Kind</h3><div class="v">${isVideo(p) ? "Video" : "Image"} · ${esc(ext(p.name))}</div>` +
     `<h3>Size</h3><div class="v">${fmtSize(p.size)}</div>` +
     `<h3>Dimensions</h3><div class="v">${dims}</div>` +
     `<h3>Taken</h3><div class="v">${fmtDate(p.taken)}</div>` +
@@ -1528,12 +1750,14 @@ function stopSlideshow() {
   clearInterval(slideTimer);
   slideTimer = null;
   $("lightbox").classList.remove("slideshow");
-  $("lbplay").innerHTML = "&#9654;";
+  $("lbplay").innerHTML = icon("play");
+  $("lbplay").setAttribute("aria-label", "Start slideshow");
 }
 $("lbplay").onclick = () => {
   if (slideTimer) { stopSlideshow(); return; }
   $("lightbox").classList.add("slideshow");
   $("lbplay").innerHTML = "&#10074;&#10074;";
+  $("lbplay").setAttribute("aria-label", "Stop slideshow");
   slideTimer = setInterval(() => {
     // Skip videos; wrap at the end.
     let next = cur;
@@ -1599,29 +1823,119 @@ for (const ev of ["pointerup", "pointercancel", "lostpointercapture"])
 
 // ----------------------------------------------------------------- import ---
 
-listen("import-progress", e => { if (importing) progressToast("Importing")(e); });
+listen("import-progress", e => { if (importing && $("gallery").style.display !== "none") progressToast("Importing")(e); });
 listen("export-progress", progressToast("Exporting"));
 listen("backup-progress", progressToast("Backing up"));
 listen("scan-progress", progressToast("Scanning"));
 
-async function importPaths(paths) {
-  if (!paths || !paths.length) return;
-  if (importing) { toast("Already importing — hang on"); return; }
+const albumName = id => albums.find(a => a.id === id)?.name;
+const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+
+function clearImportResults() {
+  $("importreports").replaceChildren();
+  $("importresults").hidden = true;
+}
+$("clearimportresults").onclick = clearImportResults;
+
+function reportImport(result, source, { inbox = false, album = false } = {}) {
+  if ($("gallery").style.display === "none") return;
+  const { imported = 0, skipped = 0, failed = 0, cleanup_failed = 0, issues = [] } = result;
+  const duplicates = album ? `existing item${skipped === 1 ? "" : "s"} filed into the album`
+    : `duplicate${skipped === 1 ? "" : "s"} skipped`;
+  const summary = result.operation_error
+    ? `${source} failed. File counts are unavailable.`
+    : `${source}: ${imported.toLocaleString()} imported, ${skipped.toLocaleString()} ${duplicates}, `
+      + `${failed.toLocaleString()} failed, ${cleanup_failed.toLocaleString()} cleanup failure${cleanup_failed === 1 ? "" : "s"}`;
+  const entry = document.createElement("details");
+  const heading = document.createElement("summary");
+  heading.textContent = summary;
+  entry.appendChild(heading);
+  entry.open = !!result.operation_error || failed > 0 || cleanup_failed > 0 || issues.length > 0;
+  if (result.operation_error) {
+    const error = document.createElement("p");
+    error.textContent = result.operation_error;
+    entry.appendChild(error);
+  }
+  if (inbox && (failed || cleanup_failed || result.operation_error)) {
+    const retained = document.createElement("p");
+    retained.textContent = "Failed imports and incomplete cleanup can leave originals in Inbox or the recovery locations listed below. Review the cleanup details before removing any remaining original.";
+    entry.appendChild(retained);
+  }
+  if (issues.length) {
+    const list = document.createElement("ul");
+    for (const issue of issues) {
+      const row = document.createElement("li");
+      row.textContent = `${issue.name}: ${issue.reason}`
+        + (issue.stage === "cleanup" ? " Review the cleanup details before removing any remaining original." : "")
+        + (issue.retryable ? " Can be retried." : "");
+      list.appendChild(row);
+    }
+    entry.appendChild(list);
+  }
+  const reports = $("importreports");
+  reports.prepend(entry);
+  while (reports.children.length > 50) reports.removeChild(reports.lastElementChild);
+  $("importresults").hidden = false;
+  toast(summary);
+}
+
+function reportImportError(error, source, options) {
+  reportImport({ operation_error: String(error) }, source, options);
+}
+
+async function drainImportRefresh() {
+  if (importing || $("gallery").style.display === "none") return;
+  if (importRefresh) return importRefresh;
+  const session = sessionVersion;
+  const task = (async () => {
+    while (pendingImportRefresh && !importing && session === sessionVersion) {
+      pendingImportRefresh = false;
+      try { await loadGrid(); }
+      catch (err) {
+        if (session === sessionVersion) reportImportError(err, "Library refresh");
+      }
+    }
+  })();
+  importRefresh = task;
+  try { await task; }
+  finally { if (importRefresh === task) importRefresh = null; }
+}
+
+// Duplicates also join the target album, so every completed attempt refreshes.
+async function importPaths(paths, album = null) {
+  if (!paths || !paths.length || $("gallery").style.display === "none") return;
+  if (importing) { toast("An import is already running"); return; }
+  const source = album ? `Import into ${albumName(album) || "album"}` : "Import";
+  const session = sessionVersion;
   importing = true;
   toast("Preparing import…");
   try {
-    const r = await invoke("import_photos", { paths });
-    let msg = r.imported
-      ? `Imported ${r.imported.toLocaleString()} item${r.imported === 1 ? "" : "s"}`
-      : "No new media found";
-    if (r.skipped) msg += ` · ${r.skipped.toLocaleString()} duplicate${r.skipped === 1 ? "" : "s"} skipped`;
-    toast(msg);
-    await loadGrid();
+    const result = await invoke("import_photos", { paths, album });
+    if (session === sessionVersion) reportImport(result, source, { album: !!album });
   } catch (err) {
-    toast("Import failed: " + err);
+    if (session === sessionVersion) reportImportError(err, source);
   } finally {
-    importing = false;
+    if (session === sessionVersion) {
+      importing = false;
+      pendingImportRefresh = true;
+      await drainImportRefresh();
+    }
   }
+}
+
+// The album an import should land in: the sidebar album under the pointer
+// during a drag, otherwise the album currently being browsed.
+function importTarget(position) {
+  if (position) {
+    // Tauri types drag positions as physical pixels, but on macOS wry reports
+    // AppKit points relative to the webview — already CSS pixels, no scaling.
+    const el = document.elementFromPoint(position.x, position.y);
+    const row = el?.closest?.("#sidebar .item[data-v='album']");
+    if (row) return row.dataset.id;
+    // Over some other sidebar row — an explicit "not this album" drop.
+    if (el?.closest?.("#sidebar")) return null;
+  }
+  return currentView.type === "album" ? currentView.album : null;
 }
 
 $("importbtn").onclick = e => {
@@ -1636,30 +1950,32 @@ $("impphotos").onclick = async () => {
       extensions: ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif",
                    "heic", "heif", "mp4", "mov", "m4v"] }]
   });
-  if (sel) await importPaths(Array.isArray(sel) ? sel : [sel]);
+  // Importing while browsing an album files into it, like a drop does.
+  if (sel) await importPaths(Array.isArray(sel) ? sel : [sel], importTarget());
 };
 $("impfolder").onclick = async () => {
   $("importmenu").classList.remove("open");
   const sel = await open({ directory: true, multiple: true });
-  if (sel) await importPaths(Array.isArray(sel) ? sel : [sel]);
+  if (sel) await importPaths(Array.isArray(sel) ? sel : [sel], importTarget());
 };
 
 $("inboxbtn").onclick = async () => {
-  if (importing) { toast("Already importing — hang on"); return; }
+  if ($("gallery").style.display === "none") return;
+  if (importing) { toast("An import is already running"); return; }
+  const session = sessionVersion;
   importing = true;
   toast("Checking PhotoVault Inbox…");
   try {
-    const r = await invoke("process_inbox");
-    let msg = r.imported
-      ? `Processed ${r.imported.toLocaleString()} item${r.imported === 1 ? "" : "s"} from Inbox`
-      : "No ready media found in Inbox";
-    if (r.skipped) msg += ` · ${r.skipped.toLocaleString()} duplicate${r.skipped === 1 ? "" : "s"} removed`;
-    toast(msg);
-    if (r.imported) await loadGrid();
+    const result = await invoke("process_inbox");
+    if (session === sessionVersion) reportImport(result, "Inbox", { inbox: true });
   } catch (err) {
-    toast("Inbox processing failed: " + err);
+    if (session === sessionVersion) reportImportError(err, "Inbox", { inbox: true });
   } finally {
-    importing = false;
+    if (session === sessionVersion) {
+      importing = false;
+      pendingImportRefresh = true;
+      await drainImportRefresh();
+    }
   }
 };
 
@@ -1668,18 +1984,98 @@ $("inboxbtn").onclick = async () => {
 // Finder drops arrive via tauri events, not DOM dragstart.
 document.addEventListener("dragstart", e => e.preventDefault());
 
-listen("tauri://drag-enter", () => {
-  if ($("gallery").style.display !== "none") $("drophint").classList.add("active");
+// A native macOS drag delivers no wheel events, so albums scrolled below the
+// fold would be unreachable — nudge the sidebar while the pointer rests near
+// its edges, re-resolving the target as rows move under it.
+let sidebarScroller = null, sidebarScrollDir = 0, lastDragPos = null;
+
+function stopSidebarScroll() {
+  clearInterval(sidebarScroller);
+  sidebarScroller = null;
+}
+
+function autoScrollSidebar(position) {
+  const sb = $("sidebar");
+  const box = sb.getBoundingClientRect();
+  sidebarScrollDir = 0;
+  if (position && position.x < box.right && position.y > box.top) {
+    if (position.y < box.top + 40) sidebarScrollDir = -1;
+    else if (position.y > box.bottom - 40) sidebarScrollDir = 1;
+  }
+  if (!sidebarScrollDir) return stopSidebarScroll();
+  if (!sidebarScroller) {
+    sidebarScroller = setInterval(() => {
+      sb.scrollTop += sidebarScrollDir * 12;
+      showDropTarget(lastDragPos);
+    }, 30);
+  }
+}
+
+// Track the album under the pointer so the hint and the drop agree, and so
+// hovering an album row visibly arms it.
+let dropAlbum = null;
+
+function showDropTarget(position) {
+  lastDragPos = position;
+  // The lightbox and modals sit over the sidebar, so album rows can't be
+  // aimed at — cover the whole window and drop the album guidance.
+  const blocked = $("lightbox").classList.contains("open")
+    || !!document.querySelector(".modal.open");
+  $("drophint").classList.toggle("full", blocked);
+  autoScrollSidebar(blocked ? null : position);
+  const album = blocked
+    ? (currentView.type === "album" ? currentView.album : null)
+    : importTarget(position);
+  // drag-over fires ~60Hz; only touch the DOM when the target actually moves.
+  if (album === dropAlbum) return;
+  dropAlbum = album;
+  document.querySelectorAll("#sidebar .item.droptarget")
+    .forEach(el => el.classList.remove("droptarget"));
+  if (album && !blocked) {
+    $("sidebar").querySelector(`.item[data-v='album'][data-id='${album}']`)
+      ?.classList.add("droptarget");
+  }
+  const sub = blocked ? ""
+    : album ? `<div class="sub">Hover another album, or “All Photos”, to change the target</div>`
+    : albums.length ? `<div class="sub">…or onto an album to file them there</div>` : "";
+  $("drophint").innerHTML = (album
+    ? `Drop into “${esc(albumName(album) || "album")}”`
+    : `Drop photos or videos to import`) + sub;
+}
+
+function endDrag() {
+  $("drophint").classList.remove("active", "full");
+  // Reset the text: it can name an album, which must never survive onto the
+  // lock screen (the overlay outlives the drag if the vault locks mid-drag).
+  $("drophint").textContent = "Drop photos or videos to import";
+  stopSidebarScroll();
+  lastDragPos = null;
+  dropAlbum = null;
+  document.querySelectorAll("#sidebar .item.droptarget")
+    .forEach(el => el.classList.remove("droptarget"));
+}
+
+listen("tauri://drag-enter", e => {
+  if ($("gallery").style.display === "none") return;
+  $("drophint").classList.add("active");
+  showDropTarget(e.payload?.position);
 });
-listen("tauri://drag-leave", () => $("drophint").classList.remove("active"));
+listen("tauri://drag-over", e => {
+  if ($("drophint").classList.contains("active")) showDropTarget(e.payload?.position);
+});
+listen("tauri://drag-leave", endDrag);
 listen("tauri://drag-drop", async e => {
-  $("drophint").classList.remove("active");
-  if ($("gallery").style.display !== "none") await importPaths(e.payload.paths);
+  const wasOpen = $("gallery").style.display !== "none";
+  const album = wasOpen ? importTarget(e.payload?.position) : null;
+  endDrag();
+  if (wasOpen) await importPaths(e.payload?.paths, album);
 });
 
 listen("inbox-imported", async e => {
-  toast(`Saved ${e.payload.count} item${e.payload.count === 1 ? "" : "s"} from Inbox`);
-  if ($("gallery").style.display !== "none" && !importing) await loadGrid();
+  if ($("gallery").style.display === "none") return;
+  reportImport(e.payload, "Automatic Inbox import", { inbox: true });
+  pendingImportRefresh = true;
+  await drainImportRefresh();
 });
 
 // ---------------------------------------------------------------- settings ---
@@ -1713,8 +2109,9 @@ $("settingsbtn").onclick = async () => {
   refreshRecoveryStatus();
   $("cpw0").value = ""; $("cpw1").value = ""; $("cpw2").value = "";
   $("settings").classList.add("open");
+  $("setclose").focus();
 };
-$("setclose").onclick = () => $("settings").classList.remove("open");
+$("setclose").onclick = () => { $("settings").classList.remove("open"); $("settingsbtn").focus(); };
 $("helpclose").onclick = () => $("helpmodal").classList.remove("open");
 
 for (const id of ["autolocksel", "optsleep", "optprotect", "optdedupe"])
@@ -1855,6 +2252,23 @@ function setFocus(i) {
 document.addEventListener("keydown", e => {
   const inInput = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "");
   const modalOpen = document.querySelector(".modal.open");
+  const focusLayer = modalOpen ? [...document.querySelectorAll(".modal.open")].pop()
+    : $("lightbox").classList.contains("open") ? $("lightbox") : null;
+  if (focusLayer && e.key === "Tab") {
+    const controls = [...focusLayer.querySelectorAll("button, input, select, [tabindex='0']")]
+      .filter(el => !el.disabled && el.getClientRects().length);
+    const first = controls[0], last = controls[controls.length - 1];
+    if (first && (document.activeElement === focusLayer || !focusLayer.contains(document.activeElement) || (e.shiftKey ? document.activeElement === first : document.activeElement === last))) {
+      e.preventDefault();
+      (e.shiftKey ? last : first).focus();
+    }
+    return;
+  }
+  const inControl = document.activeElement?.closest?.("button, [role=button], summary, video, a");
+  const viewerOpen = $("lightbox").classList.contains("open");
+  const controlKeys = viewerOpen ? ["Enter", " "]
+    : ["Enter", " ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Delete", "Backspace"];
+  if (inControl && controlKeys.includes(e.key)) return;
 
   if ($("lightbox").classList.contains("open")) {
     if (inInput) return;
@@ -1881,6 +2295,7 @@ document.addEventListener("keydown", e => {
       if (top.id === "promptmodal") $("pmcancel").click();
       else if (top.id === "keymodal") $("rkdone").click();
       else if (top.id === "offermodal") $("offerno").click();
+      else if (top.id === "settings") $("setclose").click();
       else top.classList.remove("open");
     }
     return;
@@ -1897,7 +2312,7 @@ document.addEventListener("keydown", e => {
     return;
   }
 
-  if (e.key === "/") { e.preventDefault(); $("search").focus(); return; }
+  if (e.key === "/" || ((e.metaKey || e.ctrlKey) && e.key === "f")) { e.preventDefault(); $("search").focus(); return; }
   if (e.key === "?") { $("helpmodal").classList.add("open"); return; }
   if ((e.metaKey || e.ctrlKey) && e.key === "a") {
     e.preventDefault();
@@ -1941,12 +2356,13 @@ document.addEventListener("keydown", e => {
 
 $("lockbtn").onclick = async () => {
   await invoke("lock");
+  clearVaultUI();
   await refresh();
 };
 
 // Backend timer/system event fired: wipe the UI and show login immediately.
 listen("vault-locked", async () => {
-  closeLightbox();
+  clearVaultUI();
   await refresh();
   toast("Vault locked");
 });
