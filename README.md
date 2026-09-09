@@ -56,8 +56,8 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   duplicates you already own are added to the album too. Importing from the
   Import menu while browsing an album does the same. (Create an album with the
   **+** next to *Albums*; it opens right away, ready for a drop.)
-- **Import results** retain the latest 50 batches until dismissed or the vault
-  locks. The report lists imported, duplicate, failed, and cleanup-failed
+- **Import and export results** retain the latest 50 operations until dismissed
+  or the vault locks. Import reports list imported, duplicate, failed, and cleanup-failed
   counts, with file paths and reasons.
   Failed imports keep their source files. Cleanup failures mean the encrypted
   copy may be saved while removing the original still needs attention.
@@ -89,9 +89,21 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   **Empty Trash** live in Settings.
 - **Export** — a single item from the viewer, a selection, or **Export all**
   (Settings) to decrypt everything into a folder of your choosing.
-- **Back up vault…** (Settings) writes a zip of the vault — everything inside
-  stays encrypted, so it's safe to keep in cloud storage. To restore: quit the
-  app and unzip it over the vault folder (path above).
+  Bulk exports report successful and failed files separately, with reasons.
+  Existing destination files are preserved. A failed write can leave a partial
+  file; its error identifies the path to check before retrying.
+- **Back up vault…** (Settings) captures a consistent encrypted snapshot, then
+  writes a ZIP with checksums. Locking remains available while the ZIP is written.
+  **Restore from backup** on the lock screen validates a staged copy before
+  replacing the vault and retains the previous vault in a sibling directory.
+  Legacy archives receive structural checks but lack the new checksums.
+- **Index recovery:** if PhotoVault falls back to an older index, a persistent
+  notice appears. Automatic orphan cleanup and trash expiration pause to protect
+  newer files. Back up the vault before attempting recovery. Restoring a healthy
+  backup clears this state; dismissing a notice cannot disable protection.
+- **One running copy:** updated builds prevent simultaneous writers to the same
+  vault. Quit or replace older installed copies before testing, since old builds
+  do not participate in the new file lock.
 - **PhotoVault Inbox** (`~/PhotoVault Inbox`) — save or download media into
   this folder and the app encrypts it into the vault and deletes the plaintext
   file, usually within a couple of seconds — a batch that arrives together is
@@ -114,6 +126,9 @@ imports · export all · empty trash · delete all.
 
 ## Development
 
+Requires Rust 1.89 or later. Local builds use ad hoc signing automatically.
+Settings shows the app version and a build ID derived from source inputs.
+
 ```sh
 npm install          # tauri CLI
 npm run dev          # dev window with hot reload
@@ -124,6 +139,7 @@ Frontend tests: `node --test tests/*.test.cjs` with Node 22 or later.
 Backend tests: `cd src-tauri && cargo test`.
 Behavior and verification: [photo sorting](docs/flows/photo-sorting.md) and
 [photo ingestion](docs/flows/photo-ingestion.md).
+Reliability contracts and checks: [vault reliability](docs/flows/vault-reliability.md).
 Design and accessibility checks: [macOS appearance](docs/flows/macos-design.md).
 
 Notes:

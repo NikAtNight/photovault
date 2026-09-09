@@ -14,8 +14,16 @@ use core_foundation::string::{CFString, CFStringRef};
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool};
-use objc2_app_kit::{NSWindow, NSWindowSharingType, NSWorkspace};
+use objc2_app_kit::{NSRunningApplication, NSWindow, NSWindowSharingType, NSWorkspace};
 use objc2_foundation::{NSNotification, NSString};
+
+/// Also detect older app bundles that do not participate in the vault file lock.
+pub fn another_copy_running(bundle_id: &str) -> bool {
+    let identifier = NSString::from_str(bundle_id);
+    NSRunningApplication::runningApplicationsWithBundleIdentifier(&identifier)
+        .iter()
+        .any(|app| app.processIdentifier() != std::process::id() as i32 && !app.isTerminated())
+}
 
 // ------------------------------------------------------------- window/UI ---
 

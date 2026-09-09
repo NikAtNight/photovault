@@ -63,7 +63,7 @@ function app() {
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id);
   };
-  const state = { photos: [], handlers: {}, save: async () => '/export', ask: async () => true };
+  const state = { photos: [], handlers: {}, save: async () => '/export', open: async () => null, ask: async () => true };
   const observer = class { observe() {} unobserve() {} disconnect() {} };
   const ctx = vm.createContext({
     document: { getElementById: element, createElement: tag => new Element(tag),
@@ -79,7 +79,7 @@ function app() {
         if (command === 'trash_photos') state.photos = state.photos.map(p => args.ids.includes(p.id) ? { ...p, deleted: true } : p);
         return null;
       } },
-      dialog: { save: args => state.save(args), ask: (...args) => state.ask(...args), open: async () => null },
+      dialog: { save: args => state.save(args), ask: (...args) => state.ask(...args), open: args => state.open(args) },
       event: { listen: (name, handler) => listeners.set(name, handler) },
     } },
     localStorage: { getItem: () => null, setItem() {} },
@@ -373,4 +373,200 @@ test('opening and closing the viewer moves focus into it and returns to its call
   assert.equal(a.element('lightbox').focusCount, 1);
   a.run('closeLightbox()');
   assert.equal(a.element('viewbtn').focusCount, 1);
+});
+
+test('failed trash preserves selection and viewer without a success toast or Undo', async () => {
+  const a = app();
+  await a.seed([photo('a'), photo('b')]);
+  a.run('selection = new Set(["a"]); show(0)');
+  a.state.handlers.trash_photos = async () => { throw new Error('index write failed'); };
+  const listings = a.calls.filter(c => c.command === 'list_photos').length;
+  await a.element('seldelete').onclick();
+  assert.deepEqual(Array.from(a.run('selectedIds()')), ['a']);
+  assert.equal(a.run('viewerId'), 'a');
+  assert.equal(a.calls.filter(c => c.command === 'list_photos').length, listings);
+  assert.match(a.element('toastmsg').textContent, /index write failed/);
+  assert.doesNotMatch(a.element('toastmsg').textContent, /Moved/);
+  assert.equal(a.element('toastact').style.display, 'none');
+});
+
+for (const [button, command] of [['selrestore', 'restore_photos'], ['selpurge', 'purge_photos'], ['lbrestore', 'restore_photos'], ['lbpurge', 'purge_photos']]) {
+  test(`${button} retains current state when ${command} fails`, async () => {
+    const a = app();
+    a.run('currentView = { type: "trash" }');
+    await a.seed([{ ...photo('a'), deleted: 100 }]);
+    a.run('selection = new Set(["a"]); show(0)');
+    a.state.handlers[command] = async () => { throw new Error('cannot persist'); };
+    const listings = a.calls.filter(c => c.command === 'list_photos').length;
+    await a.element(button).onclick();
+    assert.deepEqual(Array.from(a.run('selectedIds()')), ['a']);
+    assert.equal(a.run('viewerId'), 'a');
+    assert.equal(a.calls.filter(c => c.command === 'list_photos').length, listings);
+    assert.match(a.element('toastmsg').textContent, /cannot persist/);
+  });
+}
+
+test('failed Undo is visible and cannot be used after the session locks', async () => {
+  const a = app();
+  await a.seed([photo('a')]);
+  await a.run('trashIds(["a"])');
+  a.state.handlers.restore_photos = async () => { throw new Error('restore failed'); };
+  const undo = a.element('toastact').onclick;
+  undo();
+  await new Promise(setImmediate);
+  assert.match(a.element('toastmsg').textContent, /restore failed/);
+  const calls = a.calls.filter(c => c.command === 'restore_photos').length;
+  await a.emit('vault-locked');
+  undo();
+  await new Promise(setImmediate);
+  assert.equal(a.calls.filter(c => c.command === 'restore_photos').length, calls);
+});
+
+test('successful trash does not clear unrelated selections added during the request', async () => {
+  const a = app(), deleting = deferred();
+  await a.seed([photo('a'), photo('b')]);
+  a.run('selection = new Set(["a"])');
+  a.state.handlers.trash_photos = () => deleting.promise;
+  const operation = a.element('seldelete').onclick();
+  a.element('selalbum').parentElement = { style: {} };
+  a.run('selection.add("b")');
+  deleting.resolve();
+  await operation;
+  assert.deepEqual(Array.from(a.run('selectedIds()')), ['b']);
+});
+
+test('partial export persists counts and safely renders per-file errors', async () => {
+  const a = app();
+  await a.seed([photo('a'), photo('b')]);
+  a.run('selection = new Set(["a", "b"])');
+  a.state.open = async () => '/export';
+  a.state.handlers.export_photos = async () => ({ exported: 1, failed: 1, issues: [
+    { name: '<img src=x onerror=alert(1)>.jpg', reason: 'Cannot decrypt <original>' },
+  ] });
+  await a.element('selexport').onclick();
+  const report = a.element('importreports').children[0];
+  assert.match(report.textContent, /1 exported, 1 failed/);
+  assert.equal(report.open, true);
+  const row = report.children.find(e => e.tagName === 'UL').children[0];
+  assert.equal(row.innerHTML, '');
+  assert.match(row.textContent, /<img src=x onerror=alert\(1\)>/);
+  assert.equal(a.element('importresults').hidden, false);
+  const summary = a.element('toastmsg').textContent;
+  await a.emit('export-progress', { done: 2, total: 2 });
+  assert.equal(a.element('toastmsg').textContent, summary);
+});
+
+test('all-failed exports and command failures retain distinct accurate reports', async () => {
+  const a = app();
+  a.state.open = async () => '/export';
+  a.state.handlers.export_photos = async () => ({ exported: 0, failed: 3, issues: [] });
+  await a.element('exportallbtn').onclick();
+  assert.match(a.element('importreports').children[0].textContent, /0 exported, 3 failed/);
+  assert.equal(a.calls.find(c => c.command === 'export_photos').args.ids, null);
+  a.state.handlers.export_photos = async () => { throw new Error('locked'); };
+  await a.element('exportallbtn').onclick();
+  const report = a.element('importreports').children[0].textContent;
+  assert.match(report, /File counts are unavailable.*locked/);
+  assert.doesNotMatch(report, /0 exported|1 failed/);
+});
+
+test('bulk export snapshots selection before the picker and guards session changes', async () => {
+  const a = app(), picker = deferred();
+  await a.seed([photo('a'), photo('b')]);
+  a.run('selection = new Set(["a"])');
+  a.state.open = () => picker.promise;
+  a.state.handlers.export_photos = async () => ({ exported: 1, failed: 0, issues: [] });
+  const operation = a.element('selexport').onclick();
+  a.run('selection = new Set(["b"])');
+  picker.resolve('/export');
+  await operation;
+  assert.deepEqual(Array.from(a.calls.find(c => c.command === 'export_photos').args.ids), ['a']);
+  const pending = deferred();
+  a.state.open = () => pending.promise;
+  const canceled = a.element('exportallbtn').onclick();
+  await a.emit('vault-locked');
+  pending.resolve('/export');
+  await canceled;
+  assert.equal(a.calls.filter(c => c.command === 'export_photos').length, 1);
+});
+
+test('completed export cannot restore filenames or progress after lock', async () => {
+  const a = app(), exporting = deferred();
+  a.state.open = async () => '/export';
+  a.state.handlers.export_photos = () => exporting.promise;
+  const operation = a.element('exportallbtn').onclick();
+  await new Promise(setImmediate);
+  await a.emit('vault-locked');
+  exporting.resolve({ exported: 0, failed: 1, issues: [{ name: 'private.jpg', reason: 'unreadable' }] });
+  await operation;
+  await a.emit('export-progress', { done: 1, total: 1 });
+  assert.equal(a.element('importreports').textContent, '');
+  assert.equal(a.run('activeExports'), 0);
+  assert.equal(a.element('toastmsg').textContent, 'Vault locked');
+});
+
+test('lock during purge confirmation prevents the delayed mutation', async () => {
+  const a = app(), confirmation = deferred();
+  await a.seed([{ ...photo('a'), deleted: 100 }]);
+  a.run('selection = new Set(["a"])');
+  a.state.ask = () => confirmation.promise;
+  const operation = a.element('selpurge').onclick();
+  await a.emit('vault-locked');
+  confirmation.resolve(true);
+  await operation;
+  assert.equal(a.calls.some(c => c.command === 'purge_photos'), false);
+});
+
+test('failed Delete All preserves the displayed library and selection', async () => {
+  const a = app();
+  await a.seed([photo('a')]);
+  a.run('selection = new Set(["a"]); show(0)');
+  a.state.handlers.clear_vault = async () => { throw new Error('cannot write index'); };
+  await a.element('clearbtn').onclick();
+  assert.equal(a.run('photos.length'), 1);
+  assert.equal(a.run('viewerId'), 'a');
+  assert.deepEqual(Array.from(a.run('selectedIds()')), ['a']);
+  assert.match(a.element('toastmsg').textContent, /cannot write index/);
+  assert.doesNotMatch(a.element('toastmsg').textContent, /Deleted 1/);
+});
+
+test('lock during Delete All confirmation prevents the mutation', async () => {
+  const a = app(), confirmation = deferred();
+  await a.seed([photo('a')]);
+  a.state.ask = () => confirmation.promise;
+  const operation = a.element('clearbtn').onclick();
+  await a.emit('vault-locked');
+  confirmation.resolve(true);
+  await operation;
+  assert.equal(a.calls.some(c => c.command === 'clear_vault'), false);
+});
+
+test('recovery notice remains visible through refresh and clears on lock', async () => {
+  const a = app();
+  a.state.handlers.vault_status = () => 'unlocked';
+  a.state.handlers.recovery_status = () => true;
+  await a.run('refresh()');
+  assert.equal(a.element('recoverynotice').hidden, false);
+  await a.run('loadGrid()');
+  assert.equal(a.element('recoverynotice').hidden, false);
+  await a.run('refresh()');
+  assert.equal(a.element('recoverynotice').hidden, false);
+  a.run('clearVaultUI()');
+  assert.equal(a.element('recoverynotice').hidden, true);
+  a.state.handlers.recovery_status = () => false;
+  await a.run('refresh()');
+  assert.equal(a.element('recoverynotice').hidden, true);
+});
+
+test('late recovery status cannot reveal a notice after lock', async () => {
+  const a = app(), status = deferred();
+  a.state.handlers.vault_status = () => 'unlocked';
+  a.state.handlers.recovery_status = () => status.promise;
+  const refreshing = a.run('refresh()');
+  await Promise.resolve();
+  await Promise.resolve();
+  a.run('clearVaultUI()');
+  status.resolve(true);
+  await refreshing;
+  assert.equal(a.element('recoverynotice').hidden, true);
 });

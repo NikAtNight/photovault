@@ -3,6 +3,7 @@ name = "photovault"
 version = "0.2.0"
 description = "Password-locked encrypted photo & video library"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 
 [build-dependencies]

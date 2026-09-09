@@ -136,6 +136,7 @@
   #trashbanner { display: flex; align-items: center; gap: 12px; margin: 16px 24px 0;
     padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; color: var(--secondary); }
   #trashbanner button { margin-left: auto; }
+  #recoverynotice { margin: 16px 24px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
   #importresults { margin: 16px 24px; padding: 14px; background: var(--surface);
     border: 1px solid var(--line); border-radius: 12px; font-size: 12px; }
   #importresults > span { font-weight: 600; }
@@ -297,7 +298,7 @@
     #sidebar .brand { font-size: 14px; }
     .grid { grid-template-columns: repeat(auto-fill,minmax(135px,1fr)); padding: 12px 14px; }
     #sorthint { padding: 8px 14px; }
-    #importresults, #trashbanner { margin: 12px 14px; }
+    #importresults, #trashbanner, #recoverynotice { margin: 12px 14px; }
     .list th, .list td { padding-left: 6px; padding-right: 6px; }
     #lightbox .bar { padding: 10px 12px; gap: 5px; }
     #lbname { max-width: 28vw; }
@@ -378,12 +379,17 @@
   <div class="main">
     <nav id="sidebar" aria-label="Photo library"></nav>
     <main id="content">
+      <section id="recoverynotice" hidden role="status">
+        PhotoVault recovered an older library index. Some newer photos may be missing from this view.
+        Their files are preserved. Automatic file cleanup and Recently Deleted expiration are paused.
+        Keep a backup of this vault before attempting recovery.
+      </section>
       <div id="trashbanner" style="display:none">
         Items in Recently Deleted are permanently removed after 30 days.
         <button class="btn danger" id="emptytrashbtn">Empty Trash</button>
       </div>
-      <section id="importresults" hidden aria-label="Import results">
-        <span>Recent import results, up to 50 batches</span>
+      <section id="importresults" hidden aria-label="Import and export results">
+        <span>Recent import and export results, up to 50 operations</span>
         <button class="btn" id="clearimportresults">Dismiss results</button>
         <div id="importreports" aria-live="polite"></div>
       </section>
@@ -493,6 +499,8 @@
       <button class="btn danger" id="emptytrashbtn2">Empty Trash</button>
       <button class="btn danger" id="clearbtn">Delete all photos&hellip;</button>
     </div>
+    <h3>About</h3>
+    <div class="hint" id="buildinfo" style="user-select:text;overflow-wrap:anywhere">Loading version...</div>
   </div>
 </div>
 
@@ -581,6 +589,7 @@ let viewerReturnFocus = null;
 let viewerId = null;       // survives insertions and sorting during ingestion
 let settings = null;
 let importing = false;
+let activeExports = 0;
 let sessionVersion = 0;    // invalidates async work when the vault locks
 let authRequest = 0;
 let gridRequest = 0;
@@ -644,6 +653,9 @@ async function refresh() {
     const loadedSettings = await invoke("get_settings").catch(() => null);
     if (request !== authRequest || session !== sessionVersion) return;
     settings = loadedSettings;
+    const recoveryRequired = await invoke("recovery_status");
+    if (request !== authRequest || session !== sessionVersion) return;
+    $("recoverynotice").hidden = !recoveryRequired;
     await loadAlbums();
     if (request !== authRequest || session !== sessionVersion) return;
     await loadGrid();
@@ -671,7 +683,9 @@ async function refresh() {
 }
 
 function clearVaultUI() {
+  $("recoverynotice").hidden = true;
   sessionVersion++;
+  activeExports = 0;
   importing = false;
   pendingImportRefresh = false;
   importRefresh = null;
@@ -1403,40 +1417,62 @@ $("selfav").onclick = async () => {
 };
 
 $("seldelete").onclick = () => trashIds(selectedIds());
-$("selrestore").onclick = async () => {
-  await invoke("restore_photos", { ids: selectedIds() }).catch(err => toast("" + err));
-  clearSelection();
-  await loadGrid();
-};
+$("selrestore").onclick = () => changePhotos("restore_photos", selectedIds(), true);
 $("selpurge").onclick = async () => {
-  const ids = selectedIds();
+  const ids = selectedIds(), session = sessionVersion;
   const ok = await ask(`Permanently delete ${ids.length} item${ids.length === 1 ? "" : "s"}?\nThis cannot be undone.`,
     { title: "Delete forever", kind: "warning", okLabel: "Delete Forever", cancelLabel: "Cancel" });
-  if (!ok) return;
-  await invoke("purge_photos", { ids }).catch(err => toast("" + err));
-  clearSelection();
-  await loadGrid();
+  if (!ok || session !== sessionVersion) return;
+  await changePhotos("purge_photos", ids, true);
 };
 
-$("selexport").onclick = async () => {
-  const ids = selectedIds();
-  const dest = await open({ directory: true, title: "Export selection to…" });
-  if (!dest) return;
-  try {
-    const n = await invoke("export_photos", { dest, ids });
-    toast(`Exported ${n.toLocaleString()} item${n === 1 ? "" : "s"}`);
-  } catch (err) { toast("Export failed: " + err); }
-};
+$("selexport").onclick = () => exportMany(selectedIds(), "Export selection to…");
+
+async function changePhotos(command, ids, clear = false) {
+  const session = sessionVersion;
+  try { await invoke(command, { ids }); }
+  catch (err) {
+    if (session === sessionVersion) toast("Could not update photos: " + err);
+    return false;
+  }
+  if (session !== sessionVersion) return false;
+  if (clear) {
+    for (const id of ids) selection.delete(id);
+    updateSelectionUI();
+  }
+  try { await loadGrid(); }
+  catch (err) {
+    if (session === sessionVersion) toast("Photos updated, but the library could not refresh: " + err);
+    return false;
+  }
+  return session === sessionVersion;
+}
 
 async function trashIds(ids) {
   if (!ids.length) return;
-  await invoke("trash_photos", { ids }).catch(err => toast("" + err));
-  clearSelection();
-  await loadGrid();
+  const session = sessionVersion;
+  if (!await changePhotos("trash_photos", ids, true)) return;
   toast(`Moved ${ids.length} to Recently Deleted`, "Undo", async () => {
-    await invoke("restore_photos", { ids }).catch(() => {});
-    await loadGrid();
+    if (session !== sessionVersion) return;
+    if (await changePhotos("restore_photos", ids)) toast(`Restored ${ids.length} item${ids.length === 1 ? "" : "s"}`);
   });
+}
+
+async function exportMany(ids, title) {
+  const session = sessionVersion;
+  let started = false;
+  try {
+    const dest = await open({ directory: true, title });
+    if (!dest || session !== sessionVersion) return;
+    activeExports++;
+    started = true;
+    const result = await invoke("export_photos", { dest, ids });
+    if (session === sessionVersion) reportExport(result);
+  } catch (err) {
+    if (session === sessionVersion) reportExport({ operation_error: String(err) });
+  } finally {
+    if (started && session === sessionVersion) activeExports--;
+  }
 }
 
 // Album menu in the selection bar.
@@ -1640,9 +1676,7 @@ $("lbdel").onclick = async () => {
 };
 $("lbrestore").onclick = async () => {
   if (cur < 0) return;
-  const id = visible[cur].id;
-  await invoke("restore_photos", { ids: [id] }).catch(err => toast("" + err));
-  await loadGrid();
+  await changePhotos("restore_photos", [visible[cur].id]);
 };
 $("lbpurge").onclick = async () => {
   if (cur < 0) return;
@@ -1651,8 +1685,7 @@ $("lbpurge").onclick = async () => {
   const ok = await ask(`Permanently delete "${p.name}"?\nThis cannot be undone.`,
     { title: "Delete forever", kind: "warning", okLabel: "Delete Forever", cancelLabel: "Cancel" });
   if (!ok || session !== sessionVersion) return;
-  await invoke("purge_photos", { ids: [p.id] }).catch(err => toast("" + err));
-  await loadGrid();
+  await changePhotos("purge_photos", [p.id]);
 };
 
 $("lbexport").onclick = async () => {
@@ -1824,7 +1857,7 @@ for (const ev of ["pointerup", "pointercancel", "lostpointercapture"])
 // ----------------------------------------------------------------- import ---
 
 listen("import-progress", e => { if (importing && $("gallery").style.display !== "none") progressToast("Importing")(e); });
-listen("export-progress", progressToast("Exporting"));
+listen("export-progress", e => { if (activeExports && $("gallery").style.display !== "none") progressToast("Exporting")(e); });
 listen("backup-progress", progressToast("Backing up"));
 listen("scan-progress", progressToast("Scanning"));
 
@@ -1846,28 +1879,48 @@ function reportImport(result, source, { inbox = false, album = false } = {}) {
     ? `${source} failed. File counts are unavailable.`
     : `${source}: ${imported.toLocaleString()} imported, ${skipped.toLocaleString()} ${duplicates}, `
       + `${failed.toLocaleString()} failed, ${cleanup_failed.toLocaleString()} cleanup failure${cleanup_failed === 1 ? "" : "s"}`;
+  const detail = inbox && (failed || cleanup_failed || result.operation_error)
+    ? "Failed imports and incomplete cleanup can leave originals in Inbox or the recovery locations listed below. Review the cleanup details before removing any remaining original."
+    : null;
+  const rows = issues.map(issue => `${issue.name}: ${issue.reason}`
+    + (issue.stage === "cleanup" ? " Review the cleanup details before removing any remaining original." : "")
+    + (issue.retryable ? " Can be retried." : ""));
+  appendOperationReport(summary, {
+    error: result.operation_error, detail, rows,
+    expanded: !!result.operation_error || failed > 0 || cleanup_failed > 0 || issues.length > 0,
+  });
+}
+
+function reportExport(result) {
+  if ($("gallery").style.display === "none") return;
+  const { exported = 0, failed = 0, issues = [], operation_error } = result;
+  const summary = operation_error ? "Export failed. File counts are unavailable."
+    : `Export: ${exported.toLocaleString()} exported, ${failed.toLocaleString()} failed`;
+  appendOperationReport(summary, {
+    error: operation_error,
+    detail: failed ? "Successfully exported files remain in the destination folder. Review failed files before retrying." : null,
+    rows: issues.map(issue => `${issue.name}: ${issue.reason}`),
+    expanded: !!operation_error || failed > 0 || issues.length > 0,
+  });
+}
+
+function appendOperationReport(summary, { error, detail, rows, expanded }) {
   const entry = document.createElement("details");
   const heading = document.createElement("summary");
   heading.textContent = summary;
   entry.appendChild(heading);
-  entry.open = !!result.operation_error || failed > 0 || cleanup_failed > 0 || issues.length > 0;
-  if (result.operation_error) {
-    const error = document.createElement("p");
-    error.textContent = result.operation_error;
-    entry.appendChild(error);
+  entry.open = expanded;
+  for (const text of [error, detail]) {
+    if (!text) continue;
+    const paragraph = document.createElement("p");
+    paragraph.textContent = text;
+    entry.appendChild(paragraph);
   }
-  if (inbox && (failed || cleanup_failed || result.operation_error)) {
-    const retained = document.createElement("p");
-    retained.textContent = "Failed imports and incomplete cleanup can leave originals in Inbox or the recovery locations listed below. Review the cleanup details before removing any remaining original.";
-    entry.appendChild(retained);
-  }
-  if (issues.length) {
+  if (rows.length) {
     const list = document.createElement("ul");
-    for (const issue of issues) {
+    for (const text of rows) {
       const row = document.createElement("li");
-      row.textContent = `${issue.name}: ${issue.reason}`
-        + (issue.stage === "cleanup" ? " Review the cleanup details before removing any remaining original." : "")
-        + (issue.retryable ? " Can be retried." : "");
+      row.textContent = text;
       list.appendChild(row);
     }
     entry.appendChild(list);
@@ -2101,6 +2154,9 @@ async function pushSettings() {
 }
 
 $("settingsbtn").onclick = async () => {
+  invoke("get_build_info").then(info => {
+    $("buildinfo").textContent = `PhotoVault ${info.version} · Build ${info.build}`;
+  }).catch(() => { $("buildinfo").textContent = "Version information unavailable"; });
   settings = await invoke("get_settings").catch(() => settings);
   fillSettings();
   const bio = await invoke("touchid_available").catch(() => false);
@@ -2191,40 +2247,42 @@ $("scanbtn").onclick = async () => {
   } catch (err) { toast("" + err); }
 };
 
-$("exportallbtn").onclick = async () => {
-  const dest = await open({ directory: true, title: "Export all photos to…" });
-  if (!dest) return;
-  try {
-    const n = await invoke("export_photos", { dest, ids: null });
-    toast(`Exported ${n.toLocaleString()} item${n === 1 ? "" : "s"}`);
-  } catch (err) { toast("Export failed: " + err); }
-};
+$("exportallbtn").onclick = () => exportMany(null, "Export all photos to…");
 
 async function emptyTrash() {
   const count = photos.filter(p => p.deleted).length;
   if (!count) { toast("Recently Deleted is empty"); return; }
+  const session = sessionVersion;
   const ok = await ask(`Permanently delete ${count} item${count === 1 ? "" : "s"} in Recently Deleted?`,
     { title: "Empty Trash", kind: "warning", okLabel: "Delete Forever", cancelLabel: "Cancel" });
-  if (!ok) return;
-  await invoke("empty_trash").catch(err => toast("" + err));
-  await loadGrid();
+  if (!ok || session !== sessionVersion) return;
+  try { await invoke("empty_trash"); }
+  catch (err) { if (session === sessionVersion) toast("Could not empty Recently Deleted: " + err); return; }
+  if (session !== sessionVersion) return;
+  try { await loadGrid(); }
+  catch (err) { if (session === sessionVersion) toast("Recently Deleted was emptied, but the library could not refresh: " + err); }
 }
 $("emptytrashbtn").onclick = emptyTrash;
 $("emptytrashbtn2").onclick = emptyTrash;
 
 $("clearbtn").onclick = async () => {
-  const count = photos.length;
+  const count = photos.length, session = sessionVersion;
   if (!count) return;
   const ok = await ask(
     `Delete ALL ${count.toLocaleString()} items permanently?\nThis cannot be undone.`,
     { title: "Delete all photos", kind: "warning", okLabel: "Delete All", cancelLabel: "Cancel" });
-  if (!ok) return;
-  try {
-    const n = await invoke("clear_vault");
-    $("settings").classList.remove("open");
-    toast(`Deleted ${n.toLocaleString()} items`);
-    await loadGrid();
-  } catch (err) { toast("" + err); }
+  if (!ok || session !== sessionVersion) return;
+  let deleted;
+  try { deleted = await invoke("clear_vault"); }
+  catch (err) { if (session === sessionVersion) toast("Could not delete photos: " + err); return; }
+  if (session !== sessionVersion) return;
+  $("settings").classList.remove("open");
+  try { await loadGrid(); }
+  catch (err) {
+    if (session === sessionVersion) toast(`Deleted ${deleted.toLocaleString()} items, but the library could not refresh: ${err}`);
+    return;
+  }
+  if (session === sessionVersion) toast(`Deleted ${deleted.toLocaleString()} items`);
 };
 
 // ---------------------------------------------------------------- keyboard ---

@@ -10,6 +10,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod native;
+mod instance_lock;
+mod backup;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -22,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroize;
 
 const VERIFIER_PLAINTEXT: &[u8] = b"photovault-v1";
@@ -81,6 +84,7 @@ struct Vault {
     // Decrypted once at unlock and kept in memory; cleared on lock.
     photos: HashMap<String, PhotoInfo>,
     albums: HashMap<String, Album>,
+    recovery_required: bool,
     last_activity: Instant,
     importing: bool,
     settings: Settings,
@@ -233,12 +237,15 @@ struct IndexData {
     photos: HashMap<String, PhotoInfo>,
     #[serde(default)]
     albums: HashMap<String, Album>,
+    #[serde(default)]
+    recovery_required: bool,
 }
 
 #[derive(Serialize)]
 struct IndexOut<'a> {
     photos: &'a HashMap<String, PhotoInfo>,
     albums: &'a HashMap<String, Album>,
+    recovery_required: bool,
 }
 
 #[derive(Serialize)]
@@ -367,6 +374,7 @@ fn read_meta(dir: &std::path::Path) -> Result<Meta, String> {
 #[cfg(test)]
 thread_local! {
     static FAIL_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static AFTER_INDEX_REPLACEMENT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_SOURCE_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -514,25 +522,111 @@ fn parse_index(json: &[u8]) -> Result<IndexData, String> {
         Ok(IndexData {
             photos,
             albums: HashMap::new(),
+            recovery_required: false,
         })
     }
 }
 
 fn load_index(vault: &Vault, key: &[u8; 32]) -> Result<IndexData, String> {
+    recover_index_transaction(vault, key)?;
     let read = |path: PathBuf| -> Result<IndexData, String> {
         let blob = fs::read(path).map_err(|e| e.to_string())?;
         parse_index(&decrypt(key, &blob)?)
     };
-    // Fall back to the previous generation if the current file is corrupt.
-    read(vault.index_path()).or_else(|e| read(vault.index_bak_path()).map_err(|_| e))
+    let marker = vault.dir.join("recovery-required");
+    let mut data = match read(vault.index_path()) {
+        Ok(data) => data,
+        Err(primary_error) => {
+            let mut data = read(vault.index_bak_path()).map_err(|_| primary_error)?;
+            data.recovery_required = true;
+            data
+        }
+    };
+    data.recovery_required |= marker.try_exists().map_err(|e| e.to_string())?;
+    if data.recovery_required {
+        // Record fallback before unlocking. A later save must never make
+        // newer, unindexed objects look safe to delete after a restart.
+        let file = fs::OpenOptions::new().write(true).create(true).truncate(false)
+            .open(&marker).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        sync_dir(&vault.dir)?;
+    }
+    Ok(data)
 }
 
-/// Write the in-memory index back to disk, encrypted, keeping the previous
-/// generation as index.bak.
+/// Recover a save whose commit was interrupted. Keep the proposed generation for manual
+/// recovery and disable automatic cleanup before restoring the last accepted generation.
+fn recover_index_transaction(vault: &Vault, key: &[u8; 32]) -> Result<(), String> {
+    let rollback = vault.dir.join("index.rollback");
+    if !rollback.try_exists().map_err(|error| error.to_string())? {
+        return Ok(());
+    }
+    let previous = fs::read(&rollback).map_err(|error| error.to_string())?;
+    parse_index(&decrypt(key, &previous)?)?;
+    if let Ok(proposed) = fs::read(vault.index_path()) {
+        if proposed != previous {
+            // Preserve metadata for newly imported objects even if a crash resurrected
+            // the journal after an acknowledged commit. Existing recovery backups stay intact.
+            let saved = unique_dest(&vault.dir, "index.unconfirmed");
+            write_object(&saved, &proposed)?;
+        }
+    }
+    let marker = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(vault.dir.join("recovery-required"))
+        .map_err(|error| error.to_string())?;
+    marker.sync_all().map_err(|error| error.to_string())?;
+    sync_dir(&vault.dir)?;
+    let recovery = vault.dir.join("index.recovery.tmp");
+    let mut file = fs::File::create(&recovery).map_err(|error| error.to_string())?;
+    file.write_all(&previous)
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
+    fs::rename(recovery, vault.index_path()).map_err(|error| error.to_string())?;
+    sync_dir(&vault.dir)?;
+    fs::remove_file(&rollback).map_err(|error| error.to_string())?;
+    // The restored index and recovery marker are already durable. A failed sync
+    // here may repeat recovery after a crash, but cannot expose the proposed index.
+    let _ = sync_dir(&vault.dir);
+    Ok(())
+}
+
+/// Keep a durable previous generation until the new index and its directory entry
+/// are synced. Any error retains index.rollback, which loading handles before index.enc.
 fn persist_index(vault: &Vault, key: &[u8; 32]) -> Result<(), String> {
+    let rollback = vault.dir.join("index.rollback");
+    if rollback.try_exists().map_err(|error| error.to_string())? {
+        return Err("An earlier library save was interrupted. Lock and unlock the vault to recover it before making more changes.".into());
+    }
+    let previous = if vault
+        .index_path()
+        .try_exists()
+        .map_err(|error| error.to_string())?
+        || vault
+            .index_bak_path()
+            .try_exists()
+            .map_err(|error| error.to_string())?
+    {
+        load_index(vault, key)?
+    } else {
+        IndexData::default()
+    };
+    let prior = IndexOut {
+        photos: &previous.photos,
+        albums: &previous.albums,
+        recovery_required: previous.recovery_required,
+    };
+    let previous_blob = encrypt(
+        key,
+        &serde_json::to_vec(&prior).map_err(|error| error.to_string())?,
+    )?;
     let out = IndexOut {
         photos: &vault.photos,
         albums: &vault.albums,
+        recovery_required: vault.recovery_required,
     };
     let json = serde_json::to_vec(&out).map_err(|e| e.to_string())?;
     let blob = encrypt(key, &json)?;
@@ -541,9 +635,42 @@ fn persist_index(vault: &Vault, key: &[u8; 32]) -> Result<(), String> {
     file.write_all(&blob).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
-    let _ = fs::rename(vault.index_path(), vault.index_bak_path());
-    fs::rename(tmp, vault.index_path()).map_err(|e| e.to_string())?;
-    sync_dir(&vault.dir)
+    let rollback_tmp = vault.dir.join("index.rollback.tmp");
+    let mut file = fs::File::create(&rollback_tmp).map_err(|error| error.to_string())?;
+    file.write_all(&previous_blob)
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
+    fs::rename(rollback_tmp, &rollback).map_err(|error| error.to_string())?;
+    sync_dir(&vault.dir)?;
+    let commit = || -> Result<(), String> {
+        if !vault.recovery_required
+            && vault
+                .index_path()
+                .try_exists()
+                .map_err(|error| error.to_string())?
+        {
+            fs::rename(vault.index_path(), vault.index_bak_path())
+                .map_err(|error| error.to_string())?;
+        }
+        fs::rename(tmp, vault.index_path()).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        AFTER_INDEX_REPLACEMENT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        sync_dir(&vault.dir)?;
+        fs::remove_file(&rollback).map_err(|error| error.to_string())?;
+        Ok(())
+    };
+    if let Err(error) = commit() {
+        return Err(format!("Library save was interrupted: {error}. The previous index is retained; lock and unlock to recover it."));
+    }
+    // The new index is already durable. Do not turn a journal-cleanup sync failure
+    // into a failed mutation after removing the only rollback reference.
+    let _ = sync_dir(&vault.dir);
+    Ok(())
 }
 
 fn save_settings(vault: &Vault) -> Result<(), String> {
@@ -561,11 +688,12 @@ fn finish_unlock(state: &Mutex<Vault>, master: [u8; 32]) -> Result<(), String> {
     let data = load_index(&vault, &master)?;
     vault.photos = data.photos;
     vault.albums = data.albums;
+    vault.recovery_required = data.recovery_required;
     let cutoff = now_secs() - TRASH_RETENTION_SECS;
     let expired: Vec<String> = vault
         .photos
         .iter()
-        .filter(|(_, p)| p.deleted.map_or(false, |d| d < cutoff))
+        .filter(|(_, p)| !vault.recovery_required && p.deleted.map_or(false, |d| d < cutoff))
         .map(|(id, _)| id.clone())
         .collect();
     let expired_blobs: Vec<PathBuf> = expired
@@ -1035,6 +1163,13 @@ async fn vault_status(state: VaultState<'_>) -> Result<String, String> {
     })
 }
 
+#[tauri::command]
+async fn recovery_status(state: VaultState<'_>) -> Result<bool, String> {
+    let mut vault = vlock(&state);
+    vault.active_key().ok_or("locked")?;
+    Ok(vault.recovery_required)
+}
+
 #[derive(Serialize)]
 struct LockScreenInfo {
     has_recovery: bool,
@@ -1070,6 +1205,8 @@ async fn lock_screen_info(state: VaultState<'_>) -> Result<LockScreenInfo, Strin
 
 #[tauri::command]
 async fn create_vault(password: String, state: VaultState<'_>) -> Result<(), String> {
+    let meta_mutex = vlock(&state).meta_lock.clone();
+    let _meta_guard = meta_lock(&meta_mutex);
     {
         let vault = vlock(&state);
         if vault.meta_path().exists() {
@@ -1145,6 +1282,9 @@ async fn change_password(
         (vault.dir.clone(), key, vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
+    if vlock(&state).active_key() != Some(master) {
+        return Err("The vault changed or locked. Try again after unlocking.".into());
+    }
     let mut meta = read_meta(&dir)?;
     master_from_password(&current_password, &meta)
         .map_err(|_| "Current password is incorrect.".to_string())?;
@@ -1164,6 +1304,9 @@ async fn recovery_generate(state: VaultState<'_>) -> Result<String, String> {
         (vault.dir.clone(), key, vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
+    if vlock(&state).active_key() != Some(master) {
+        return Err("The vault changed or locked. Try again after unlocking.".into());
+    }
     let rk = random_key();
     let mut meta = read_meta(&dir)?;
     meta.recovery = Some(hex::encode(encrypt(&rk, &master)?));
@@ -1173,12 +1316,15 @@ async fn recovery_generate(state: VaultState<'_>) -> Result<String, String> {
 
 #[tauri::command]
 async fn recovery_disable(state: VaultState<'_>) -> Result<(), String> {
-    let (dir, meta_mutex) = {
+    let (dir, master, meta_mutex) = {
         let mut vault = vlock(&state);
-        vault.active_key().ok_or("locked")?;
-        (vault.dir.clone(), vault.meta_lock.clone())
+        let master = vault.active_key().ok_or("locked")?;
+        (vault.dir.clone(), master, vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
+    if vlock(&state).active_key() != Some(master) {
+        return Err("The vault changed or locked. Try again after unlocking.".into());
+    }
     let mut meta = read_meta(&dir)?;
     meta.recovery = None;
     write_meta(&dir, &meta)?;
@@ -1285,6 +1431,8 @@ async fn touchid_unlock(state: VaultState<'_>) -> Result<(), String> {
     native::authenticate_biometric("unlock your photo vault")?;
     let bytes = native::keychain_read_master()?;
     let master = key_from_slice(&bytes)?;
+    let meta_mutex = vlock(&state).meta_lock.clone();
+    let _meta_guard = meta_lock(&meta_mutex);
     let meta = read_meta(&dir)?;
     let verifier = hex::decode(&meta.verifier).map_err(|e| e.to_string())?;
     match decrypt(&master, &verifier) {
@@ -1312,6 +1460,20 @@ async fn touch_activity(state: VaultState<'_>) -> Result<(), String> {
 #[tauri::command]
 async fn get_settings(state: VaultState<'_>) -> Result<Settings, String> {
     Ok(vlock(&state).settings.clone())
+}
+
+#[derive(Serialize)]
+struct BuildInfo {
+    version: String,
+    build: &'static str,
+}
+
+#[tauri::command]
+fn get_build_info(app: tauri::AppHandle) -> BuildInfo {
+    BuildInfo {
+        version: app.package_info().version.to_string(),
+        build: env!("PHOTOVAULT_BUILD_ID"),
+    }
 }
 
 #[tauri::command]
@@ -2059,8 +2221,12 @@ async fn import_photos(
 async fn cleanup_orphans(state: VaultState<'_>) -> Result<usize, String> {
     let mut vault = vlock(&state);
     vault.active_key().ok_or("locked")?;
-    if vault.importing {
-        return Ok(0); // objects being written right now — don't touch anything
+    Ok(sweep_orphans(&vault))
+}
+
+fn sweep_orphans(vault: &Vault) -> usize {
+    if vault.importing || vault.recovery_required {
+        return 0;
     }
     let mut removed = 0usize;
     if let Ok(entries) = fs::read_dir(vault.objects_dir()) {
@@ -2073,7 +2239,7 @@ async fn cleanup_orphans(state: VaultState<'_>) -> Result<usize, String> {
             }
         }
     }
-    Ok(removed)
+    removed
 }
 
 // ------------------------------------------------------------------ trash ---
@@ -2085,25 +2251,45 @@ async fn trash_photos(ids: Vec<String>, state: VaultState<'_>) -> Result<(), Str
     if vault.importing {
         return Err("An import is running — wait for it to finish.".into());
     }
-    let now = now_secs();
-    for id in &ids {
-        if let Some(p) = vault.photos.get_mut(id) {
-            p.deleted = Some(now);
-        }
-    }
-    persist_index(&vault, &key)
+    set_deleted(&mut vault, &key, &ids, Some(now_secs()))
 }
 
 #[tauri::command]
 async fn restore_photos(ids: Vec<String>, state: VaultState<'_>) -> Result<(), String> {
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    for id in &ids {
-        if let Some(p) = vault.photos.get_mut(id) {
-            p.deleted = None;
+    set_deleted(&mut vault, &key, &ids, None)
+}
+
+fn set_deleted(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    ids: &[String],
+    deleted: Option<f64>,
+) -> Result<(), String> {
+    let original: Vec<_> = ids
+        .iter()
+        .filter_map(|id| {
+            vault
+                .photos
+                .get(id)
+                .map(|photo| (id.clone(), photo.deleted))
+        })
+        .collect();
+    for id in ids {
+        if let Some(photo) = vault.photos.get_mut(id) {
+            photo.deleted = deleted;
         }
     }
-    persist_index(&vault, &key)
+    if let Err(error) = persist_index(vault, key) {
+        for (id, deleted) in original {
+            if let Some(photo) = vault.photos.get_mut(&id) {
+                photo.deleted = deleted;
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Permanently delete (from the trash, or anywhere).
@@ -2173,13 +2359,21 @@ async fn clear_vault(state: VaultState<'_>) -> Result<usize, String> {
     if vault.importing {
         return Err("An import is running — wait for it to finish.".into());
     }
-    let count = vault.photos.len();
-    vault.photos.clear();
-    vault.albums.clear();
+    clear_vault_contents(&mut vault, &key)
+}
+
+fn clear_vault_contents(vault: &mut Vault, key: &[u8; 32]) -> Result<usize, String> {
+    let photos = std::mem::take(&mut vault.photos);
+    let albums = std::mem::take(&mut vault.albums);
+    let count = photos.len();
+    if let Err(error) = persist_index(vault, key) {
+        vault.photos = photos;
+        vault.albums = albums;
+        return Err(error);
+    }
     vault.media_cache = None;
     vault.thumb_cache.clear();
     vault.thumb_order.clear();
-    persist_index(&vault, &key)?;
     if let Ok(entries) = fs::read_dir(vault.objects_dir()) {
         for entry in entries.flatten() {
             let _ = fs::remove_file(entry.path());
@@ -2199,7 +2393,7 @@ fn unique_dest(dir: &std::path::Path, name: &str) -> PathBuf {
         .filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains('\0'))
         .unwrap_or("photo");
     let first = dir.join(safe_name);
-    if !first.exists() {
+    if fs::symlink_metadata(&first).is_err() {
         return first;
     }
     let (stem, ext) = match safe_name.rsplit_once('.') {
@@ -2208,7 +2402,7 @@ fn unique_dest(dir: &std::path::Path, name: &str) -> PathBuf {
     };
     (1..)
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
+        .find(|p| fs::symlink_metadata(p).is_err())
         .unwrap()
 }
 
@@ -2245,6 +2439,98 @@ async fn export_photo(id: String, dest: String, state: VaultState<'_>) -> Result
     fs::write(dest, data).map_err(|e| e.to_string())
 }
 
+#[derive(Serialize, Default)]
+struct ExportResult {
+    exported: usize,
+    failed: usize,
+    issues: Vec<ExportIssue>,
+}
+
+#[derive(Serialize)]
+struct ExportIssue {
+    name: String,
+    reason: String,
+}
+
+impl ExportResult {
+    fn failed(&mut self, name: String, reason: String) {
+        self.failed += 1;
+        self.issues.push(ExportIssue { name, reason });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_EXPORT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Reserve the output atomically so an export cannot overwrite a file created after its name check.
+fn write_export(dir: &std::path::Path, name: &str, data: &[u8]) -> Result<(), String> {
+    let (path, mut file) = loop {
+        let path = unique_dest(dir, name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => break (path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Cannot create exported file: {error}")),
+        }
+    };
+    let mut write = || -> std::io::Result<()> {
+        #[cfg(test)]
+        if FAIL_EXPORT_WRITE.with(|fail| fail.replace(false)) {
+            file.write_all(&data[..data.len().min(1)])?;
+            return Err(std::io::Error::other(
+                "Simulated failure after a partial export write.",
+            ));
+        }
+        file.write_all(data).and_then(|_| file.sync_all())
+    };
+    write().map_err(|error| {
+        format!("Cannot finish exported file at {}: {error}. Check this destination for incomplete output before retrying.", path.display())
+    })?;
+    Ok(())
+}
+
+fn export_entries(
+    key: &[u8; 32],
+    objects: &std::path::Path,
+    dir: &std::path::Path,
+    entries: &[(String, String)],
+    mut result: ExportResult,
+    mut progress: impl FnMut(ImportProgress),
+) -> ExportResult {
+    let directory = fs::create_dir_all(dir);
+    let total = entries.len() + result.failed;
+    let already_failed = result.failed;
+    for (i, (id, name)) in entries.iter().enumerate() {
+        if i % 25 == 0 {
+            progress(ImportProgress {
+                done: i + already_failed,
+                total,
+            });
+        }
+        let exported = || -> Result<(), String> {
+            if let Err(error) = &directory {
+                return Err(format!("Cannot open export folder: {error}"));
+            }
+            let blob = fs::read(objects.join(id))
+                .map_err(|error| format!("Cannot read encrypted original: {error}"))?;
+            let data =
+                decrypt(key, &blob).map_err(|error| format!("Cannot decrypt original: {error}"))?;
+            write_export(dir, name, &data)
+        };
+        match exported() {
+            Ok(()) => result.exported += 1,
+            Err(error) => result.failed(name.clone(), error),
+        }
+    }
+    progress(ImportProgress { done: total, total });
+    result
+}
+
 /// Export selected photos (`ids`) or the whole non-trashed library (None).
 #[tauri::command]
 async fn export_photos(
@@ -2252,173 +2538,70 @@ async fn export_photos(
     ids: Option<Vec<String>>,
     app: tauri::AppHandle,
     state: VaultState<'_>,
-) -> Result<usize, String> {
-    let (key, objects, entries) = {
+) -> Result<ExportResult, String> {
+    let (key, objects, entries, result) = {
         let mut vault = vlock(&state);
         let key = vault.active_key().ok_or("locked")?;
+        let mut result = ExportResult::default();
         let entries: Vec<(String, String)> = match &ids {
-            Some(ids) => ids
-                .iter()
-                .filter_map(|id| vault.photos.get(id).map(|p| (id.clone(), p.name.clone())))
-                .collect(),
+            Some(ids) => {
+                let mut seen = HashSet::new();
+                ids.iter()
+                    .filter(|id| seen.insert((*id).clone()))
+                    .filter_map(|id| match vault.photos.get(id) {
+                        Some(photo) => Some((id.clone(), photo.name.clone())),
+                        None => {
+                            result.failed(
+                                format!("Unavailable photo {id}"),
+                                "Photo is no longer in the library.".into(),
+                            );
+                            None
+                        }
+                    })
+                    .collect()
+            }
             None => vault
                 .photos
                 .iter()
-                .filter(|(_, p)| p.deleted.is_none())
-                .map(|(id, info)| (id.clone(), info.name.clone()))
+                .filter(|(_, photo)| photo.deleted.is_none())
+                .map(|(id, photo)| (id.clone(), photo.name.clone()))
                 .collect(),
         };
-        (key, vault.objects_dir(), entries)
+        (key, vault.objects_dir(), entries, result)
     };
-    let dir = PathBuf::from(&dest);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let total = entries.len();
-    let mut count = 0usize;
-    for (i, (id, name)) in entries.iter().enumerate() {
-        if i % 25 == 0 {
-            let _ = app.emit("export-progress", ImportProgress { done: i, total });
-        }
-        let Ok(blob) = fs::read(objects.join(id)) else {
-            continue;
-        };
-        let Ok(data) = decrypt(&key, &blob) else {
-            continue;
-        };
-        if fs::write(unique_dest(&dir, name), data).is_ok() {
-            count += 1;
-        }
-    }
-    let _ = app.emit("export-progress", ImportProgress { done: total, total });
-    Ok(count)
+    Ok(export_entries(
+        &key,
+        &objects,
+        &PathBuf::from(dest),
+        &entries,
+        result,
+        |progress| {
+            let _ = app.emit("export-progress", progress);
+        },
+    ))
 }
 
-/// Zip the whole vault directory (everything already encrypted) — a portable,
-/// cloud-safe backup. Restore = unzip over the vault folder while the app is
-/// closed.
+/// Write a consistent encrypted snapshot and publish it only after it is complete.
 #[tauri::command]
 async fn backup_vault(
     dest: String,
     app: tauri::AppHandle,
     state: VaultState<'_>,
 ) -> Result<usize, String> {
-    use std::io::Write;
-    let dir = {
-        let mut vault = vlock(&state);
-        vault.active_key().ok_or("locked")?;
-        vault.dir.clone()
-    };
-    let file = fs::File::create(&dest).map_err(|e| e.to_string())?;
-    let mut zw = zip::ZipWriter::new(file);
-    // Stored, not deflated: the payload is AES-GCM output, incompressible.
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored)
-        .large_file(true);
-    let mut count = 0usize;
-    for name in [
-        "meta.json",
-        "meta.bak",
-        "settings.json",
-        "index.enc",
-        "index.bak",
-    ] {
-        if let Ok(bytes) = fs::read(dir.join(name)) {
-            zw.start_file(name, opts).map_err(|e| e.to_string())?;
-            zw.write_all(&bytes).map_err(|e| e.to_string())?;
-            count += 1;
-        }
-    }
-    let objects: Vec<PathBuf> = fs::read_dir(dir.join("objects"))
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    let total = objects.len();
-    for (i, p) in objects.iter().enumerate() {
-        if i % 50 == 0 {
-            let _ = app.emit("backup-progress", ImportProgress { done: i, total });
-        }
-        let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        zw.start_file(format!("objects/{fname}"), opts)
-            .map_err(|e| e.to_string())?;
-        let mut f = fs::File::open(p).map_err(|e| e.to_string())?;
-        std::io::copy(&mut f, &mut zw).map_err(|e| e.to_string())?;
-        count += 1;
-    }
-    zw.finish().map_err(|e| e.to_string())?;
-    let _ = app.emit("backup-progress", ImportProgress { done: total, total });
-    Ok(count)
+    backup::write_backup(&PathBuf::from(dest), &state, |progress| {
+        let _ = app.emit("backup-progress", progress);
+    })
 }
 
-/// A backup zip entry we're willing to extract: one of the known top-level
-/// files, or objects/<id>[.t] — no absolute paths, no traversal, no nesting.
+#[cfg(test)]
 fn safe_backup_entry(name: &str) -> bool {
-    if name.contains("..") || name.starts_with('/') || name.contains('\\') {
-        return false;
-    }
-    matches!(
-        name,
-        "meta.json" | "meta.bak" | "settings.json" | "index.enc" | "index.bak"
-    ) || name == "objects/"
-        || name
-            .strip_prefix("objects/")
-            .map_or(false, |f| !f.is_empty() && !f.contains('/'))
+    backup::safe_entry(name)
 }
 
-/// Restore a vault from a backup zip (created by backup_vault). Only allowed
-/// while locked; the existing vault directory is moved aside, never deleted.
+/// Validate a staged backup before replacing the locked vault.
 #[tauri::command]
 async fn restore_backup(src: String, state: VaultState<'_>) -> Result<(), String> {
-    let dir = {
-        let mut vault = vlock(&state);
-        if vault.active_key().is_some() {
-            return Err("Lock the vault before restoring a backup.".into());
-        }
-        vault.dir.clone()
-    };
-    let file = fs::File::open(&src).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|_| "That file isn't a readable zip archive.".to_string())?;
-    let mut has_meta = false;
-    for i in 0..zip.len() {
-        let name = zip
-            .by_index(i)
-            .map_err(|e| e.to_string())?
-            .name()
-            .to_string();
-        if !safe_backup_entry(&name) {
-            return Err("The backup contains unexpected files — not restoring.".into());
-        }
-        has_meta |= name == "meta.json";
-    }
-    if !has_meta {
-        return Err("That zip doesn't look like a PhotoVault backup (no meta.json).".into());
-    }
-    // Keep the current vault as a sibling directory rather than deleting it.
-    if dir.join("meta.json").exists() {
-        let aside = dir.with_file_name(format!("vault.pre-restore-{}", now_secs() as u64));
-        fs::rename(&dir, &aside).map_err(|e| e.to_string())?;
-    }
-    fs::create_dir_all(dir.join("objects")).map_err(|e| e.to_string())?;
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry.name().to_string();
-        let mut out = fs::File::create(dir.join(&name)).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-    }
-    // Adopt the restored settings (auto-lock, dedupe, …) immediately.
-    let mut vault = vlock(&state);
-    if let Some(s) = fs::read(vault.settings_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
-    {
-        vault.settings = s;
-    }
-    Ok(())
+    backup::restore(&PathBuf::from(src), &state)
 }
 
 /// Backfill capture dates for photos imported before this feature existed.
@@ -3087,7 +3270,33 @@ fn main() {
             let _ = media_tx.send((ctx.app_handle().clone(), request, responder));
         })
         .setup(|app| {
-            let dir = app.path().app_data_dir()?.join("vault");
+            let app_dir = app.path().app_data_dir()?;
+            let access = if native::another_copy_running(&app.config().identifier) {
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock,
+                    "PhotoVault is already running. Quit the other copy before opening this one."))
+            } else {
+                instance_lock::acquire(&app_dir)
+            };
+            let process_lock = match access {
+                Ok(file) => file,
+                Err(error) => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                    let handle = app.handle().clone();
+                    let message = if error.kind() == std::io::ErrorKind::WouldBlock {
+                        error.to_string()
+                    } else {
+                        format!("PhotoVault could not secure access to the vault: {error}")
+                    };
+                    app.dialog().message(message).title("PhotoVault")
+                        .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                        .show(move |_| handle.exit(0));
+                    return Ok(());
+                }
+            };
+            app.manage(process_lock);
+            let dir = app_dir.join("vault");
             fs::create_dir_all(&dir)?;
             let inbox = app.path().home_dir()?.join("PhotoVault Inbox");
             let inbox_is_real_dir = match fs::symlink_metadata(&inbox) {
@@ -3114,6 +3323,7 @@ fn main() {
                 key: None,
                 photos: HashMap::new(),
                 albums: HashMap::new(),
+                recovery_required: false,
                 last_activity: Instant::now(),
                 importing: false,
                 settings,
@@ -3148,6 +3358,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             vault_status,
+            recovery_status,
             lock_screen_info,
             create_vault,
             unlock,
@@ -3162,6 +3373,7 @@ fn main() {
             touchid_disable,
             touchid_unlock,
             get_settings,
+            get_build_info,
             set_settings,
             list_photos,
             list_albums,
@@ -3196,13 +3408,14 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn test_vault(dir: PathBuf, key: Option<[u8; 32]>) -> Vault {
+    pub(crate) fn test_vault(dir: PathBuf, key: Option<[u8; 32]>) -> Vault {
         Vault {
             dir,
             inbox: PathBuf::new(),
             key,
             photos: HashMap::new(),
             albums: HashMap::new(),
+            recovery_required: false,
             last_activity: Instant::now(),
             importing: false,
             settings: Settings::default(),
@@ -3306,6 +3519,88 @@ mod tests {
         let loaded = load_index(&vault, &key).unwrap();
         assert_eq!(loaded.photos["id"].name, "a.jpg");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_preserves_unindexed_and_expired_objects_across_saves_and_restart() {
+        let dir = std::env::temp_dir().join(format!("pv-recovery-{}", random_id()));
+        fs::create_dir_all(dir.join("objects")).unwrap();
+        let key = random_key();
+        let mut vault = test_vault(dir.clone(), None);
+        vault.photos.insert("expired".into(), test_photo(Some(1.0)));
+        persist_index(&vault, &key).unwrap();
+        fs::copy(vault.index_path(), vault.index_bak_path()).unwrap();
+        let original_backup = fs::read(vault.index_bak_path()).unwrap();
+        fs::write(vault.index_path(), b"corrupt").unwrap();
+        for name in ["expired", "expired.t", "newer", "newer.t"] {
+            fs::write(dir.join("objects").join(name), b"intact encrypted data").unwrap();
+        }
+        let state = Mutex::new(vault);
+        finish_unlock(&state, key).unwrap();
+        {
+            let mut vault = vlock(&state);
+            assert!(vault.recovery_required);
+            assert!(vault.photos.contains_key("expired"));
+            assert!(dir.join("recovery-required").exists());
+            assert_eq!(sweep_orphans(&vault), 0);
+            vault.photos.get_mut("expired").unwrap().name = "Renamed.jpg".into();
+            persist_index(&vault, &key).unwrap();
+            assert_eq!(fs::read(vault.index_bak_path()).unwrap(), original_backup);
+        }
+        let restarted = Mutex::new(test_vault(dir.clone(), None));
+        finish_unlock(&restarted, key).unwrap();
+        {
+            let vault = vlock(&restarted);
+            assert!(vault.recovery_required);
+            assert_eq!(vault.photos["expired"].name, "Renamed.jpg");
+            assert_eq!(sweep_orphans(&vault), 0);
+        }
+        // The encrypted flag also survives a backup that carries only the index.
+        fs::remove_file(dir.join("recovery-required")).unwrap();
+        assert!(load_index(&vlock(&restarted), &key).unwrap().recovery_required);
+        assert!(dir.join("recovery-required").exists());
+        for name in ["expired", "expired.t", "newer", "newer.t"] {
+            assert_eq!(fs::read(dir.join("objects").join(name)).unwrap(), b"intact encrypted data");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_marker_failure_refuses_unlock_without_deleting_objects() {
+        let dir = std::env::temp_dir().join(format!("pv-recovery-failure-{}", random_id()));
+        fs::create_dir_all(dir.join("objects")).unwrap();
+        fs::create_dir(dir.join("recovery-required")).unwrap();
+        let key = random_key();
+        fs::write(dir.join("index.bak"), encrypt(&key, br#"{"photos":{},"albums":{}}"#).unwrap()).unwrap();
+        fs::write(dir.join("objects/newer"), b"keep me").unwrap();
+        let state = Mutex::new(test_vault(dir.clone(), None));
+        assert!(finish_unlock(&state, key).is_err());
+        assert!(vlock(&state).key.is_none());
+        assert_eq!(fs::read(dir.join("objects/newer")).unwrap(), b"keep me");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn healthy_legacy_index_still_expires_trash_and_cleans_orphans() {
+        let dir = std::env::temp_dir().join(format!("pv-healthy-{}", random_id()));
+        fs::create_dir_all(dir.join("objects")).unwrap();
+        let key = random_key();
+        let json = br#"{"old":{"name":"old.jpg","added":1,"deleted":1},"keep":{"name":"keep.jpg","added":2}}"#;
+        fs::write(dir.join("index.enc"), encrypt(&key, json).unwrap()).unwrap();
+        for name in ["old", "old.t", "keep", "keep.t", "orphan"] {
+            fs::write(dir.join("objects").join(name), b"fixture").unwrap();
+        }
+        let state = Mutex::new(test_vault(dir.clone(), None));
+        finish_unlock(&state, key).unwrap();
+        let vault = vlock(&state);
+        assert!(!vault.recovery_required);
+        assert!(!vault.photos.contains_key("old"));
+        assert!(!dir.join("objects/old").exists());
+        assert!(!dir.join("objects/old.t").exists());
+        assert_eq!(sweep_orphans(&vault), 1);
+        assert!(dir.join("objects/keep").exists());
+        assert!(dir.join("objects/keep.t").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3619,6 +3914,7 @@ mod tests {
             key: None,
             photos: HashMap::new(),
             albums: HashMap::new(),
+            recovery_required: false,
             last_activity: Instant::now(),
             importing: false,
             settings: Settings::default(),
@@ -4068,5 +4364,279 @@ mod tests {
             .photos
             .values()
             .all(|photo| photo.albums.is_empty()));
+    }
+
+    #[test]
+    fn deletion_state_rolls_back_when_index_cannot_be_saved() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        vault.photos.insert("live".into(), test_photo(None));
+        vault
+            .photos
+            .insert("deleted".into(), test_photo(Some(12.0)));
+        persist_index(&vault, &fixture.key).unwrap();
+        fs::create_dir(vault.index_path().with_extension("tmp")).unwrap();
+        let ids = vec!["live".into(), "deleted".into(), "live".into()];
+        for deleted in [Some(30.0), None] {
+            assert!(set_deleted(&mut vault, &fixture.key, &ids, deleted).is_err());
+            assert_eq!(vault.photos["live"].deleted, None);
+            assert_eq!(vault.photos["deleted"].deleted, Some(12.0));
+            let index = load_index(&vault, &fixture.key).unwrap();
+            assert_eq!(index.photos["live"].deleted, None);
+            assert_eq!(index.photos["deleted"].deleted, Some(12.0));
+        }
+    }
+
+    #[test]
+    fn deletion_state_persists_trash_and_restore() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        vault.photos.insert("photo".into(), test_photo(None));
+        for deleted in [Some(30.0), None] {
+            set_deleted(&mut vault, &fixture.key, &["photo".into()], deleted).unwrap();
+            assert_eq!(
+                load_index(&vault, &fixture.key).unwrap().photos["photo"].deleted,
+                deleted
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_export_reports_read_decrypt_and_write_failures_without_losing_successes() {
+        let fixture = ImportFixture::new();
+        let objects = vlock(&fixture.state).objects_dir();
+        let destination = fixture.root.join("export");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("same.jpg"), b"existing").unwrap();
+        fs::write(
+            objects.join("good"),
+            encrypt(&fixture.key, b"original").unwrap(),
+        )
+        .unwrap();
+        fs::write(objects.join("corrupt"), b"corrupt").unwrap();
+        fs::write(
+            objects.join("long"),
+            encrypt(&fixture.key, b"long").unwrap(),
+        )
+        .unwrap();
+        let entries = vec![
+            ("good".into(), "same.jpg".into()),
+            ("missing".into(), "missing.jpg".into()),
+            ("corrupt".into(), "corrupt.jpg".into()),
+            ("long".into(), format!("{}.jpg", "x".repeat(300))),
+        ];
+        let result = export_entries(
+            &fixture.key,
+            &objects,
+            &destination,
+            &entries,
+            ExportResult::default(),
+            |_| {},
+        );
+        assert_eq!((result.exported, result.failed), (1, 3));
+        assert!(result.issues[0].reason.contains("read"));
+        assert!(result.issues[1].reason.contains("decrypt"));
+        assert!(result.issues[2].reason.contains("create"));
+        assert_eq!(fs::read(destination.join("same.jpg")).unwrap(), b"existing");
+        assert_eq!(
+            fs::read(destination.join("same (1).jpg")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn bulk_export_reports_every_file_when_destination_is_unusable() {
+        let fixture = ImportFixture::new();
+        let destination = fixture.root.join("not-a-directory");
+        fs::write(&destination, b"keep").unwrap();
+        let entries = vec![("a".into(), "a.jpg".into()), ("b".into(), "b.jpg".into())];
+        let result = export_entries(
+            &fixture.key,
+            &fixture.root,
+            &destination,
+            &entries,
+            ExportResult::default(),
+            |_| {},
+        );
+        assert_eq!((result.exported, result.failed), (0, 2));
+        assert!(result
+            .issues
+            .iter()
+            .all(|issue| issue.reason.contains("export folder")));
+        assert_eq!(fs::read(destination).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_destination_does_not_reuse_a_dangling_symlink() {
+        let fixture = ImportFixture::new();
+        let directory = fixture.root.join("export");
+        fs::create_dir(&directory).unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("missing"), directory.join("photo.jpg"))
+            .unwrap();
+        assert_eq!(
+            unique_dest(&directory, "photo.jpg"),
+            directory.join("photo (1).jpg")
+        );
+        write_export(&directory, "photo.jpg", b"exported").unwrap();
+        assert!(!fixture.root.join("missing").exists());
+        assert_eq!(
+            fs::read(directory.join("photo (1).jpg")).unwrap(),
+            b"exported"
+        );
+    }
+
+    #[test]
+    fn clearing_vault_rolls_back_photos_and_albums_before_removing_objects() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        vault.photos.insert("photo".into(), test_photo(None));
+        vault.albums.insert(
+            "album".into(),
+            Album {
+                name: "Trip".into(),
+                created: 1.0,
+            },
+        );
+        vault.media_cache = Some(("photo".into(), Arc::new(vec![1, 2, 3])));
+        let object = vault.objects_dir().join("photo");
+        fs::write(&object, b"encrypted original").unwrap();
+        persist_index(&vault, &fixture.key).unwrap();
+        fs::create_dir(vault.index_path().with_extension("tmp")).unwrap();
+        assert!(clear_vault_contents(&mut vault, &fixture.key).is_err());
+        assert!(vault.photos.contains_key("photo"));
+        assert!(vault.albums.contains_key("album"));
+        assert!(vault.media_cache.is_some());
+        assert_eq!(fs::read(object).unwrap(), b"encrypted original");
+        assert_eq!(load_index(&vault, &fixture.key).unwrap().photos.len(), 1);
+    }
+
+    #[test]
+    fn partial_export_write_is_reported_and_retry_preserves_existing_output() {
+        let fixture = ImportFixture::new();
+        let objects = vlock(&fixture.state).objects_dir();
+        let destination = fixture.root.join("export");
+        fs::write(
+            objects.join("photo"),
+            encrypt(&fixture.key, b"original").unwrap(),
+        )
+        .unwrap();
+        let entries = vec![("photo".into(), "photo.jpg".into())];
+        FAIL_EXPORT_WRITE.with(|fail| fail.set(true));
+        let failed = export_entries(
+            &fixture.key,
+            &objects,
+            &destination,
+            &entries,
+            ExportResult::default(),
+            |_| {},
+        );
+        assert_eq!((failed.exported, failed.failed), (0, 1));
+        assert_eq!(failed.issues[0].name, "photo.jpg");
+        assert!(failed.issues[0].reason.contains("incomplete output"));
+        assert_eq!(fs::read(destination.join("photo.jpg")).unwrap(), b"o");
+        let retried = export_entries(
+            &fixture.key,
+            &objects,
+            &destination,
+            &entries,
+            ExportResult::default(),
+            |_| {},
+        );
+        assert_eq!((retried.exported, retried.failed), (1, 0));
+        assert_eq!(fs::read(destination.join("photo.jpg")).unwrap(), b"o");
+        assert_eq!(
+            fs::read(destination.join("photo (1).jpg")).unwrap(),
+            b"original"
+        );
+    }
+
+    fn fail_sync_after_index_replacement(dir: PathBuf) {
+        AFTER_INDEX_REPLACEMENT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                FAIL_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(dir));
+            }))
+        });
+    }
+
+    #[test]
+    fn post_rename_sync_failure_restores_trash_and_restore_after_restart() {
+        for original in [None, Some(now_secs())] {
+            let fixture = ImportFixture::new();
+            let mut vault = vlock(&fixture.state);
+            vault.photos.insert("photo".into(), test_photo(original));
+            persist_index(&vault, &fixture.key).unwrap();
+            let requested = if original.is_some() {
+                None
+            } else {
+                Some(now_secs())
+            };
+            fail_sync_after_index_replacement(vault.dir.clone());
+            assert!(set_deleted(&mut vault, &fixture.key, &["photo".into()], requested).is_err());
+            assert_eq!(vault.photos["photo"].deleted, original);
+            assert!(vault.dir.join("index.rollback").exists());
+            let proposed = parse_index(
+                &decrypt(&fixture.key, &fs::read(vault.index_path()).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(proposed.photos["photo"].deleted, requested);
+            assert!(persist_index(&vault, &fixture.key).is_err());
+            assert!(load_index(&vault, &fixture.key).is_err());
+            FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+            let restarted = Mutex::new(test_vault(vault.dir.clone(), None));
+            drop(vault);
+            finish_unlock(&restarted, fixture.key).unwrap();
+            let recovered = vlock(&restarted);
+            assert_eq!(recovered.photos["photo"].deleted, original);
+            assert!(recovered.recovery_required);
+            assert!(!recovered.dir.join("index.rollback").exists());
+            assert!(recovered.dir.join("index.unconfirmed").exists());
+        }
+    }
+
+    #[test]
+    fn post_rename_sync_failure_of_delete_all_preserves_library_and_objects() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        vault.photos.insert("photo".into(), test_photo(None));
+        vault.albums.insert(
+            "album".into(),
+            Album {
+                name: "Trip".into(),
+                created: 1.0,
+            },
+        );
+        let object = vault.objects_dir().join("photo");
+        fs::write(&object, b"encrypted original").unwrap();
+        persist_index(&vault, &fixture.key).unwrap();
+        fail_sync_after_index_replacement(vault.dir.clone());
+        assert!(clear_vault_contents(&mut vault, &fixture.key).is_err());
+        assert!(vault.photos.contains_key("photo"));
+        assert!(vault.albums.contains_key("album"));
+        assert!(load_index(&vault, &fixture.key).is_err());
+        assert_eq!(fs::read(&object).unwrap(), b"encrypted original");
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        let restarted = Mutex::new(test_vault(vault.dir.clone(), None));
+        drop(vault);
+        finish_unlock(&restarted, fixture.key).unwrap();
+        let recovered = vlock(&restarted);
+        assert!(recovered.photos.contains_key("photo"));
+        assert!(recovered.albums.contains_key("album"));
+        assert_eq!(sweep_orphans(&recovered), 0);
+        assert_eq!(fs::read(object).unwrap(), b"encrypted original");
+    }
+
+    #[test]
+    fn first_index_post_rename_sync_failure_recovers_an_empty_prior_library() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        vault.photos.insert("new".into(), test_photo(None));
+        fail_sync_after_index_replacement(vault.dir.clone());
+        assert!(persist_index(&vault, &fixture.key).is_err());
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        let restored = load_index(&vault, &fixture.key).unwrap();
+        assert!(restored.photos.is_empty());
+        assert!(restored.recovery_required);
+        assert!(vault.dir.join("index.unconfirmed").exists());
     }
 }
