@@ -124,6 +124,11 @@ impl Vault {
     fn meta_path(&self) -> PathBuf {
         self.dir.join("meta.json")
     }
+    /// Publishing meta is the last step of creating a vault. `read_meta` falls
+    /// back to meta.bak, so either file means the vault exists.
+    fn has_meta(&self) -> bool {
+        self.meta_path().exists() || self.dir.join("meta.bak").exists()
+    }
     fn index_path(&self) -> PathBuf {
         self.dir.join("index.enc")
     }
@@ -423,13 +428,14 @@ fn parse_recovery_key(text: &str) -> Result<[u8; 32], String> {
 
 // ------------------------------------------------------------------ meta ---
 
+fn read_meta_file(path: &std::path::Path) -> std::io::Result<Meta> {
+    fs::read(path).and_then(|raw| serde_json::from_slice(&raw).map_err(std::io::Error::other))
+}
+
 fn read_meta(dir: &std::path::Path) -> Result<Meta, String> {
-    let primary = fs::read(dir.join("meta.json"))
-        .and_then(|raw| serde_json::from_slice(&raw).map_err(std::io::Error::other));
-    match primary {
+    match read_meta_file(&dir.join("meta.json")) {
         Ok(meta) => Ok(meta),
-        Err(primary_err) => fs::read(dir.join("meta.bak"))
-            .and_then(|raw| serde_json::from_slice(&raw).map_err(std::io::Error::other))
+        Err(primary_err) => read_meta_file(&dir.join("meta.bak"))
             .map_err(|backup_err| format!("{primary_err}; backup: {backup_err}")),
     }
 }
@@ -503,23 +509,36 @@ fn write_file_durably(
 /// authoritative and intact; once both renames land, neither file holds a
 /// wrapping that a retired password can open.
 ///
-/// `WriteError::Unconfirmed` means `meta.json` itself was replaced. A failure
-/// on the backup leaves `meta.json` as it was, so it counts as not replaced.
+/// `WriteError::Unconfirmed` means readers now see the new meta. Either
+/// `meta.json` was replaced, or `meta.bak` was and `meta.json` isn't valid, so
+/// `read_meta` falls back to the backup. Any other failure leaves the old
+/// `meta.json` in charge, so it counts as not replaced.
 fn write_meta(dir: &std::path::Path, meta: &Meta) -> Result<(), WriteError> {
     let json = serde_json::to_vec(meta).map_err(|e| WriteError::NotReplaced(e.to_string()))?;
-    write_file_durably(
+    // Call once meta.bak holds the new meta but meta.json wasn't replaced.
+    let backup_only = |e: String| match read_meta_file(&dir.join("meta.json")) {
+        Ok(_) => WriteError::NotReplaced(e),
+        Err(_) => WriteError::Unconfirmed(e),
+    };
+    match write_file_durably(
         &dir.join("meta.bak.tmp"),
         &dir.join("meta.bak"),
         &json,
         dir,
-    )
-    .map_err(|e| WriteError::NotReplaced(e.into()))?;
-    write_file_durably(
+    ) {
+        Ok(()) => {}
+        Err(WriteError::Unconfirmed(e)) => return Err(backup_only(e)),
+        Err(e) => return Err(e),
+    }
+    match write_file_durably(
         &dir.join("meta.json.tmp"),
         &dir.join("meta.json"),
         &json,
         dir,
-    )
+    ) {
+        Err(WriteError::NotReplaced(e)) => Err(backup_only(e)),
+        result => result,
+    }
 }
 
 fn remove_legacy_meta_backup(dir: &std::path::Path) {
@@ -803,8 +822,9 @@ fn finish_unlock(state: &Mutex<Vault>, master: [u8; 32]) -> Result<(), String> {
             ]
         })
         .collect();
+    let mut removed = Vec::new();
     for id in &expired {
-        vault.photos.remove(id);
+        removed.extend(vault.photos.remove_entry(id));
         vault.media_cache = vault
             .media_cache
             .take()
@@ -817,9 +837,15 @@ fn finish_unlock(state: &Mutex<Vault>, master: [u8; 32]) -> Result<(), String> {
             .retain(|cached_id| !expired.contains(cached_id));
     }
     if !expired.is_empty() {
-        persist_index(&vault, &master)?;
-        for path in expired_blobs {
-            let _ = fs::remove_file(path);
+        // Expiry is housekeeping. If it can't be saved, keep the items until
+        // the next unlock rather than refuse to open the vault.
+        match persist_index(&vault, &master) {
+            Ok(()) => {
+                for path in expired_blobs {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            Err(_) => vault.photos.extend(removed),
         }
     }
     vault.key = Some(master);
@@ -1256,7 +1282,7 @@ fn collect_files(paths: &[String], result: &mut ImportResult) -> Vec<PathBuf> {
 #[tauri::command]
 async fn vault_status(state: VaultState<'_>) -> Result<String, String> {
     let mut vault = vlock(&state);
-    Ok(if !vault.meta_path().exists() {
+    Ok(if !vault.has_meta() {
         "new".into()
     } else if vault.active_key().is_some() {
         "unlocked".into()
@@ -1310,13 +1336,14 @@ async fn lock_screen_info(state: VaultState<'_>) -> Result<LockScreenInfo, Strin
 
 #[tauri::command]
 async fn create_vault(password: String, state: VaultState<'_>) -> Result<(), String> {
-    let meta_mutex = vlock(&state).meta_lock.clone();
+    create_new_vault(&state, &password)
+}
+
+fn create_new_vault(state: &Mutex<Vault>, password: &str) -> Result<(), String> {
+    let meta_mutex = vlock(state).meta_lock.clone();
     let _meta_guard = meta_lock(&meta_mutex);
-    {
-        let vault = vlock(&state);
-        if vault.meta_path().exists() {
-            return Err("Vault already exists.".into());
-        }
+    if vlock(state).has_meta() {
+        return Err("Vault already exists.".into());
     }
     if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
@@ -1333,13 +1360,26 @@ async fn create_vault(password: String, state: VaultState<'_>) -> Result<(), Str
         wrapped_master: None,
         recovery: None,
     };
-    rewrap_master(&mut meta, &password, &master)?; // slow (scrypt): outside the lock
-    let mut vault = vlock(&state);
+    rewrap_master(&mut meta, password, &master)?; // slow (scrypt): outside the lock
+    let mut vault = vlock(state);
     fs::create_dir_all(vault.objects_dir()).map_err(|e| e.to_string())?;
-    write_meta(&vault.dir, &meta)?;
+    // An earlier failed attempt may have left an index under its own master
+    // key. Without meta nothing can open it, so start over.
+    for name in ["index.enc", "index.bak", "index.rollback", "recovery-required"] {
+        match fs::remove_file(vault.dir.join(name)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+            _ => {}
+        }
+    }
     vault.photos = HashMap::new();
     vault.albums = HashMap::new();
     persist_index(&vault, &master)?;
+    // Meta goes last, so the vault only exists once it's complete. If readers
+    // see the new meta, the vault is done even if the disk didn't confirm it.
+    match write_meta(&vault.dir, &meta) {
+        Ok(()) | Err(WriteError::Unconfirmed(_)) => {}
+        Err(WriteError::NotReplaced(e)) => return Err(e),
+    }
     vault.key = Some(master);
     vault.session += 1;
     vault.last_activity = Instant::now();
@@ -1348,13 +1388,17 @@ async fn create_vault(password: String, state: VaultState<'_>) -> Result<(), Str
 
 #[tauri::command]
 async fn unlock(password: String, state: VaultState<'_>) -> Result<(), String> {
+    unlock_with_password(&state, &password)
+}
+
+fn unlock_with_password(state: &Mutex<Vault>, password: &str) -> Result<(), String> {
     let (dir, meta_mutex) = {
-        let vault = vlock(&state);
+        let vault = vlock(state);
         (vault.dir.clone(), vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
     let meta = read_meta(&dir)?;
-    let master = match master_from_password(&password, &meta) {
+    let master = match master_from_password(password, &meta) {
         Ok(m) => m,
         Err(e) => {
             std::thread::sleep(Duration::from_millis(500));
@@ -1364,11 +1408,32 @@ async fn unlock(password: String, state: VaultState<'_>) -> Result<(), String> {
     // Seamless v1 → v2 migration: wrap the existing key as the master key.
     if meta.wrapped_master.is_none() {
         let mut meta = meta;
-        rewrap_master(&mut meta, &password, &master)?;
-        write_meta(&dir, &meta)?;
+        rewrap_master(&mut meta, password, &master)?;
+        match write_meta(&dir, &meta) {
+            // Readers see the new meta, and the same password opens it.
+            Ok(()) | Err(WriteError::Unconfirmed(_)) => {}
+            Err(WriteError::NotReplaced(e)) => return Err(e),
+        }
     }
     remove_legacy_meta_backup(&dir);
-    finish_unlock(&state, master)
+    finish_unlock(state, master)
+}
+
+/// What a credential change returns. `warning` is set when the change took
+/// effect but the disk didn't confirm the write, so a crash might undo it.
+#[derive(Serialize)]
+struct Saved {
+    warning: Option<String>,
+}
+
+/// Write meta for a credential change. An error means nothing changed. Once
+/// readers see the new meta the change counts, with `warning` if unconfirmed.
+fn save_meta(dir: &std::path::Path, meta: &Meta, warning: &str) -> Result<Saved, String> {
+    match write_meta(dir, meta) {
+        Ok(()) => Ok(Saved { warning: None }),
+        Err(WriteError::Unconfirmed(_)) => Ok(Saved { warning: Some(warning.into()) }),
+        Err(WriteError::NotReplaced(e)) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -1376,28 +1441,40 @@ async fn change_password(
     current_password: String,
     new_password: String,
     state: VaultState<'_>,
-) -> Result<(), String> {
+) -> Result<Saved, String> {
+    change_vault_password(&state, &current_password, &new_password)
+}
+
+fn change_vault_password(
+    state: &Mutex<Vault>,
+    current_password: &str,
+    new_password: &str,
+) -> Result<Saved, String> {
     if new_password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
             "New password must be at least {MIN_PASSWORD_LEN} characters."
         ));
     }
     let (dir, master, meta_mutex) = {
-        let mut vault = vlock(&state);
+        let mut vault = vlock(state);
         let key = vault.active_key().ok_or("locked")?;
         (vault.dir.clone(), key, vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
-    if vlock(&state).active_key() != Some(master) {
+    if vlock(state).active_key() != Some(master) {
         return Err("The vault changed or locked. Try again after unlocking.".into());
     }
     let mut meta = read_meta(&dir)?;
-    master_from_password(&current_password, &meta)
+    master_from_password(current_password, &meta)
         .map_err(|_| "Current password is incorrect.".to_string())?;
-    rewrap_master(&mut meta, &new_password, &master)?;
-    write_meta(&dir, &meta)?;
+    rewrap_master(&mut meta, new_password, &master)?;
+    let saved = save_meta(
+        &dir,
+        &meta,
+        "Password changed, but the disk didn't confirm the write. Use your new password from now on. Keep the old one until you've unlocked once with the new one.",
+    )?;
     remove_legacy_meta_backup(&dir);
-    Ok(())
+    Ok(saved)
 }
 
 #[derive(Serialize)]
@@ -1427,20 +1504,14 @@ fn generate_recovery_key(state: &Mutex<Vault>) -> Result<NewRecoveryKey, String>
     Ok(shown)
 }
 
-#[derive(Serialize)]
-struct RecoveryConfirmed {
-    // Set when the new key replaced the old one but the disk didn't confirm it.
-    warning: Option<String>,
-}
-
 /// Save the key from `recovery_generate` with this id once the user has seen
 /// it. This replaces the old recovery key. An error means nothing changed.
 #[tauri::command]
-async fn recovery_confirm(id: String, state: VaultState<'_>) -> Result<RecoveryConfirmed, String> {
+async fn recovery_confirm(id: String, state: VaultState<'_>) -> Result<Saved, String> {
     confirm_recovery_key(&state, &id)
 }
 
-fn confirm_recovery_key(state: &Mutex<Vault>, id: &str) -> Result<RecoveryConfirmed, String> {
+fn confirm_recovery_key(state: &Mutex<Vault>, id: &str) -> Result<Saved, String> {
     let (dir, master, session, meta_mutex) = {
         let mut vault = vlock(state);
         let key = vault.active_key().ok_or("locked")?;
@@ -1461,33 +1532,34 @@ fn confirm_recovery_key(state: &Mutex<Vault>, id: &str) -> Result<RecoveryConfir
     };
     let mut meta = read_meta(&dir)?;
     meta.recovery = Some(hex::encode(encrypt(&rk, &master)?));
-    let warning = match write_meta(&dir, &meta) {
-        Ok(()) => None,
-        // meta.json already holds the new key, so it's the one that works now.
-        Err(WriteError::Unconfirmed(_)) => Some(
-            "Saved, but the disk didn't confirm the write. Keep this new key; any old key no longer works."
-                .into(),
-        ),
-        Err(e) => return Err(e.into()),
-    };
+    // The new key works now, but a crash could still bring back the old one.
+    let saved = save_meta(
+        &dir,
+        &meta,
+        "Saved, but the disk didn't confirm the write. Keep this new key, and keep any old key until you've unlocked once with the new one.",
+    )?;
     // Keep a newer key generated while this one was being saved.
     let mut vault = vlock(state);
     if vault.pending_recovery.as_ref().is_some_and(|(pending_id, _)| pending_id == id) {
         vault.pending_recovery = None;
     }
-    Ok(RecoveryConfirmed { warning })
+    Ok(saved)
 }
 
 #[tauri::command]
-async fn recovery_disable(state: VaultState<'_>) -> Result<(), String> {
+async fn recovery_disable(state: VaultState<'_>) -> Result<Saved, String> {
+    disable_recovery_key(&state)
+}
+
+fn disable_recovery_key(state: &Mutex<Vault>) -> Result<Saved, String> {
     let (dir, master, meta_mutex) = {
-        let mut vault = vlock(&state);
+        let mut vault = vlock(state);
         let master = vault.active_key().ok_or("locked")?;
         (vault.dir.clone(), master, vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
     {
-        let mut vault = vlock(&state);
+        let mut vault = vlock(state);
         if vault.active_key() != Some(master) {
             return Err("The vault changed or locked. Try again after unlocking.".into());
         }
@@ -1495,9 +1567,13 @@ async fn recovery_disable(state: VaultState<'_>) -> Result<(), String> {
     }
     let mut meta = read_meta(&dir)?;
     meta.recovery = None;
-    write_meta(&dir, &meta)?;
+    let saved = save_meta(
+        &dir,
+        &meta,
+        "Recovery key turned off, but the disk didn't confirm the write. If it shows as set up after a restart, turn it off again.",
+    )?;
     remove_legacy_meta_backup(&dir);
-    Ok(())
+    Ok(saved)
 }
 
 /// Forgot-password path: the recovery key unwraps the master key, and the
@@ -1507,7 +1583,7 @@ async fn recovery_unlock(
     recovery_key: String,
     new_password: String,
     state: VaultState<'_>,
-) -> Result<(), String> {
+) -> Result<Saved, String> {
     unlock_with_recovery_key(&recovery_key, &new_password, &state)
 }
 
@@ -1515,7 +1591,7 @@ fn unlock_with_recovery_key(
     recovery_key: &str,
     new_password: &str,
     state: &Mutex<Vault>,
-) -> Result<(), String> {
+) -> Result<Saved, String> {
     if new_password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
             "New password must be at least {MIN_PASSWORD_LEN} characters."
@@ -1558,9 +1634,15 @@ fn unlock_with_recovery_key(
         return Err("Wrong recovery key.".into());
     }
     rewrap_master(&mut meta, new_password, &master)?;
-    write_meta(&dir, &meta)?;
+    // Once the new password works, finish unlocking even if the disk didn't confirm it.
+    let saved = save_meta(
+        &dir,
+        &meta,
+        "Password reset, but the disk didn't confirm the write. Use your new password from now on. Keep your recovery key, too.",
+    )?;
     remove_legacy_meta_backup(&dir);
-    finish_unlock(state, master)
+    finish_unlock(state, master)?;
+    Ok(saved)
 }
 
 // ---------------------------------------------------------------- Touch ID ---
@@ -4485,6 +4567,29 @@ mod tests {
     }
 
     #[test]
+    fn failed_trash_expiry_save_still_unlocks_and_keeps_the_items() {
+        let dir = std::env::temp_dir().join(format!("pv-expiry-failure-{}", random_id()));
+        fs::create_dir_all(dir.join("objects")).unwrap();
+        let key = random_key();
+        let json = br#"{"old":{"name":"old.jpg","added":1,"deleted":1},"keep":{"name":"keep.jpg","added":2}}"#;
+        fs::write(dir.join("index.enc"), encrypt(&key, json).unwrap()).unwrap();
+        for name in ["old", "old.t", "keep", "keep.t"] {
+            fs::write(dir.join("objects").join(name), b"fixture").unwrap();
+        }
+        let state = Mutex::new(test_vault(dir.clone(), None));
+        let index_tmp = vlock(&state).index_path().with_extension("tmp");
+        fs::create_dir(&index_tmp).unwrap();
+        finish_unlock(&state, key).unwrap();
+        let vault = vlock(&state);
+        assert_eq!(vault.key, Some(key));
+        assert!(vault.photos.contains_key("old"));
+        assert!(dir.join("objects/old").exists());
+        assert!(dir.join("objects/old.t").exists());
+        drop(vault);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn healthy_legacy_index_still_expires_trash_and_cleans_orphans() {
         let dir = std::env::temp_dir().join(format!("pv-healthy-{}", random_id()));
         fs::create_dir_all(dir.join("objects")).unwrap();
@@ -6300,9 +6405,173 @@ mod tests {
         let confirmed = confirm_recovery_key(&fixture.state, &shown.id).unwrap();
         FAIL_SYNC_AFTER_REPLACING.with(|path| path.borrow_mut().take());
         FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
-        assert!(confirmed.warning.unwrap().contains("any old key no longer works"));
+        assert!(confirmed.warning.unwrap().contains("keep any old key until"));
         assert!(opens(&shown.key) && !opens(&old));
         assert!(vlock(&fixture.state).pending_recovery.is_none());
+
+        // meta.json is unreadable, so readers use meta.bak. Once the new key
+        // replaces the backup, it's the one that works, even if the sync fails.
+        let old = shown.key;
+        fs::write(dir.join("meta.json"), b"truncated").unwrap();
+        let shown = generate_recovery_key(&fixture.state).unwrap();
+        let confirmed = with_failed_sync_after(&dir, "meta.bak", || confirm_recovery_key(&fixture.state, &shown.id));
+        assert!(confirmed.unwrap().warning.is_some());
+        assert!(opens(&shown.key) && !opens(&old));
+        assert!(vlock(&fixture.state).pending_recovery.is_none());
+    }
+
+    /// Run `f` while the directory sync after replacing `dir/name` fails.
+    fn with_failed_sync_after<T>(dir: &std::path::Path, name: &str, f: impl FnOnce() -> T) -> T {
+        FAIL_SYNC_AFTER_REPLACING.with(|path| *path.borrow_mut() = Some(dir.join(name)));
+        let result = f();
+        FAIL_SYNC_AFTER_REPLACING.with(|path| path.borrow_mut().take());
+        let failed = FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        assert_eq!(failed.as_deref(), Some(dir), "the write never replaced {name}");
+        result
+    }
+
+    /// A vault in the fixture with this password and recovery key, locked.
+    fn locked_vault(fixture: &ImportFixture, password: &str, recovery: &[u8; 32]) -> PathBuf {
+        let dir = vlock(&fixture.state).dir.clone();
+        let mut meta = blank_meta();
+        rewrap_master(&mut meta, password, &fixture.key).unwrap();
+        meta.recovery = Some(hex::encode(encrypt(recovery, &fixture.key).unwrap()));
+        write_meta(&dir, &meta).unwrap();
+        persist_index(&vlock(&fixture.state), &fixture.key).unwrap();
+        wipe_vault(&mut vlock(&fixture.state));
+        dir
+    }
+
+    fn password_opens(dir: &std::path::Path, password: &str) -> bool {
+        master_from_password(password, &read_meta(dir).unwrap()).is_ok()
+    }
+
+    #[test]
+    fn password_change_counts_once_the_new_meta_is_in_place() {
+        let fixture = ImportFixture::new();
+        let dir = locked_vault(&fixture, "old password", &random_key());
+        unlock_with_password(&fixture.state, "old password").unwrap();
+
+        // Nothing replaced: an error, and the old password still works.
+        FAIL_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(dir.clone()));
+        let failed = change_vault_password(&fixture.state, "old password", "new password");
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        assert!(failed.is_err());
+        assert!(password_opens(&dir, "old password") && !password_opens(&dir, "new password"));
+
+        // meta.json was replaced but not synced: the new password is the one
+        // that works, so the change succeeds with a warning.
+        let saved = with_failed_sync_after(&dir, "meta.json", || {
+            change_vault_password(&fixture.state, "old password", "new password")
+        });
+        assert!(saved.unwrap().warning.unwrap().contains("Use your new password"));
+        assert!(password_opens(&dir, "new password") && !password_opens(&dir, "old password"));
+        wipe_vault(&mut vlock(&fixture.state));
+        unlock_with_password(&fixture.state, "new password").unwrap();
+    }
+
+    #[test]
+    fn recovery_reset_unlocks_once_the_new_password_is_in_place() {
+        let fixture = ImportFixture::new();
+        let rk = random_key();
+        let dir = locked_vault(&fixture, "old password", &rk);
+        let saved = with_failed_sync_after(&dir, "meta.json", || {
+            unlock_with_recovery_key(&format_recovery_key(&rk), "new password", &fixture.state)
+        });
+        assert!(saved.unwrap().warning.unwrap().contains("Use your new password"));
+        assert_eq!(vlock(&fixture.state).key, Some(fixture.key));
+        assert!(password_opens(&dir, "new password") && !password_opens(&dir, "old password"));
+    }
+
+    #[test]
+    fn recovery_disable_counts_once_the_new_meta_is_in_place() {
+        let fixture = ImportFixture::new();
+        let rk = format_recovery_key(&random_key());
+        let dir = locked_vault(&fixture, "password", &parse_recovery_key(&rk).unwrap());
+        unlock_with_password(&fixture.state, "password").unwrap();
+        let saved = with_failed_sync_after(&dir, "meta.json", || disable_recovery_key(&fixture.state));
+        assert!(saved.unwrap().warning.unwrap().contains("turn it off again"));
+        assert!(read_meta(&dir).unwrap().recovery.is_none());
+        wipe_vault(&mut vlock(&fixture.state));
+        let reset = unlock_with_recovery_key(&rk, "new password", &fixture.state);
+        assert_eq!(reset.err().as_deref(), Some("No recovery key is set up for this vault."));
+    }
+
+    #[test]
+    fn v1_migration_unlocks_once_the_new_meta_is_in_place() {
+        let fixture = ImportFixture::new();
+        let dir = vlock(&fixture.state).dir.clone();
+        let salt = [7u8; 16];
+        let master = derive_key("legacy password", &salt).unwrap();
+        let mut meta = blank_meta();
+        meta.salt = hex::encode(salt);
+        meta.verifier = hex::encode(encrypt(&master, VERIFIER_PLAINTEXT).unwrap());
+        write_meta(&dir, &meta).unwrap();
+        persist_index(&vlock(&fixture.state), &master).unwrap();
+        wipe_vault(&mut vlock(&fixture.state));
+        let unlocked = with_failed_sync_after(&dir, "meta.json", || {
+            unlock_with_password(&fixture.state, "legacy password")
+        });
+        unlocked.unwrap();
+        assert_eq!(vlock(&fixture.state).key, Some(master));
+        let migrated = read_meta(&dir).unwrap();
+        assert!(migrated.wrapped_master.is_some());
+        assert_eq!(master_from_password("legacy password", &migrated).unwrap(), master);
+    }
+
+    #[test]
+    fn failed_vault_creation_leaves_no_vault_and_can_be_retried() {
+        let fixture = ImportFixture::new();
+        let dir = vlock(&fixture.state).dir.clone();
+        wipe_vault(&mut vlock(&fixture.state));
+
+        // The index save fails and leaves its journal behind.
+        FAIL_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(dir.clone()));
+        let failed = create_new_vault(&fixture.state, "first password");
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        assert!(failed.is_err());
+        assert!(dir.join("index.rollback").exists());
+        assert!(!vlock(&fixture.state).has_meta());
+
+        // The index lands under this attempt's master key, then meta fails.
+        fs::create_dir(dir.join("meta.bak.tmp")).unwrap();
+        assert!(create_new_vault(&fixture.state, "second password").is_err());
+        fs::remove_dir(dir.join("meta.bak.tmp")).unwrap();
+        assert!(dir.join("index.enc").exists());
+        assert!(!vlock(&fixture.state).has_meta());
+        assert!(vlock(&fixture.state).key.is_none());
+
+        // A retry starts over with a new master key and its own index.
+        create_new_vault(&fixture.state, "third password").unwrap();
+        wipe_vault(&mut vlock(&fixture.state));
+        assert!(unlock_with_password(&fixture.state, "second password").is_err());
+        unlock_with_password(&fixture.state, "third password").unwrap();
+    }
+
+    #[test]
+    fn vault_creation_counts_once_meta_is_in_place() {
+        // meta.json lands but its sync fails.
+        let fixture = ImportFixture::new();
+        let dir = vlock(&fixture.state).dir.clone();
+        wipe_vault(&mut vlock(&fixture.state));
+        with_failed_sync_after(&dir, "meta.json", || create_new_vault(&fixture.state, "password")).unwrap();
+        assert!(vlock(&fixture.state).key.is_some());
+        wipe_vault(&mut vlock(&fixture.state));
+        unlock_with_password(&fixture.state, "password").unwrap();
+
+        // Only meta.bak lands. Readers fall back to it, so the vault exists.
+        let fixture = ImportFixture::new();
+        let dir = vlock(&fixture.state).dir.clone();
+        wipe_vault(&mut vlock(&fixture.state));
+        fs::create_dir(dir.join("meta.json.tmp")).unwrap();
+        create_new_vault(&fixture.state, "password").unwrap();
+        assert!(!dir.join("meta.json").exists());
+        assert_eq!(
+            create_new_vault(&fixture.state, "password").err().as_deref(),
+            Some("Vault already exists.")
+        );
+        wipe_vault(&mut vlock(&fixture.state));
+        unlock_with_password(&fixture.state, "password").unwrap();
     }
 
     #[test]

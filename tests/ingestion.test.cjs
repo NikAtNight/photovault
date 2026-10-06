@@ -857,7 +857,7 @@ test('a confirm that replaced the key without a disk sync keeps it on screen unt
   a.element('keymodal').id = 'keymodal';
   a.run(`document.querySelectorAll = sel => sel === ".modal.open" && $("keymodal").classList.contains("open")
     ? [$("keymodal")] : [];`);
-  const warning = "Saved, but the disk didn't confirm the write. Keep this new key; any old key no longer works.";
+  const warning = "Saved, but the disk didn't confirm the write. Keep this new key, and keep any old key until you've unlocked once with the new one.";
   a.state.handlers.recovery_confirm = () => ({ warning });
   a.run('showRecoveryKey("NEW-KEY", "new", false)');
   await a.element('rkdone').onclick();
@@ -879,6 +879,48 @@ test('a confirm that replaced the key without a disk sync keeps it on screen unt
   assert.equal(a.calls.filter(c => c.command === 'recovery_confirm').length, 2);
   assert.equal(a.element('keymodal').classList.contains('open'), false);
 });
+
+// A credential change whose write landed but wasn't confirmed by the disk
+// still succeeds. The UI shows the warning instead of the usual message.
+const unconfirmed = "Saved, but the disk didn't confirm the write. Use your new password from now on.";
+for (const warning of [undefined, unconfirmed]) {
+  test(`a password change ${warning ? 'with' : 'without'} a warning clears the form and says so`, async () => {
+    const a = app();
+    a.state.handlers.change_password = () => ({ warning });
+    for (const id of ['cpw0', 'cpw1', 'cpw2']) a.element(id).value = id === 'cpw0' ? 'old password' : 'new password';
+    await a.element('pwform').events.submit({ preventDefault() {} });
+    assert.deepEqual({ ...a.calls.find(c => c.command === 'change_password').args },
+      { currentPassword: 'old password', newPassword: 'new password' });
+    for (const id of ['cpw0', 'cpw1', 'cpw2']) assert.equal(a.element(id).value, '');
+    assert.equal(a.element('toastmsg').textContent, warning ?? 'Password changed');
+  });
+
+  test(`a recovery reset ${warning ? 'with' : 'without'} a warning finishes unlocking`, async () => {
+    const a = app();
+    a.state.handlers.recovery_unlock = () => ({ warning });
+    a.state.handlers.vault_status = () => 'unlocked';
+    a.run('mode = "recovery"');
+    a.element('rk').value = 'RECOVERY-KEY';
+    a.element('pw').value = a.element('pw2').value = 'new password';
+    await a.element('authform').events.submit({ preventDefault() {} });
+    const commands = a.calls.map(c => c.command);
+    assert.ok(commands.indexOf('recovery_unlock') < commands.indexOf('vault_status'));
+    assert.equal(a.run('mode'), 'login');
+    assert.equal(a.element('autherr').textContent, '');
+    assert.equal(a.element('toastmsg').textContent, warning ?? 'Password reset');
+  });
+
+  test(`turning off the recovery key ${warning ? 'with' : 'without'} a warning refreshes its status`, async () => {
+    const a = app();
+    a.state.handlers.recovery_disable = () => ({ warning });
+    a.state.handlers.lock_screen_info = () => ({ has_recovery: false });
+    await a.element('rkoff').onclick();
+    await new Promise(setImmediate);
+    assert.ok(a.calls.some(c => c.command === 'lock_screen_info'));
+    assert.equal(a.run('$("rkgen").textContent'), 'Generate…');
+    assert.equal(a.element('toastmsg').textContent, warning ?? '');
+  });
+}
 
 test('Escape closes the recovery key without saving it', async () => {
   const a = app();

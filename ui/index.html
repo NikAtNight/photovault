@@ -628,6 +628,12 @@ function toast(msg, action, onAction) {
   t._h = setTimeout(() => (t.style.display = "none"), action ? 6000 : 2500);
 }
 
+// The change worked but the disk didn't confirm it. Stays up longer than a
+// plain toast, since it tells the user which password or key to keep.
+function warningToast(msg) {
+  toast(msg, "OK", () => {});
+}
+
 function progressToast(verb) {
   return e => {
     const { done, total } = e.payload;
@@ -832,10 +838,11 @@ $("authform").addEventListener("submit", async e => {
       await invoke("create_vault", { password: pw });
       $("offermodal").classList.add("open");   // recovery-key offer, then refresh
     } else if (mode === "recovery") {
-      await invoke("recovery_unlock", { recoveryKey: $("rk").value, newPassword: pw });
+      const saved = await invoke("recovery_unlock", { recoveryKey: $("rk").value, newPassword: pw });
       mode = "login";
       await refresh();
-      toast("Password reset");
+      if (saved?.warning) warningToast(saved.warning);
+      else toast("Password reset");
     } else {
       await invoke("unlock", { password: pw });
       await refresh();
@@ -2330,7 +2337,8 @@ $("rkoff").onclick = async () => {
   const ok = await ask("Disable the recovery key?\nThe old key stops working immediately.",
     { title: "Disable recovery key", kind: "warning", okLabel: "Disable", cancelLabel: "Cancel" });
   if (!ok) return;
-  await invoke("recovery_disable").catch(err => toast("" + err));
+  const saved = await invoke("recovery_disable").catch(err => toast("" + err));
+  if (saved?.warning) warningToast(saved.warning);
   refreshRecoveryStatus();
 };
 
@@ -2338,12 +2346,13 @@ $("pwform").addEventListener("submit", async e => {
   e.preventDefault();
   if ($("cpw1").value !== $("cpw2").value) { toast("New passwords don't match."); return; }
   try {
-    await invoke("change_password", {
+    const saved = await invoke("change_password", {
       currentPassword: $("cpw0").value,
       newPassword: $("cpw1").value,
     });
     $("cpw0").value = ""; $("cpw1").value = ""; $("cpw2").value = "";
-    toast("Password changed");
+    if (saved?.warning) warningToast(saved.warning);
+    else toast("Password changed");
   } catch (err) { toast("" + err); }
 });
 

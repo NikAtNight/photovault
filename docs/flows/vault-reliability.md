@@ -33,10 +33,20 @@ appearance selector is outside these five fixes.
   hasn't locked and unlocked since (`Vault.session`). Lock drops the pending
   key, the old key keeps working, nothing shows over the lock screen, and lock
   clears typed passwords. The UI shows only the latest Generate response.
-- Fail the recovery key save. If nothing was replaced, any old key still
-  works. If the new meta file landed but the directory sync failed
-  (`WriteError::Unconfirmed`), the new key counts as saved and the modal
-  warns to keep it.
+- Fail a credential write (recovery key confirm, password change, recovery
+  reset, recovery disable). If nothing readers use was replaced, the command
+  fails and the old credentials still work. If the new meta landed but the
+  directory sync failed (`WriteError::Unconfirmed`), the change counts as done
+  and the command returns `{ warning }` naming what to keep (the old password
+  or recovery key, or for disable, to turn it off again if it reappears). A
+  recovery reset still unlocks: `finish_unlock` treats trash expiry as
+  best-effort, so a failed expiry save keeps those items and opens the vault.
+  `write_meta` decides by which file readers use: when `meta.json` isn't valid
+  meta, a landed `meta.bak` counts as applied.
+- Interrupt vault creation. `create_new_vault` clears leftover index files,
+  writes the empty index, and publishes meta last, so a failed attempt leaves
+  no vault and can be retried. A vault exists if `meta.json` or `meta.bak`
+  does (`has_meta`).
 - Fail a settings save. `save_settings` replaces `settings.json` atomically.
   If the replace didn't happen, memory rolls back and the old file stays. If
   it happened but the directory sync failed, the new settings count as saved.
