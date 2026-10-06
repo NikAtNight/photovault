@@ -132,6 +132,13 @@
     min-width: 22px; min-height: 24px; border-radius: 5px; }
   #sidebar .tools button:hover { background: var(--hover); color: var(--text); }
   .sidebar-note { padding: 12px 10px; font-size: 11px; color: var(--secondary); }
+  #sbresize { position: fixed; top: 12px; bottom: 12px; left: calc(var(--sbw) - 4px); width: 8px;
+    z-index: 16; cursor: col-resize; touch-action: none; }
+  #sbresize::after { content: ""; position: absolute; top: 18px; bottom: 18px; left: 3px; width: 2px;
+    border-radius: 1px; background: var(--accent); opacity: 0; transition: opacity .15s; }
+  #sbresize:hover::after, #sbresize.dragging::after, #sbresize:focus-visible::after { opacity: .6; }
+  #sbresize:focus-visible { outline: 0; }
+  body.sbdragging { cursor: col-resize; }
   #content { margin-left: var(--sbw); min-width: 0; padding-bottom: 96px; }
   #trashbanner { display: flex; align-items: center; gap: 12px; margin: 16px 24px 0;
     padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; color: var(--secondary); }
@@ -378,6 +385,8 @@
   </header>
   <div class="main">
     <nav id="sidebar" aria-label="Photo library"></nav>
+    <div id="sbresize" role="separator" aria-orientation="vertical" aria-label="Resize sidebar"
+      tabindex="0" title="Drag to resize the sidebar. Double-click to reset."></div>
     <main id="content">
       <section id="recoverynotice" hidden role="status">
         PhotoVault recovered an older library index. Some newer photos may be missing from this view.
@@ -509,8 +518,10 @@
     <h2>Your recovery key</h2>
     <p style="color:var(--secondary);font-size:13px">Write this down or store it in a
     password manager. It's the <b>only</b> way back in if you forget your
-    password. It will not be shown again.</p>
+    password. It will not be shown again. It starts working when you click
+    <b>I've saved it</b>, and any old key stops working then.</p>
     <div id="rkey"></div>
+    <div class="err" id="rkwarn" role="alert" hidden></div>
     <div class="btnrow">
       <button class="btn" id="rkcopy">Copy</button>
       <button class="btn primary" id="rkdone">I've saved it</button>
@@ -593,8 +604,11 @@ let activeExports = 0;
 let sessionVersion = 0;    // invalidates async work when the vault locks
 let authRequest = 0;
 let gridRequest = 0;
+let albumRequest = 0;
 let pendingImportRefresh = false;
 let importRefresh = null;
+let refreshRetry = null;   // one scheduled retry of a failed library refresh
+let refreshBackoff = 0;    // ms; 0 means the last refresh succeeded
 
 // ------------------------------------------------------------------ toast ---
 
@@ -620,7 +634,8 @@ function progressToast(verb) {
     const t = $("toast");
     clearTimeout(t._h);
     $("toastact").style.display = "none";
-    $("toastmsg").textContent = `${verb} ${done.toLocaleString()} / ${total.toLocaleString()}…`;
+    $("toastmsg").textContent = total
+      ? `${verb} ${done.toLocaleString()} / ${total.toLocaleString()}…` : `${verb}…`;
     t.style.display = "flex";
   };
 }
@@ -656,11 +671,17 @@ async function refresh() {
     const recoveryRequired = await invoke("recovery_status");
     if (request !== authRequest || session !== sessionVersion) return;
     $("recoverynotice").hidden = !recoveryRequired;
-    await loadAlbums();
+    const albumError = await loadAlbums();
     if (request !== authRequest || session !== sessionVersion) return;
     await loadGrid();
     if (request !== authRequest || session !== sessionVersion) return;
     invoke("cleanup_orphans").catch(() => {}); // crash-leftover sweep, silent
+    // Unlock goes on without albums. The library refresh tries once more right
+    // away, then backs off, and reports the failure once.
+    if (albumError) {
+      pendingImportRefresh = true;
+      drainImportRefresh();
+    }
     return;
   }
   mode = status === "new" ? "setup" : "login";
@@ -689,6 +710,9 @@ function clearVaultUI() {
   importing = false;
   pendingImportRefresh = false;
   importRefresh = null;
+  clearTimeout(refreshRetry);
+  refreshRetry = null;
+  refreshBackoff = 0;
   clearImportResults();
   clearTimeout($("toast")._h);
   $("toast").style.display = "none";
@@ -699,6 +723,11 @@ function clearVaultUI() {
              // overlay (which can name an album) painted over the lock screen
   for (const m of ["settings", "keymodal", "offermodal", "promptmodal"])
     $(m).classList.remove("open");
+  // Closed modals keep their contents, so wipe the recovery key, passwords,
+  // and album name they may still hold.
+  $("rkey").textContent = "";
+  $("cpw0").value = ""; $("cpw1").value = ""; $("cpw2").value = "";
+  $("pminput").value = "";
   $("gallery").style.display = "none";
   $("auth").style.display = "grid";
   photos = [];
@@ -820,9 +849,14 @@ $("authform").addEventListener("submit", async e => {
 
 $("offeryes").onclick = async () => {
   $("offermodal").classList.remove("open");
+  const session = sessionVersion, request = ++recoveryRequest;
   try {
-    showRecoveryKey(await invoke("recovery_generate"), true);
+    const { key, id } = await invoke("recovery_generate");
+    // A lock during the request must not show the key over the lock screen.
+    if (session !== sessionVersion || request !== recoveryRequest) return;
+    showRecoveryKey(key, id, true);
   } catch (err) {
+    if (session !== sessionVersion || request !== recoveryRequest) return;
     toast("" + err);
     await refresh();
   }
@@ -832,11 +866,35 @@ $("offerno").onclick = async () => {
   await refresh();
 };
 
+// A generated key is only pending until Done saves it with recovery_confirm.
+// Any other close drops it, and the backend drops it on lock. Each key has an
+// id, so Done saves the key on screen and not one from another Generate.
 let keyModalThenRefresh = false;
-function showRecoveryKey(key, thenRefresh) {
+let recoveryRequest = 0;       // only the latest Generate response is shown
+let pendingRecoveryId = null;  // the shown key's id until Done saves it
+function showRecoveryKey(key, id, thenRefresh) {
   keyModalThenRefresh = !!thenRefresh;
+  pendingRecoveryId = id;
+  $("rkwarn").hidden = true;
+  $("rkwarn").textContent = "";
   $("rkey").textContent = key;
   $("keymodal").classList.add("open");
+}
+async function closeRecoveryKey() {
+  $("keymodal").classList.remove("open");
+  $("rkey").textContent = "";
+  pendingRecoveryId = null;
+  if (keyModalThenRefresh) await refresh();
+  else refreshRecoveryStatus();
+}
+// Closing without Done (Escape) keeps whatever key was there before. Ignored
+// while Done is saving, since that save may still succeed.
+async function cancelRecoveryKey() {
+  if ($("rkdone").disabled) return;
+  if (pendingRecoveryId !== null) toast(keyModalThenRefresh
+    ? "No recovery key was set up. You can add one in Settings."
+    : "Recovery key not changed.");
+  await closeRecoveryKey();
 }
 $("rkcopy").onclick = async () => {
   const text = $("rkey").textContent;
@@ -853,10 +911,32 @@ $("rkcopy").onclick = async () => {
   toast("Copied — remember to store it somewhere safe");
 };
 $("rkdone").onclick = async () => {
-  $("keymodal").classList.remove("open");
-  $("rkey").textContent = "";
-  if (keyModalThenRefresh) await refresh();
-  else refreshRecoveryStatus();
+  // Already saved (see the warning below), so Done just closes.
+  if (pendingRecoveryId === null) return closeRecoveryKey();
+  const session = sessionVersion;
+  $("rkdone").disabled = true;
+  let saved;
+  try {
+    saved = await invoke("recovery_confirm", { id: pendingRecoveryId });
+  } catch {
+    // Keep the key on screen so Done can be tried again. After a lock, stop.
+    if (session === sessionVersion) toast(keyModalThenRefresh
+      ? "Couldn't save the recovery key. Try Done again."
+      : "Couldn't save the new recovery key. Any old key still works.");
+    return;
+  } finally {
+    $("rkdone").disabled = false;
+  }
+  if (session !== sessionVersion) return;
+  if (saved?.warning) {
+    // The new key already replaced the old one. Keep it on screen until the
+    // user closes the modal.
+    pendingRecoveryId = null;
+    $("rkwarn").textContent = saved.warning;
+    $("rkwarn").hidden = false;
+    return;
+  }
+  await closeRecoveryKey();
 };
 
 // ----------------------------------------------------------- prompt modal ---
@@ -1307,10 +1387,15 @@ async function loadGrid() {
   renderSidebar();
 }
 
+// Never throws, so unlocking isn't blocked by a failed album list. On failure
+// it keeps the albums already shown and returns the error so callers can retry.
 async function loadAlbums() {
-  const session = sessionVersion;
-  const loadedAlbums = await invoke("list_albums").catch(() => []);
-  if (session === sessionVersion) albums = loadedAlbums;
+  const session = sessionVersion, request = ++albumRequest;
+  let loadedAlbums;
+  try { loadedAlbums = await invoke("list_albums"); }
+  catch (err) { return err; }
+  if (session === sessionVersion && request === albumRequest) albums = loadedAlbums;
+  return null;
 }
 
 $("sortsel").onchange = e => {
@@ -1943,9 +2028,25 @@ async function drainImportRefresh() {
   const task = (async () => {
     while (pendingImportRefresh && !importing && session === sessionVersion) {
       pendingImportRefresh = false;
-      try { await loadGrid(); }
-      catch (err) {
-        if (session === sessionVersion) reportImportError(err, "Library refresh");
+      // Inbox zips can create albums, so refresh those too.
+      try {
+        const albumError = await loadAlbums();
+        await loadGrid();
+        if (albumError) throw albumError;
+        refreshBackoff = 0;
+      } catch (err) {
+        if (session !== sessionVersion) return;
+        // Keep the refresh pending and retry after 1s, 2s, 4s, ... up to 30s.
+        // Report once per failure streak, not on every retry.
+        if (!refreshBackoff) reportImportError(err, "Library refresh");
+        pendingImportRefresh = true;
+        refreshBackoff = Math.min(refreshBackoff * 2 || 1000, 30000);
+        if (!refreshRetry) refreshRetry = setTimeout(() => {
+          if (session !== sessionVersion) return;
+          refreshRetry = null;
+          drainImportRefresh();
+        }, refreshBackoff);
+        return;
       }
     }
   })();
@@ -2124,6 +2225,20 @@ listen("tauri://drag-drop", async e => {
   if (wasOpen) await importPaths(e.payload?.paths, album);
 });
 
+// Large zips take minutes, so show progress while the pass runs.
+listen("inbox-progress", e => {
+  if (importing || $("gallery").style.display === "none") return;
+  progressToast(e.payload.total ? "Importing from Inbox" : "Unzipping Inbox archive")(e);
+});
+
+// The backend sends this each time an Inbox pass saves photos or albums, so
+// the library shows what's saved so far instead of waiting for the pass to end.
+listen("library-changed", async () => {
+  if (importing || $("gallery").style.display === "none") return;
+  pendingImportRefresh = true;
+  await drainImportRefresh();
+});
+
 listen("inbox-imported", async e => {
   if ($("gallery").style.display === "none") return;
   reportImport(e.payload, "Automatic Inbox import", { inbox: true });
@@ -2154,12 +2269,15 @@ async function pushSettings() {
 }
 
 $("settingsbtn").onclick = async () => {
+  const session = sessionVersion;
   invoke("get_build_info").then(info => {
     $("buildinfo").textContent = `PhotoVault ${info.version} · Build ${info.build}`;
   }).catch(() => { $("buildinfo").textContent = "Version information unavailable"; });
   settings = await invoke("get_settings").catch(() => settings);
   fillSettings();
   const bio = await invoke("touchid_available").catch(() => false);
+  // Settings must not open over the lock screen if the vault locked meanwhile.
+  if (session !== sessionVersion) return;
   $("touchidrow").style.display = bio ? "flex" : "none";
   $("touchidhint").textContent = "Unlock the vault with your fingerprint";
   refreshRecoveryStatus();
@@ -2201,9 +2319,12 @@ async function refreshRecoveryStatus() {
 }
 
 $("rkgen").onclick = async () => {
+  const session = sessionVersion, request = ++recoveryRequest;
+  const current = () => session === sessionVersion && request === recoveryRequest;
   try {
-    showRecoveryKey(await invoke("recovery_generate"), false);
-  } catch (err) { toast("" + err); }
+    const { key, id } = await invoke("recovery_generate");
+    if (current()) showRecoveryKey(key, id, false);
+  } catch (err) { if (current()) toast("" + err); }
 };
 $("rkoff").onclick = async () => {
   const ok = await ask("Disable the recovery key?\nThe old key stops working immediately.",
@@ -2348,10 +2469,10 @@ document.addEventListener("keydown", e => {
   if (modalOpen) {
     if (e.key === "Escape") {
       // Close only the topmost modal, and route through handlers that carry
-      // follow-up state (recovery-key confirmation, setup offer, prompt).
+      // follow-up state (recovery-key cancel, setup offer, prompt).
       const top = [...document.querySelectorAll(".modal.open")].pop();
       if (top.id === "promptmodal") $("pmcancel").click();
-      else if (top.id === "keymodal") $("rkdone").click();
+      else if (top.id === "keymodal") cancelRecoveryKey();
       else if (top.id === "offermodal") $("offerno").click();
       else if (top.id === "settings") $("setclose").click();
       else top.classList.remove("open");
@@ -2450,6 +2571,56 @@ function setHeaderHeight() {
   if (h) document.documentElement.style.setProperty("--hh", h.offsetHeight + "px");
 }
 new ResizeObserver(setHeaderHeight).observe(document.querySelector("header"));
+
+// The sidebar width is --sbw, which the header, content, and overlays all
+// follow. A saved width is clamped so the sidebar never takes over the window.
+function setSidebarWidth(width) {
+  const root = document.documentElement;
+  if (width == null) {
+    root.style.removeProperty("--sbw");
+  } else {
+    const max = Math.max(200, Math.min(480, window.innerWidth / 2));
+    width = Math.round(Math.min(max, Math.max(170, width)));
+    root.style.setProperty("--sbw", width + "px");
+  }
+  const current = parseFloat(getComputedStyle(root).getPropertyValue("--sbw"));
+  $("sbresize").setAttribute("aria-valuenow", String(current || ""));
+  return width;
+}
+let sidebarWidth = Number(localStorage.getItem("pv-sidebar-width")) || null;
+function saveSidebarWidth(width) {
+  sidebarWidth = setSidebarWidth(width);
+  if (sidebarWidth == null) localStorage.removeItem("pv-sidebar-width");
+  else localStorage.setItem("pv-sidebar-width", String(sidebarWidth));
+}
+if (sidebarWidth) setSidebarWidth(sidebarWidth);
+window.addEventListener("resize", () => { if (sidebarWidth) setSidebarWidth(sidebarWidth); });
+
+$("sbresize").onpointerdown = e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const handle = $("sbresize");
+  handle.setPointerCapture(e.pointerId);
+  handle.classList.add("dragging");
+  document.body.classList.add("sbdragging");
+  handle.onpointermove = move => setSidebarWidth(move.clientX);
+  handle.onpointerup = handle.onpointercancel = up => {
+    handle.onpointermove = handle.onpointerup = handle.onpointercancel = null;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("sbdragging");
+    saveSidebarWidth(up.clientX);
+  };
+};
+$("sbresize").ondblclick = () => saveSidebarWidth(null);
+$("sbresize").onkeydown = e => {
+  const step = e.shiftKey ? 48 : 16;
+  const width = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--sbw"));
+  if (e.key === "ArrowLeft") saveSidebarWidth(width - step);
+  else if (e.key === "ArrowRight") saveSidebarWidth(width + step);
+  else return;
+  e.preventDefault();
+  e.stopPropagation();
+};
 
 refresh();
 </script>

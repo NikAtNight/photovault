@@ -33,6 +33,9 @@ screens. `icon` reuses the symbols across the toolbar, sidebar, and viewer.
 `renderPhotos` updates the view title/count and renders a scrollable list.
 `setHeaderHeight` measures the toolbar to size the list's scroll area.
 `--sbw` controls the sidebar boundary, content inset, and file-drop overlay.
+The `#sbresize` handle sets it by drag or arrow keys, between 170px and the
+smaller of 480px or half the window. The width is saved in `pv-sidebar-width`
+and double-click clears it.
 The document keyboard handler guards focused controls and contains Tab focus
 within modal presentations. Command-F focuses search.
 

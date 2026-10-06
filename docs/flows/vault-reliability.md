@@ -22,6 +22,29 @@ appearance selector is outside these five fixes.
 - Restore a malformed, incomplete, or interrupted archive. Keep the original
   active vault intact. Stage and validate before switching directories, retain
   the previous vault, and roll back failed installation.
+- Fail an album, favorite, rename, tag, date-scan, or settings save. Restore
+  the previous in-memory values (`edit_library`), so a later save can't
+  persist the failed change.
+- Leave a failing file in the Inbox past the auto-lock time. The vault locks
+  and the UI shows the login screen.
+- Generate a recovery key, then lock or press Escape before clicking Done.
+  `recovery_generate` only holds the new key in memory and returns it with an
+  id; `recovery_confirm(id)` saves exactly that key, and only if the vault
+  hasn't locked and unlocked since (`Vault.session`). Lock drops the pending
+  key, the old key keeps working, nothing shows over the lock screen, and lock
+  clears typed passwords. The UI shows only the latest Generate response.
+- Fail the recovery key save. If nothing was replaced, any old key still
+  works. If the new meta file landed but the directory sync failed
+  (`WriteError::Unconfirmed`), the new key counts as saved and the modal
+  warns to keep it.
+- Fail a settings save. `save_settings` replaces `settings.json` atomically.
+  If the replace didn't happen, memory rolls back and the old file stays. If
+  it happened but the directory sync failed, the new settings count as saved.
+  Turning Touch ID off saves the setting before deleting the keychain item.
+- Let the vault go idle and then trigger any command. Whichever path wipes the
+  key, `lock_tick` sends `vault-locked` within about 5 seconds unless the UI
+  already knows (`lock_unreported`). Mouse or keyboard input on an idle vault
+  locks it instead of reviving it.
 - Fail trash/restore persistence. Keep memory and disk consistent, retain
   selection, and show failure. Mixed bulk exports report exported and failed
   counts with safely rendered filenames and reasons.

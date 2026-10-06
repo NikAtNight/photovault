@@ -10,11 +10,14 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   photo, video, thumbnail, and the library index with **AES-256-GCM**
   (random 12-byte nonce per file, authenticated). The master key is *wrapped*
   (encrypted) by keys derived from your credentials:
-  - your **password** → KEK via **scrypt** (N=2¹⁵, r=8, p=1, random 16-byte
-    salt). Changing the password just re-wraps the master key — instant, no
+  - your **password** → KEK via **scrypt** (N=2¹⁷, r=8, p=1, random 16-byte
+    salt; vaults made with the older N=2¹⁵ move up when you change the
+    password or reset it with the recovery key). Changing the password just re-wraps the master key — instant, no
     re-encryption of the library.
   - an optional **recovery key** (random 64-hex-char code, shown once) that
-    can unlock the vault and reset the password if you forget it.
+    can unlock the vault and reset the password if you forget it. A new key
+    takes effect only when you click **I've saved it**; until then any old key
+    keeps working.
   - optionally **Touch ID**: the master key is stored in the macOS login
     keychain (encrypted at rest by the OS, released only to this app) and
     reads are gated behind a biometric prompt.
@@ -24,7 +27,9 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   `objects/<random-hex>` blobs. No filenames, no extensions, no readable EXIF.
 - **In memory:** the master key lives only inside the app process while
   unlocked and is zeroized on lock — via the Lock button, **auto-lock** after
-  inactivity (1 min – 1 hour or off; default 15 min), or automatically when
+  inactivity (1 min – 1 hour or off; default 15 min). Mouse and keyboard use,
+  opening photos, and playing video count as activity; Inbox imports, library
+  refreshes, and thumbnail loads don't. It also locks automatically when
   **the Mac sleeps or the screen locks**. Decrypted media is served to the UI
   over an in-process `pvmedia://` protocol — never written to disk.
 - **Screenshots & screen sharing** of the window are blocked by default
@@ -33,8 +38,9 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   never generated a recovery key (or disabled it), the photos are gone.
   That's the point.
 - Vaults created by older versions are migrated to envelope encryption
-  automatically on first unlock (the old `meta.json` is kept as
-  `meta.v1.bak`).
+  automatically on first unlock. A `meta.v1.bak` left by earlier builds is
+  removed after the next successful unlock, password change, or recovery
+  change.
 
 ## Usage
 
@@ -65,7 +71,8 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   converted for thumbnails via macOS `sips`, originals kept), and **video**
   (MP4, MOV, M4V — poster frames via QuickLook, streamed with seeking).
 - **Browse:** sidebar with **All Photos / Favorites / Videos / Recently
-  Deleted / Albums**; grid or list view; sort by date added, **date taken**
+  Deleted / Albums**. Drag its right edge to resize it (double-click the edge
+  to reset); grid or list view; sort by date added, **date taken**
   (EXIF), name, size, or type; **search** by filename (`/` focuses the box).
 - **Sort by multiple columns:** in list view, click **Added**, then
   **Shift-click Name**. Photos group by local calendar day, then sort by name
@@ -112,10 +119,27 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   shows how many are waiting. Once unlocked, click **Process Inbox** to process
   waiting files immediately (the automatic watcher continues to run too).
   Temporary failures retry automatically with increasing delays, up to one
-  minute. Changed or replaced sources are preserved rather than discarded;
+  minute. A full or read-only disk retries after 10 minutes, then every 30.
+  Files over 4 GB aren't imported yet; they stay in place with a report and
+  aren't retried until they change. Photos show up in the library as each
+  batch is saved, not only when the whole pass ends. Changed or replaced sources are preserved rather than discarded;
   check the result report for their location. Recovery folders named
   `Pending import ...` stay inside Inbox and are scanned on subsequent passes.
   Encrypted files are synced before the index is saved and originals removed.
+- **Zip files in the Inbox** are unzipped into a folder of the same name, and
+  their photos and videos go into an album named after the zip (`Summer
+  Trip.zip` files into *Summer Trip*). An existing album with that name, in any
+  letter case, is reused. Photos you already own are added to the album too.
+  Zips are handled one at a time, so the first zip's photos appear before the
+  next one is unpacked. The zip is deleted once it's extracted, unless its
+  contents changed during extraction, in which case it's kept. Files that aren't imported (text,
+  JSON, hidden files, zips inside the zip) stay in the extracted folder.
+  A zip placed inside an extracted folder is left alone. Extracted files keep
+  the zip's UTC timestamps when it has them (Finder and `zip` write these).
+  Zips that are damaged,
+  password protected, hold no media, contain paths escaping the folder, or
+  expand past 20 GB stay in the Inbox with a report. So do zips holding
+  symlinks, after their other files are extracted.
 
 ## Settings
 
@@ -134,6 +158,10 @@ npm install          # tauri CLI
 npm run dev          # dev window with hot reload
 npm run build        # release .app bundle
 ```
+
+App icon source: `app-icon.png`. Regenerate platform icons with
+`npm run tauri -- icon app-icon.png`, then rebuild the app.
+Artwork prompt and provenance: [app icon](docs/app-icon.md).
 
 Frontend tests: `node --test tests/*.test.cjs` with Node 22 or later.
 Backend tests: `cd src-tauri && cargo test`.

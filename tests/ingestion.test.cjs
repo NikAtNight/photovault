@@ -63,7 +63,8 @@ function app() {
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id);
   };
-  const state = { photos: [], handlers: {}, save: async () => '/export', open: async () => null, ask: async () => true };
+  // Timers never fire on their own; tests run a recorded callback to drive it.
+  const state = { photos: [], handlers: {}, timers: [], save: async () => '/export', open: async () => null, ask: async () => true };
   const observer = class { observe() {} unobserve() {} disconnect() {} };
   const ctx = vm.createContext({
     document: { getElementById: element, createElement: tag => new Element(tag),
@@ -84,7 +85,7 @@ function app() {
     } },
     localStorage: { getItem: () => null, setItem() {} },
     ResizeObserver: observer, IntersectionObserver: observer,
-    setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
+    setTimeout: (fn, ms) => state.timers.push({ fn, ms }), clearTimeout() {}, setInterval: () => 1, clearInterval() {},
     cancelAnimationFrame() {}, requestAnimationFrame: () => 1,
   });
   vm.runInContext(script, ctx);
@@ -191,6 +192,184 @@ test('failure-only background events show the filename and retry reason', async 
     { name: 'house.jpg', reason: 'No space left', stage: 'import', retryable: true },
   ] }));
   assert.match(a.element('importreports').textContent, /house.jpg: No space left.*Can be retried/);
+});
+
+test('Inbox events reload albums so zip albums appear in the sidebar', async () => {
+  const a = app();
+  a.state.handlers.list_albums = () => [{ id: 'trip', name: 'Trip', created: 1 }];
+  a.state.photos = [{ ...photo('arrived'), albums: ['trip'] }];
+  await a.emit('inbox-imported', result({ imported: 1 }));
+  assert.equal(a.run('albums[0].name'), 'Trip');
+  assert.equal(a.run('photos[0].albums[0]'), 'trip');
+});
+
+test('Inbox progress updates the toast without refreshing the library', async () => {
+  const a = app();
+  await a.emit('inbox-progress', { done: 0, total: 0 });
+  assert.equal(a.element('toastmsg').textContent, 'Unzipping Inbox archive…');
+  await a.emit('inbox-progress', { done: 25, total: 300 });
+  assert.equal(a.element('toastmsg').textContent, 'Importing from Inbox 25 / 300…');
+  assert.equal(a.calls.some(c => c.command === 'list_photos' || c.command === 'list_albums'), false);
+});
+
+test('library-changed shows saved photos and albums before the pass ends', async () => {
+  const a = app();
+  a.state.handlers.list_albums = () => [{ id: 'trip', name: 'Trip', created: 1 }];
+  a.state.photos = [{ ...photo('arrived'), albums: ['trip'] }];
+  await a.emit('library-changed', null);
+  assert.equal(a.run('albums[0].name'), 'Trip');
+  assert.equal(a.run('photos[0].albums[0]'), 'trip');
+  assert.equal(a.run('pendingImportRefresh'), false);
+});
+
+test('library-changed waits while a manual import is running', async () => {
+  const a = app();
+  a.run('importing = true');
+  await a.emit('library-changed', null);
+  assert.equal(a.calls.some(c => c.command === 'list_photos'), false);
+});
+
+test('a failed library refresh retries with backoff and reports once per streak', async () => {
+  const a = app();
+  let failures = 2;
+  a.state.handlers.list_photos = () => {
+    if (failures-- > 0) throw new Error('index busy');
+    return [photo('arrived')];
+  };
+  const retry = () => a.state.timers[a.run('refreshRetry') - 1];
+  await a.emit('library-changed', null);
+  assert.equal(a.element('importreports').children.length, 1);
+  assert.match(a.element('importreports').textContent, /Library refresh.*index busy/);
+  assert.equal(a.run('pendingImportRefresh'), true);
+  assert.equal(retry().ms, 1000);
+  // Another event during the streak tries right away but adds no second timer.
+  const scheduled = a.run('refreshRetry');
+  await a.emit('library-changed', null);
+  assert.equal(a.run('refreshRetry'), scheduled);
+  assert.equal(a.run('refreshBackoff'), 2000);
+  assert.equal(a.element('importreports').children.length, 1);
+  retry().fn();
+  await new Promise(setImmediate);
+  assert.equal(a.run('photos[0].id'), 'arrived');
+  assert.equal(a.run('pendingImportRefresh'), false);
+  assert.equal(a.run('refreshRetry'), null);
+  assert.equal(a.run('refreshBackoff'), 0);
+  assert.equal(a.element('importreports').children.length, 1);
+});
+
+test('a failed album load is retried and does not block the photo refresh', async () => {
+  const a = app();
+  let fail = true;
+  a.state.handlers.list_albums = () => {
+    if (fail) throw new Error('albums unreadable');
+    return [{ id: 'trip', name: 'Trip', created: 1 }];
+  };
+  a.state.photos = [photo('arrived')];
+  await a.emit('library-changed', null);
+  assert.equal(a.run('photos[0].id'), 'arrived');
+  assert.match(a.element('importreports').textContent, /albums unreadable/);
+  assert.equal(a.run('pendingImportRefresh'), true);
+  fail = false;
+  a.state.timers[a.run('refreshRetry') - 1].fn();
+  await new Promise(setImmediate);
+  assert.equal(a.run('albums[0].name'), 'Trip');
+  assert.equal(a.run('pendingImportRefresh'), false);
+});
+
+test('backoff caps at 30 seconds', async () => {
+  const a = app();
+  a.state.handlers.list_photos = () => { throw new Error('index busy'); };
+  await a.emit('library-changed', null);
+  for (let i = 0; i < 8; i++) {
+    a.state.timers[a.run('refreshRetry') - 1].fn();
+    await new Promise(setImmediate);
+  }
+  assert.equal(a.run('refreshBackoff'), 30000);
+  assert.equal(a.state.timers[a.run('refreshRetry') - 1].ms, 30000);
+  assert.equal(a.element('importreports').children.length, 1);
+});
+
+test('lock stops a scheduled library refresh retry', async () => {
+  const a = app();
+  a.state.handlers.list_photos = () => { throw new Error('index busy'); };
+  await a.emit('library-changed', null);
+  const retry = a.state.timers[a.run('refreshRetry') - 1];
+  await a.emit('vault-locked');
+  assert.equal(a.run('refreshRetry'), null);
+  assert.equal(a.run('pendingImportRefresh'), false);
+  const listings = a.calls.filter(c => c.command === 'list_photos').length;
+  retry.fn();
+  await new Promise(setImmediate);
+  assert.equal(a.calls.filter(c => c.command === 'list_photos').length, listings);
+  assert.equal(a.run('refreshRetry'), null);
+});
+
+test('a failed album list does not block unlocking', async () => {
+  const a = app();
+  a.state.handlers.vault_status = () => 'unlocked';
+  a.state.handlers.list_albums = () => { throw new Error('albums unreadable'); };
+  a.state.photos = [photo('a')];
+  await a.run('refresh()');
+  assert.equal(a.element('gallery').style.display, 'block');
+  assert.equal(a.run('photos[0].id'), 'a');
+});
+
+test('albums that fail to load at unlock are retried on the refresh backoff', async () => {
+  const a = app();
+  let failures = 2; // unlock, then the immediate retry
+  a.state.handlers.vault_status = () => 'unlocked';
+  a.state.handlers.list_albums = () => {
+    if (failures-- > 0) throw new Error('albums unreadable');
+    return [{ id: 'trip', name: 'Trip', created: 1 }];
+  };
+  a.state.photos = [photo('a')];
+  await a.run('refresh()');
+  await new Promise(setImmediate);
+  assert.equal(a.element('gallery').style.display, 'block');
+  assert.equal(a.run('photos[0].id'), 'a');
+  assert.equal(a.run('albums.length'), 0);
+  assert.equal(a.element('importreports').children.length, 1);
+  assert.equal(a.state.timers[a.run('refreshRetry') - 1].ms, 1000);
+  a.state.timers[a.run('refreshRetry') - 1].fn();
+  await new Promise(setImmediate);
+  assert.equal(a.run('albums[0].name'), 'Trip');
+  assert.equal(a.run('pendingImportRefresh'), false);
+  assert.equal(a.run('refreshBackoff'), 0);
+  assert.equal(a.element('importreports').children.length, 1);
+});
+
+test('automatic refreshes never report user activity', async () => {
+  const a = app();
+  a.state.handlers.list_photos = () => { throw new Error('locked'); };
+  await a.emit('library-changed', null);
+  await a.emit('inbox-progress', { done: 1, total: 2 });
+  await a.emit('inbox-imported', result({ imported: 1 }));
+  a.state.timers[a.run('refreshRetry') - 1].fn();
+  await new Promise(setImmediate);
+  const commands = new Set(a.calls.map(c => c.command));
+  assert.deepEqual([...commands].sort(), ['list_albums', 'list_photos']);
+  assert.equal(a.element('importreports').children.length, 2);
+});
+
+test('an older album response cannot replace a newer one', async () => {
+  const a = app(), listing = deferred();
+  let count = 0;
+  a.state.handlers.list_albums = () => ++count === 1 ? listing.promise : [{ id: 'new', name: 'New', created: 2 }];
+  const first = a.run('loadAlbums()');
+  await a.run('loadAlbums()');
+  listing.resolve([{ id: 'old', name: 'Old', created: 1 }]);
+  await first;
+  assert.equal(a.run('albums.length'), 1);
+  assert.equal(a.run('albums[0].id'), 'new');
+});
+
+test('Inbox progress waits while a manual import is running', async () => {
+  const a = app();
+  a.run('importing = true');
+  a.element('toastmsg').textContent = 'Preparing import…';
+  await a.emit('inbox-progress', { done: 25, total: 300 });
+  assert.equal(a.element('toastmsg').textContent, 'Preparing import…');
+  assert.equal(a.calls.filter(c => c.command === 'list_photos').length, 0);
 });
 
 test('an event during an ongoing refresh drains another refresh', async () => {
@@ -569,4 +748,174 @@ test('late recovery status cannot reveal a notice after lock', async () => {
   status.resolve(true);
   await refreshing;
   assert.equal(a.element('recoverynotice').hidden, true);
+});
+
+for (const [button, lock] of [['offeryes', 'event'], ['rkgen', 'clearVaultUI']]) {
+  test(`a recovery key from ${button} that arrives after lock (${lock}) is never shown`, async () => {
+    const a = app(), generating = deferred();
+    a.state.handlers.recovery_generate = () => generating.promise;
+    const operation = a.element(button).onclick();
+    if (lock === 'event') await a.emit('vault-locked');
+    else a.run('clearVaultUI()');
+    generating.resolve({ key: 'SECRET-RECOVERY-KEY', id: 'new' });
+    await operation;
+    assert.equal(a.element('keymodal').classList.contains('open'), false);
+    assert.equal(a.element('rkey').textContent, '');
+  });
+}
+
+test('a recovery key error after lock does not toast or refresh again', async () => {
+  const a = app(), generating = deferred();
+  a.state.handlers.recovery_generate = () => generating.promise;
+  const operation = a.element('offeryes').onclick();
+  a.run('clearVaultUI()');
+  generating.reject(new Error('vault locked'));
+  await operation;
+  assert.equal(a.element('toastmsg').textContent, '');
+  assert.equal(a.calls.some(c => c.command === 'vault_status'), false);
+});
+
+test('lock wipes a shown recovery key and typed passwords', () => {
+  const a = app();
+  a.run('showRecoveryKey("SECRET-RECOVERY-KEY", "new", false)');
+  for (const id of ['cpw0', 'cpw1', 'cpw2']) a.element(id).value = 'hunter22';
+  a.element('pminput').value = 'Private album';
+  a.run('clearVaultUI()');
+  assert.equal(a.element('keymodal').classList.contains('open'), false);
+  assert.equal(a.element('rkey').textContent, '');
+  for (const id of ['cpw0', 'cpw1', 'cpw2', 'pminput']) assert.equal(a.element(id).value, '');
+});
+
+test('Done saves the new recovery key and then refreshes recovery status', async () => {
+  const a = app();
+  a.state.handlers.lock_screen_info = () => ({ has_recovery: true });
+  a.run('showRecoveryKey("NEW-KEY", "new", false)');
+  await a.element('rkdone').onclick();
+  assert.deepEqual(a.calls.filter(c => c.command === 'recovery_confirm').map(c => c.args.id), ['new']);
+  assert.equal(a.element('keymodal').classList.contains('open'), false);
+  assert.equal(a.element('rkey').textContent, '');
+  await new Promise(setImmediate);
+  assert.equal(a.run('$("rkgen").textContent'), 'Regenerate…');
+});
+
+test('Done after the setup offer saves the key and then finishes unlocking', async () => {
+  const a = app();
+  a.run('showRecoveryKey("NEW-KEY", "new", true)');
+  await a.element('rkdone').onclick();
+  const commands = a.calls.map(c => c.command);
+  assert.ok(commands.indexOf('recovery_confirm') < commands.indexOf('vault_status'));
+  assert.equal(a.element('keymodal').classList.contains('open'), false);
+});
+
+test('a failed confirm keeps the new key on screen and says the old key still works', async () => {
+  const a = app();
+  a.state.handlers.recovery_confirm = () => { throw new Error('disk full'); };
+  a.run('showRecoveryKey("NEW-KEY", "new", false)');
+  await a.element('rkdone').onclick();
+  assert.equal(a.element('keymodal').classList.contains('open'), true);
+  assert.equal(a.element('rkey').textContent, 'NEW-KEY');
+  assert.match(a.element('toastmsg').textContent, /Couldn't save the new recovery key.*old key still works/);
+  assert.equal(a.element('rkdone').disabled, false);
+  assert.equal(a.calls.some(c => c.command === 'lock_screen_info'), false);
+});
+
+for (const outcome of ['resolve', 'reject']) {
+  test(`a confirm that settles after lock (${outcome}) shows nothing`, async () => {
+    const a = app(), confirming = deferred();
+    a.state.handlers.recovery_confirm = () => confirming.promise;
+    a.run('showRecoveryKey("NEW-KEY", "new", true)');
+    const operation = a.element('rkdone').onclick();
+    a.run('clearVaultUI()');
+    if (outcome === 'resolve') confirming.resolve(null);
+    else confirming.reject(new Error('locked'));
+    await operation;
+    assert.equal(a.element('keymodal').classList.contains('open'), false);
+    assert.equal(a.element('rkey').textContent, '');
+    assert.equal(a.element('toastmsg').textContent, '');
+    assert.equal(a.calls.some(c => c.command === 'vault_status' || c.command === 'lock_screen_info'), false);
+  });
+}
+
+test('only the latest Generate response is shown, and Done saves that key', async () => {
+  const a = app(), first = deferred(), second = deferred();
+  const responses = [first, second];
+  a.state.handlers.recovery_generate = () => responses.shift().promise;
+  const older = a.element('rkgen').onclick();
+  const newer = a.element('rkgen').onclick();
+  second.resolve({ key: 'KEY-B', id: 'b' });
+  await newer;
+  // The first request answers last. It must not replace the key on screen.
+  first.resolve({ key: 'KEY-A', id: 'a' });
+  await older;
+  assert.equal(a.element('rkey').textContent, 'KEY-B');
+  await a.element('rkdone').onclick();
+  assert.deepEqual(a.calls.filter(c => c.command === 'recovery_confirm').map(c => c.args.id), ['b']);
+});
+
+test('a confirm that replaced the key without a disk sync keeps it on screen until closed', async () => {
+  const a = app();
+  a.element('keymodal').id = 'keymodal';
+  a.run(`document.querySelectorAll = sel => sel === ".modal.open" && $("keymodal").classList.contains("open")
+    ? [$("keymodal")] : [];`);
+  const warning = "Saved, but the disk didn't confirm the write. Keep this new key; any old key no longer works.";
+  a.state.handlers.recovery_confirm = () => ({ warning });
+  a.run('showRecoveryKey("NEW-KEY", "new", false)');
+  await a.element('rkdone').onclick();
+  assert.equal(a.element('keymodal').classList.contains('open'), true);
+  assert.equal(a.element('rkey').textContent, 'NEW-KEY');
+  assert.equal(a.element('rkwarn').hidden, false);
+  assert.equal(a.element('rkwarn').textContent, warning);
+  assert.doesNotMatch(a.element('toastmsg').textContent, /old key still works/);
+  // The key is saved, so closing doesn't claim it wasn't, and Done doesn't save again.
+  await a.keydown({ key: 'Escape' });
+  assert.equal(a.element('keymodal').classList.contains('open'), false);
+  assert.equal(a.element('rkey').textContent, '');
+  assert.doesNotMatch(a.element('toastmsg').textContent, /not changed/);
+  a.run('showRecoveryKey("OTHER-KEY", "other", false)');
+  assert.equal(a.element('rkwarn').hidden, true);
+  a.state.handlers.recovery_confirm = () => ({ warning });
+  await a.element('rkdone').onclick();
+  await a.element('rkdone').onclick();
+  assert.equal(a.calls.filter(c => c.command === 'recovery_confirm').length, 2);
+  assert.equal(a.element('keymodal').classList.contains('open'), false);
+});
+
+test('Escape closes the recovery key without saving it', async () => {
+  const a = app();
+  a.element('keymodal').id = 'keymodal';
+  a.run(`document.querySelectorAll = sel => sel === ".modal.open" && $("keymodal").classList.contains("open")
+    ? [$("keymodal")] : [];`);
+  a.run('showRecoveryKey("NEW-KEY", "new", false)');
+  await a.keydown({ key: 'Escape' });
+  assert.equal(a.calls.some(c => c.command === 'recovery_confirm'), false);
+  assert.equal(a.element('keymodal').classList.contains('open'), false);
+  assert.equal(a.element('rkey').textContent, '');
+  assert.match(a.element('toastmsg').textContent, /Recovery key not changed/);
+});
+
+test('Escape while Done is saving leaves the key modal alone', async () => {
+  const a = app(), confirming = deferred();
+  a.state.handlers.recovery_confirm = () => confirming.promise;
+  a.element('keymodal').id = 'keymodal';
+  a.run(`document.querySelectorAll = sel => sel === ".modal.open" && $("keymodal").classList.contains("open")
+    ? [$("keymodal")] : [];`);
+  a.run('showRecoveryKey("NEW-KEY", "new", false)');
+  const operation = a.element('rkdone').onclick();
+  await a.keydown({ key: 'Escape' });
+  assert.equal(a.element('keymodal').classList.contains('open'), true);
+  assert.equal(a.element('toastmsg').textContent, '');
+  confirming.resolve(null);
+  await operation;
+  assert.equal(a.element('keymodal').classList.contains('open'), false);
+  assert.equal(a.element('toastmsg').textContent, '');
+});
+
+test('settings cannot open over the lock screen after a slow load', async () => {
+  const a = app(), available = deferred();
+  a.state.handlers.touchid_available = () => available.promise;
+  const opening = a.element('settingsbtn').onclick();
+  await a.emit('vault-locked');
+  available.resolve(true);
+  await opening;
+  assert.equal(a.element('settings').classList.contains('open'), false);
 });

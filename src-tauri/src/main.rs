@@ -13,7 +13,7 @@ mod native;
 mod instance_lock;
 mod backup;
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const VERIFIER_PLAINTEXT: &[u8] = b"photovault-v1";
 const DEFAULT_AUTO_LOCK_SECS: u64 = 15 * 60;
@@ -39,6 +39,15 @@ const DEFAULT_SCRYPT_P: u32 = 1;
 const MAX_PHOTO_NAME_BYTES: usize = 255;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(20);
 const INBOX_MIN_FILE_AGE: Duration = Duration::from_secs(2);
+/// Hidden file naming the album for media in its Inbox folder (written when a zip is extracted).
+const INBOX_ALBUM_MARKER: &str = ".photovault-album";
+const UNZIP_STAGING_PREFIX: &str = ".photovault-unzip-";
+const MAX_UNZIP_BYTES: u64 = 20 << 30;
+const MAX_UNZIP_ENTRIES: usize = 100_000;
+/// Objects are encrypted in one piece, so import holds the whole file in memory.
+const MAX_IMPORT_BYTES: u64 = 4 << 30;
+/// Nonce plus GCM tag that encryption adds to a plaintext.
+const ENCRYPTION_OVERHEAD: usize = 12 + 16;
 
 fn yes() -> bool {
     true
@@ -81,6 +90,17 @@ struct Vault {
     // Watched folder: images saved here are pulled into the vault.
     inbox: PathBuf,
     key: Option<[u8; 32]>, // master key while unlocked
+    // A generated recovery key the UI is showing, with its generation id. Only
+    // written to meta once the user confirms that id, so the old key keeps
+    // working until then. Cleared on lock.
+    pending_recovery: Option<(String, Zeroizing<[u8; 32]>)>,
+    // Changes on every unlock and wipe, so work that waited on a lock can tell
+    // the vault was locked and unlocked again in the meantime.
+    session: u64,
+    // Set when a wipe locks the vault. Cleared once the UI knows: it asked for
+    // the lock, got "locked" from vault_status, or got a vault-locked event.
+    // lock_timer reports the rest, like an idle wipe inside a command.
+    lock_unreported: bool,
     // Decrypted once at unlock and kept in memory; cleared on lock.
     photos: HashMap<String, PhotoInfo>,
     albums: HashMap<String, Album>,
@@ -118,12 +138,9 @@ impl Vault {
     }
 
     /// Returns the master key if unlocked, auto-locking first when idle too long.
+    /// Counts as user activity.
     fn active_key(&mut self) -> Option<[u8; 32]> {
-        if self.key.is_some()
-            && self.settings.auto_lock_secs > 0
-            && !self.importing
-            && self.last_activity.elapsed().as_secs() > self.settings.auto_lock_secs
-        {
+        if self.idle_too_long() {
             wipe_vault(self);
         }
         if self.key.is_some() {
@@ -131,14 +148,34 @@ impl Vault {
         }
         self.key
     }
+
+    /// The master key for background work, which isn't user activity. An idle
+    /// vault reads as locked; lock_timer wipes it and tells the UI.
+    fn background_key(&self) -> Option<[u8; 32]> {
+        if self.idle_too_long() {
+            None
+        } else {
+            self.key
+        }
+    }
+
+    fn idle_too_long(&self) -> bool {
+        self.key.is_some()
+            && self.settings.auto_lock_secs > 0
+            && !self.importing
+            && self.last_activity.elapsed().as_secs() > self.settings.auto_lock_secs
+    }
 }
 
 /// Clear all secrets and decrypted state from memory.
 fn wipe_vault(vault: &mut Vault) {
     if let Some(k) = vault.key.as_mut() {
         k.zeroize();
+        vault.lock_unreported = true;
     }
     vault.key = None;
+    vault.session += 1;
+    vault.pending_recovery = None;
     vault.photos.clear();
     vault.albums.clear();
     vault.media_cache = None;
@@ -163,6 +200,7 @@ fn do_system_lock(app: &tauri::AppHandle) {
     let mut vault = vlock(&state);
     if vault.key.is_some() {
         wipe_vault(&mut vault);
+        vault.lock_unreported = false;
         drop(vault);
         let _ = app.emit("vault-locked", ());
     }
@@ -318,6 +356,31 @@ fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|_| "decryption failed".to_string())
 }
 
+/// Same format as `encrypt`, but reuses `data`'s memory so a large original
+/// isn't held twice. Reserve ENCRYPTION_OVERHEAD up front to avoid a realloc.
+fn encrypt_owned(key: &[u8; 32], mut data: Vec<u8>) -> Result<Vec<u8>, String> {
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    data.reserve_exact(ENCRYPTION_OVERHEAD);
+    Aes256Gcm::new(key.into())
+        .encrypt_in_place(Nonce::from_slice(&nonce), b"", &mut data)
+        .map_err(|e| e.to_string())?;
+    data.splice(..0, nonce);
+    Ok(data)
+}
+
+/// `decrypt` that reuses the blob's memory for the plaintext.
+fn decrypt_owned(key: &[u8; 32], mut blob: Vec<u8>) -> Result<Vec<u8>, String> {
+    if blob.len() < 13 {
+        return Err("corrupt blob".into());
+    }
+    let nonce: Vec<u8> = blob.drain(..12).collect();
+    Aes256Gcm::new(key.into())
+        .decrypt_in_place(Nonce::from_slice(&nonce), b"", &mut blob)
+        .map_err(|_| "decryption failed".to_string())?;
+    Ok(blob)
+}
+
 fn random_key() -> [u8; 32] {
     let mut k = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut k);
@@ -376,6 +439,8 @@ thread_local! {
     static FAIL_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static AFTER_INDEX_REPLACEMENT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_SOURCE_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    // Once write_file_durably renames onto this path, its directory sync fails.
+    static FAIL_SYNC_AFTER_REPLACING: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 fn sync_dir(dir: &std::path::Path) -> Result<(), String> {
@@ -389,18 +454,39 @@ fn sync_dir(dir: &std::path::Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// A failed durable write. `Unconfirmed` means the new file already replaced
+/// the old one, but the directory sync failed, so a crash might still undo it.
+#[derive(Debug)]
+enum WriteError {
+    NotReplaced(String),
+    Unconfirmed(String),
+}
+
+impl From<WriteError> for String {
+    fn from(error: WriteError) -> String {
+        match error {
+            WriteError::NotReplaced(e) | WriteError::Unconfirmed(e) => e,
+        }
+    }
+}
+
 fn write_file_durably(
     tmp: &std::path::Path,
     dest: &std::path::Path,
     data: &[u8],
     dir: &std::path::Path,
-) -> Result<(), String> {
-    let mut file = fs::File::create(tmp).map_err(|e| e.to_string())?;
-    file.write_all(data).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
+) -> Result<(), WriteError> {
+    let not_replaced = |e: std::io::Error| WriteError::NotReplaced(e.to_string());
+    let mut file = fs::File::create(tmp).map_err(not_replaced)?;
+    file.write_all(data).map_err(not_replaced)?;
+    file.sync_all().map_err(not_replaced)?;
     drop(file);
-    fs::rename(tmp, dest).map_err(|e| e.to_string())?;
-    sync_dir(dir)
+    fs::rename(tmp, dest).map_err(not_replaced)?;
+    #[cfg(test)]
+    if FAIL_SYNC_AFTER_REPLACING.with(|path| path.borrow().as_deref() == Some(dest)) {
+        FAIL_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(dir.to_path_buf()));
+    }
+    sync_dir(dir).map_err(WriteError::Unconfirmed)
 }
 
 /// Persist meta durably, without ever retaining a superseded wrapping.
@@ -416,14 +502,18 @@ fn write_file_durably(
 /// The backup is written first, so a crash mid-write leaves `meta.json`
 /// authoritative and intact; once both renames land, neither file holds a
 /// wrapping that a retired password can open.
-fn write_meta(dir: &std::path::Path, meta: &Meta) -> Result<(), String> {
-    let json = serde_json::to_vec(meta).map_err(|e| e.to_string())?;
+///
+/// `WriteError::Unconfirmed` means `meta.json` itself was replaced. A failure
+/// on the backup leaves `meta.json` as it was, so it counts as not replaced.
+fn write_meta(dir: &std::path::Path, meta: &Meta) -> Result<(), WriteError> {
+    let json = serde_json::to_vec(meta).map_err(|e| WriteError::NotReplaced(e.to_string()))?;
     write_file_durably(
         &dir.join("meta.bak.tmp"),
         &dir.join("meta.bak"),
         &json,
         dir,
-    )?;
+    )
+    .map_err(|e| WriteError::NotReplaced(e.into()))?;
     write_file_durably(
         &dir.join("meta.json.tmp"),
         &dir.join("meta.json"),
@@ -673,12 +763,20 @@ fn persist_index(vault: &Vault, key: &[u8; 32]) -> Result<(), String> {
     Ok(())
 }
 
+/// Write to a temp file and rename it over settings.json, so a failed write
+/// leaves the old settings intact. An error means the old file is still in
+/// place. Once the rename lands the new file is the one a restart reads, so a
+/// failed directory sync after it counts as saved and callers keep the new values.
 fn save_settings(vault: &Vault) -> Result<(), String> {
-    fs::write(
-        vault.settings_path(),
-        serde_json::to_vec(&vault.settings).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
+    match write_file_durably(
+        &vault.dir.join("settings.json.tmp"),
+        &vault.settings_path(),
+        &serde_json::to_vec(&vault.settings).map_err(|e| e.to_string())?,
+        &vault.dir,
+    ) {
+        Ok(()) | Err(WriteError::Unconfirmed(_)) => Ok(()),
+        Err(WriteError::NotReplaced(e)) => Err(e),
+    }
 }
 
 /// Load the index into memory and mark the vault unlocked. Also purges
@@ -725,6 +823,7 @@ fn finish_unlock(state: &Mutex<Vault>, master: [u8; 32]) -> Result<(), String> {
         }
     }
     vault.key = Some(master);
+    vault.session += 1;
     vault.last_activity = Instant::now();
     Ok(())
 }
@@ -754,6 +853,10 @@ fn is_media_path(path: &std::path::Path) -> bool {
             IMAGE_EXTS.contains(&e.as_str()) || VIDEO_EXTS.contains(&e.as_str())
         })
         .unwrap_or(false)
+}
+
+fn is_zip_path(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"))
 }
 
 fn is_hidden(path: &std::path::Path) -> bool {
@@ -990,10 +1093,9 @@ fn prepare_media(path: &std::path::Path, data: &[u8]) -> Result<MediaMeta, Impor
                 "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff"
             ) && image::guess_format(data).is_err()
             {
-                return Err(ImportFailure {
-                    reason: "File contents are not a supported image.".into(),
-                    retryable: false,
-                });
+                return Err(ImportFailure::permanent(
+                    "File contents are not a supported image.",
+                ));
             }
             let jpg = sips_to_jpeg(path)?;
             let img = image::load_from_memory(&jpg).map_err(|e| {
@@ -1159,6 +1261,9 @@ async fn vault_status(state: VaultState<'_>) -> Result<String, String> {
     } else if vault.active_key().is_some() {
         "unlocked".into()
     } else {
+        // The UI shows the lock screen for this answer, so lock_timer doesn't
+        // need to report the lock again and reset the login form.
+        vault.lock_unreported = false;
         "locked".into()
     })
 }
@@ -1236,6 +1341,7 @@ async fn create_vault(password: String, state: VaultState<'_>) -> Result<(), Str
     vault.albums = HashMap::new();
     persist_index(&vault, &master)?;
     vault.key = Some(master);
+    vault.session += 1;
     vault.last_activity = Instant::now();
     Ok(())
 }
@@ -1294,24 +1400,82 @@ async fn change_password(
     Ok(())
 }
 
-/// Generate (or replace) the recovery key. Returns it formatted for humans —
-/// shown exactly once, never stored in plaintext.
+#[derive(Serialize)]
+struct NewRecoveryKey {
+    key: String,
+    // Pass back to recovery_confirm, so Done saves the key that was shown.
+    id: String,
+}
+
+/// Generate a new recovery key and return it formatted for humans. It's only
+/// held in memory until `recovery_confirm` saves it, so the old key keeps
+/// working if the vault locks or the UI never shows this one.
 #[tauri::command]
-async fn recovery_generate(state: VaultState<'_>) -> Result<String, String> {
-    let (dir, master, meta_mutex) = {
-        let mut vault = vlock(&state);
+async fn recovery_generate(state: VaultState<'_>) -> Result<NewRecoveryKey, String> {
+    generate_recovery_key(&state)
+}
+
+fn generate_recovery_key(state: &Mutex<Vault>) -> Result<NewRecoveryKey, String> {
+    let mut vault = vlock(state);
+    vault.active_key().ok_or("locked")?;
+    let rk = Zeroizing::new(random_key());
+    let shown = NewRecoveryKey {
+        key: format_recovery_key(&rk),
+        id: random_id(),
+    };
+    vault.pending_recovery = Some((shown.id.clone(), rk));
+    Ok(shown)
+}
+
+#[derive(Serialize)]
+struct RecoveryConfirmed {
+    // Set when the new key replaced the old one but the disk didn't confirm it.
+    warning: Option<String>,
+}
+
+/// Save the key from `recovery_generate` with this id once the user has seen
+/// it. This replaces the old recovery key. An error means nothing changed.
+#[tauri::command]
+async fn recovery_confirm(id: String, state: VaultState<'_>) -> Result<RecoveryConfirmed, String> {
+    confirm_recovery_key(&state, &id)
+}
+
+fn confirm_recovery_key(state: &Mutex<Vault>, id: &str) -> Result<RecoveryConfirmed, String> {
+    let (dir, master, session, meta_mutex) = {
+        let mut vault = vlock(state);
         let key = vault.active_key().ok_or("locked")?;
-        (vault.dir.clone(), key, vault.meta_lock.clone())
+        (vault.dir.clone(), key, vault.session, vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
-    if vlock(&state).active_key() != Some(master) {
-        return Err("The vault changed or locked. Try again after unlocking.".into());
-    }
-    let rk = random_key();
+    let rk = {
+        let mut vault = vlock(state);
+        // Unlocking restores the same master key, so only the session shows
+        // a lock and unlock while this waited for the meta lock.
+        if vault.active_key().is_none() || vault.session != session {
+            return Err("The vault changed or locked. Try again after unlocking.".into());
+        }
+        match &vault.pending_recovery {
+            Some((pending_id, rk)) if pending_id == id => rk.clone(),
+            _ => return Err("This recovery key is no longer waiting to be saved. Generate a new one.".into()),
+        }
+    };
     let mut meta = read_meta(&dir)?;
     meta.recovery = Some(hex::encode(encrypt(&rk, &master)?));
-    write_meta(&dir, &meta)?;
-    Ok(format_recovery_key(&rk))
+    let warning = match write_meta(&dir, &meta) {
+        Ok(()) => None,
+        // meta.json already holds the new key, so it's the one that works now.
+        Err(WriteError::Unconfirmed(_)) => Some(
+            "Saved, but the disk didn't confirm the write. Keep this new key; any old key no longer works."
+                .into(),
+        ),
+        Err(e) => return Err(e.into()),
+    };
+    // Keep a newer key generated while this one was being saved.
+    let mut vault = vlock(state);
+    if vault.pending_recovery.as_ref().is_some_and(|(pending_id, _)| pending_id == id) {
+        vault.pending_recovery = None;
+    }
+    Ok(RecoveryConfirmed { warning })
 }
 
 #[tauri::command]
@@ -1322,8 +1486,12 @@ async fn recovery_disable(state: VaultState<'_>) -> Result<(), String> {
         (vault.dir.clone(), master, vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
-    if vlock(&state).active_key() != Some(master) {
-        return Err("The vault changed or locked. Try again after unlocking.".into());
+    {
+        let mut vault = vlock(&state);
+        if vault.active_key() != Some(master) {
+            return Err("The vault changed or locked. Try again after unlocking.".into());
+        }
+        vault.pending_recovery = None;
     }
     let mut meta = read_meta(&dir)?;
     meta.recovery = None;
@@ -1340,14 +1508,22 @@ async fn recovery_unlock(
     new_password: String,
     state: VaultState<'_>,
 ) -> Result<(), String> {
+    unlock_with_recovery_key(&recovery_key, &new_password, &state)
+}
+
+fn unlock_with_recovery_key(
+    recovery_key: &str,
+    new_password: &str,
+    state: &Mutex<Vault>,
+) -> Result<(), String> {
     if new_password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
             "New password must be at least {MIN_PASSWORD_LEN} characters."
         ));
     }
-    let rk = parse_recovery_key(&recovery_key)?;
+    let rk = parse_recovery_key(recovery_key)?;
     let (dir, meta_mutex) = {
-        let vault = vlock(&state);
+        let vault = vlock(state);
         (vault.dir.clone(), vault.meta_lock.clone())
     };
     let _meta_guard = meta_lock(&meta_mutex);
@@ -1381,10 +1557,10 @@ async fn recovery_unlock(
     if !valid {
         return Err("Wrong recovery key.".into());
     }
-    rewrap_master(&mut meta, &new_password, &master)?;
+    rewrap_master(&mut meta, new_password, &master)?;
     write_meta(&dir, &meta)?;
     remove_legacy_meta_backup(&dir);
-    finish_unlock(&state, master)
+    finish_unlock(state, master)
 }
 
 // ---------------------------------------------------------------- Touch ID ---
@@ -1406,16 +1582,30 @@ async fn touchid_enable(state: VaultState<'_>) -> Result<(), String> {
     native::authenticate_biometric("enable Touch ID unlock for PhotoVault")?;
     native::keychain_store_master(&master)?;
     let mut vault = vlock(&state);
-    vault.settings.touch_id = true;
-    save_settings(&vault)
+    let previous = std::mem::replace(&mut vault.settings.touch_id, true);
+    if let Err(e) = save_settings(&vault) {
+        vault.settings.touch_id = previous;
+        if !previous {
+            // Don't leave a usable copy of the master key behind a setting that's off.
+            native::keychain_delete_master();
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn touchid_disable(state: VaultState<'_>) -> Result<(), String> {
-    native::keychain_delete_master();
     let mut vault = vlock(&state);
-    vault.settings.touch_id = false;
-    save_settings(&vault)
+    let previous = std::mem::replace(&mut vault.settings.touch_id, false);
+    if let Err(e) = save_settings(&vault) {
+        // The key stays too, so Touch ID unlock still works with the setting on.
+        vault.settings.touch_id = previous;
+        return Err(e);
+    }
+    drop(vault);
+    native::keychain_delete_master();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1448,12 +1638,10 @@ async fn touchid_unlock(state: VaultState<'_>) -> Result<(), String> {
 
 /// UI signals user interaction (throttled) so the vault doesn't auto-lock
 /// while someone is actively looking at photos without issuing commands.
+/// An idle vault locks here instead of reviving, like any other user command.
 #[tauri::command]
 async fn touch_activity(state: VaultState<'_>) -> Result<(), String> {
-    let mut vault = vlock(&state);
-    if vault.key.is_some() {
-        vault.last_activity = Instant::now();
-    }
+    vlock(&state).active_key();
     Ok(())
 }
 
@@ -1486,12 +1674,18 @@ async fn set_settings(
         let mut vault = vlock(&state);
         // touch_id is managed by its own commands (keychain side effects).
         let touch_id = vault.settings.touch_id;
-        vault.settings = Settings {
-            touch_id,
-            ..settings
-        };
+        let previous = std::mem::replace(
+            &mut vault.settings,
+            Settings {
+                touch_id,
+                ..settings
+            },
+        );
         vault.last_activity = Instant::now();
-        save_settings(&vault)?;
+        if let Err(e) = save_settings(&vault) {
+            vault.settings = previous;
+            return Err(e);
+        }
     }
     if let Some(window) = app.get_webview_window("main") {
         let protect = vlock(&state).settings.screen_protect;
@@ -1515,23 +1709,28 @@ fn lock_timer(app: tauri::AppHandle) {
         prev_wall = wall;
         let state: State<Mutex<Vault>> = app.state();
         let mut vault = vlock(&state);
-        if vault.key.is_none() {
-            continue;
-        }
-        let idle = vault.settings.auto_lock_secs > 0
-            && !vault.importing
-            && vault.last_activity.elapsed().as_secs() > vault.settings.auto_lock_secs;
-        if idle || (slept && vault.settings.lock_on_sleep) {
-            wipe_vault(&mut vault);
+        if lock_tick(&mut vault, slept) {
             drop(vault);
             let _ = app.emit("vault-locked", ());
         }
     }
 }
 
+/// One lock_timer pass. Returns true when the UI needs a vault-locked event:
+/// this pass locked the vault, or something else wiped it without telling the
+/// UI (a command that found it idle).
+fn lock_tick(vault: &mut Vault, slept: bool) -> bool {
+    if vault.idle_too_long() || (vault.key.is_some() && slept && vault.settings.lock_on_sleep) {
+        wipe_vault(vault);
+    }
+    std::mem::take(&mut vault.lock_unreported) && vault.key.is_none()
+}
+
 #[tauri::command]
 async fn lock(state: VaultState<'_>) -> Result<(), String> {
-    wipe_vault(&mut vlock(&state));
+    let mut vault = vlock(&state);
+    wipe_vault(&mut vault);
+    vault.lock_unreported = false; // the UI asked for it
     Ok(())
 }
 
@@ -1539,8 +1738,14 @@ async fn lock(state: VaultState<'_>) -> Result<(), String> {
 
 #[tauri::command]
 async fn list_photos(state: VaultState<'_>) -> Result<Vec<PhotoEntry>, String> {
-    let mut vault = vlock(&state);
-    vault.active_key().ok_or("locked")?;
+    photo_list(&state)
+}
+
+// The UI also reloads the lists after every Inbox pass, so reading them isn't
+// user activity. An idle vault reads as locked until lock_timer locks it.
+fn photo_list(state: &Mutex<Vault>) -> Result<Vec<PhotoEntry>, String> {
+    let vault = vlock(state);
+    vault.background_key().ok_or("locked")?;
     Ok(vault
         .photos
         .iter()
@@ -1563,8 +1768,12 @@ async fn list_photos(state: VaultState<'_>) -> Result<Vec<PhotoEntry>, String> {
 
 #[tauri::command]
 async fn list_albums(state: VaultState<'_>) -> Result<Vec<AlbumEntry>, String> {
-    let mut vault = vlock(&state);
-    vault.active_key().ok_or("locked")?;
+    album_list(&state)
+}
+
+fn album_list(state: &Mutex<Vault>) -> Result<Vec<AlbumEntry>, String> {
+    let vault = vlock(state);
+    vault.background_key().ok_or("locked")?;
     let mut albums: Vec<AlbumEntry> = vault
         .albums
         .iter()
@@ -1578,6 +1787,24 @@ async fn list_albums(state: VaultState<'_>) -> Result<Vec<AlbumEntry>, String> {
     Ok(albums)
 }
 
+/// Apply `edit` to the in-memory library and save it. If either step fails, photos
+/// and albums go back to how they were, so a later save can't persist a change
+/// the user was told failed.
+fn edit_library<T>(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    edit: impl FnOnce(&mut Vault) -> Result<T, String>,
+) -> Result<T, String> {
+    let photos = vault.photos.clone();
+    let albums = vault.albums.clone();
+    let saved = edit(vault).and_then(|out| persist_index(vault, key).map(|()| out));
+    if saved.is_err() {
+        vault.photos = photos;
+        vault.albums = albums;
+    }
+    saved
+}
+
 #[tauri::command]
 async fn album_create(name: String, state: VaultState<'_>) -> Result<String, String> {
     let name = name.trim().to_string();
@@ -1586,16 +1813,21 @@ async fn album_create(name: String, state: VaultState<'_>) -> Result<String, Str
     }
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    let id = random_id();
-    vault.albums.insert(
-        id.clone(),
-        Album {
-            name,
-            created: now_secs(),
-        },
-    );
-    persist_index(&vault, &key)?;
-    Ok(id)
+    create_album(&mut vault, &key, name)
+}
+
+fn create_album(vault: &mut Vault, key: &[u8; 32], name: String) -> Result<String, String> {
+    edit_library(vault, key, |vault| {
+        let id = random_id();
+        vault.albums.insert(
+            id.clone(),
+            Album {
+                name,
+                created: now_secs(),
+            },
+        );
+        Ok(id)
+    })
 }
 
 #[tauri::command]
@@ -1606,21 +1838,30 @@ async fn album_rename(id: String, name: String, state: VaultState<'_>) -> Result
     }
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    vault.albums.get_mut(&id).ok_or("Album not found.")?.name = name;
-    persist_index(&vault, &key)
+    edit_library(&mut vault, &key, |vault| {
+        vault.albums.get_mut(&id).ok_or("Album not found.")?.name = name;
+        Ok(())
+    })
 }
 
 #[tauri::command]
 async fn album_delete(id: String, state: VaultState<'_>) -> Result<(), String> {
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    if vault.albums.remove(&id).is_some() {
-        for p in vault.photos.values_mut() {
-            p.albums.retain(|a| a != &id);
-        }
-        persist_index(&vault, &key)?;
+    delete_album(&mut vault, &key, &id)
+}
+
+fn delete_album(vault: &mut Vault, key: &[u8; 32], id: &str) -> Result<(), String> {
+    if !vault.albums.contains_key(id) {
+        return Ok(());
     }
-    Ok(())
+    edit_library(vault, key, |vault| {
+        vault.albums.remove(id);
+        for p in vault.photos.values_mut() {
+            p.albums.retain(|a| a != id);
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -1632,19 +1873,31 @@ async fn albums_assign(
 ) -> Result<(), String> {
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    if !vault.albums.contains_key(&album) {
+    assign_album(&mut vault, &key, &ids, &album, add)
+}
+
+fn assign_album(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    ids: &[String],
+    album: &str,
+    add: bool,
+) -> Result<(), String> {
+    if !vault.albums.contains_key(album) {
         return Err("Album not found.".into());
     }
-    for id in &ids {
-        if let Some(p) = vault.photos.get_mut(id) {
-            if add && !p.albums.contains(&album) {
-                p.albums.push(album.clone());
-            } else if !add {
-                p.albums.retain(|a| a != &album);
+    edit_library(vault, key, |vault| {
+        for id in ids {
+            if let Some(p) = vault.photos.get_mut(id) {
+                if add && !p.albums.iter().any(|a| a == album) {
+                    p.albums.push(album.to_string());
+                } else if !add {
+                    p.albums.retain(|a| a != album);
+                }
             }
         }
-    }
-    persist_index(&vault, &key)
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -1655,12 +1908,23 @@ async fn set_favorite(
 ) -> Result<(), String> {
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    for id in &ids {
-        if let Some(p) = vault.photos.get_mut(id) {
-            p.favorite = favorite;
+    mark_favorite(&mut vault, &key, &ids, favorite)
+}
+
+fn mark_favorite(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    ids: &[String],
+    favorite: bool,
+) -> Result<(), String> {
+    edit_library(vault, key, |vault| {
+        for id in ids {
+            if let Some(p) = vault.photos.get_mut(id) {
+                p.favorite = favorite;
+            }
         }
-    }
-    persist_index(&vault, &key)
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -1668,8 +1932,10 @@ async fn rename_photo(id: String, name: String, state: VaultState<'_>) -> Result
     let name = sanitize_photo_name(&name)?;
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    vault.photos.get_mut(&id).ok_or("not found")?.name = name;
-    persist_index(&vault, &key)
+    edit_library(&mut vault, &key, |vault| {
+        vault.photos.get_mut(&id).ok_or("not found")?.name = name;
+        Ok(())
+    })
 }
 
 /// Trim, drop empties, dedupe case-insensitively keeping the first spelling.
@@ -1689,8 +1955,19 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
 async fn set_tags(id: String, tags: Vec<String>, state: VaultState<'_>) -> Result<(), String> {
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    vault.photos.get_mut(&id).ok_or("not found")?.tags = normalize_tags(tags);
-    persist_index(&vault, &key)
+    set_photo_tags(&mut vault, &key, &id, tags)
+}
+
+fn set_photo_tags(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    id: &str,
+    tags: Vec<String>,
+) -> Result<(), String> {
+    edit_library(vault, key, |vault| {
+        vault.photos.get_mut(id).ok_or("not found")?.tags = normalize_tags(tags);
+        Ok(())
+    })
 }
 
 // ----------------------------------------------------------------- import ---
@@ -1718,6 +1995,8 @@ struct ImportIssue {
     retryable: bool,
     #[serde(skip)]
     retry_path: Option<PathBuf>,
+    #[serde(skip)]
+    slow_retry: bool,
 }
 
 impl ImportResult {
@@ -1739,6 +2018,7 @@ impl ImportResult {
             stage,
             retryable,
             retry_path: None,
+            slow_retry: false,
         });
     }
 }
@@ -1747,6 +2027,8 @@ impl ImportResult {
 struct ImportFailure {
     reason: String,
     retryable: bool,
+    /// Retry only after a long wait, like a full disk that needs the user's attention.
+    slow_retry: bool,
 }
 
 impl ImportFailure {
@@ -1754,6 +2036,15 @@ impl ImportFailure {
         Self {
             reason: reason.to_string(),
             retryable: true,
+            slow_retry: false,
+        }
+    }
+
+    fn permanent(reason: impl ToString) -> Self {
+        Self {
+            reason: reason.to_string(),
+            retryable: false,
+            slow_retry: false,
         }
     }
 }
@@ -1775,7 +2066,47 @@ fn same_source(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     a.is_file() && b.is_file() && a.len() == b.len() && a.modified().ok() == b.modified().ok()
 }
 
+/// Read the whole source, with room left to encrypt it in place.
 fn read_source(path: &std::path::Path) -> Result<(Vec<u8>, SourceProof), ImportFailure> {
+    let mut data = Vec::new();
+    let proof = scan_source(path, |file, len| {
+        data = read_capped(file, len)?;
+        Ok(blake3::hash(&data))
+    })?;
+    Ok((data, proof))
+}
+
+/// Read at most `len` bytes, the size checked against the import cap. A file
+/// that grew since then fails instead of being read past the cap.
+fn read_capped(file: &mut impl Read, len: u64) -> std::io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len as usize + ENCRYPTION_OVERHEAD)
+        .map_err(|_| std::io::Error::other("Not enough memory to import this file."))?;
+    file.take(len + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > len {
+        return Err(std::io::Error::other(
+            "Source changed while it was being read.",
+        ));
+    }
+    Ok(data)
+}
+
+/// Same checks and hash as `read_source`, streamed so the file isn't loaded again.
+fn hash_source(path: &std::path::Path) -> Result<SourceProof, ImportFailure> {
+    scan_source(path, |file, _| hash_file(file))
+}
+
+/// Streaming blake3 of the rest of an open file.
+fn hash_file(file: &mut fs::File) -> std::io::Result<blake3::Hash> {
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(file, &mut hasher)?;
+    Ok(hasher.finalize())
+}
+
+fn scan_source(
+    path: &std::path::Path,
+    hash: impl FnOnce(&mut fs::File, u64) -> std::io::Result<blake3::Hash>,
+) -> Result<SourceProof, ImportFailure> {
     let before = fs::symlink_metadata(path).map_err(ImportFailure::temporary)?;
     if !before.is_file() || before.file_type().is_symlink() {
         return Err(ImportFailure::temporary(
@@ -1789,9 +2120,13 @@ fn read_source(path: &std::path::Path) -> Result<(Vec<u8>, SourceProof), ImportF
             "Source changed before it could be read.",
         ));
     }
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)
-        .map_err(ImportFailure::temporary)?;
+    // Checked before reading. Permanent, so the Inbox doesn't retry it every minute.
+    if metadata.len() > MAX_IMPORT_BYTES {
+        return Err(ImportFailure::permanent(
+            "File is larger than 4 GB, which PhotoVault can't import yet.",
+        ));
+    }
+    let hash = hash(&mut file, metadata.len()).map_err(ImportFailure::temporary)?;
     if file_signature(&metadata)
         != file_signature(&file.metadata().map_err(ImportFailure::temporary)?)
     {
@@ -1799,8 +2134,7 @@ fn read_source(path: &std::path::Path) -> Result<(Vec<u8>, SourceProof), ImportF
             "Source changed while it was being read.",
         ));
     }
-    let hash = blake3::hash(&data);
-    Ok((data, SourceProof { metadata, hash }))
+    Ok(SourceProof { metadata, hash })
 }
 
 struct ImportGuard<'a> {
@@ -1814,8 +2148,23 @@ impl Drop for ImportGuard<'_> {
 }
 
 fn claim_import<'a>(state: &'a Mutex<Vault>) -> Result<ImportGuard<'a>, String> {
+    claim_import_as(state, true)
+}
+
+/// The Inbox watcher's claim. It doesn't count as activity, so retrying a file
+/// that keeps failing can't hold the vault open past auto-lock.
+fn claim_background_import<'a>(state: &'a Mutex<Vault>) -> Result<ImportGuard<'a>, String> {
+    claim_import_as(state, false)
+}
+
+fn claim_import_as<'a>(state: &'a Mutex<Vault>, user: bool) -> Result<ImportGuard<'a>, String> {
     let mut vault = vlock(state);
-    vault.active_key().ok_or("locked")?;
+    let key = if user {
+        vault.active_key()
+    } else {
+        vault.background_key()
+    };
+    key.ok_or("locked")?;
     if vault.importing {
         return Err("An import is already running.".into());
     }
@@ -1845,9 +2194,9 @@ fn flush_batch(state: &Mutex<Vault>, batch: &mut Vec<(String, PhotoInfo)>) -> Re
         return Ok(());
     }
     let mut vault = vlock(state);
-    // Re-check the key: the vault may have been locked mid-import.
+    // Re-check the key: the vault may have been locked mid-import. No activity
+    // bump: `importing` already holds off auto-lock while the import runs.
     let key = vault.key.ok_or("locked")?;
-    vault.last_activity = Instant::now(); // a running import counts as activity
     let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
     for (id, mut info) in batch.drain(..) {
         // The target album can be deleted while a long import runs — never
@@ -1866,26 +2215,43 @@ fn flush_batch(state: &Mutex<Vault>, batch: &mut Vec<(String, PhotoInfo)>) -> Re
     Ok(())
 }
 
-/// Rename first so replacing the original pathname cannot make cleanup delete the replacement.
-/// A crash or changed source leaves the claimed file in a visible, automatically scanned folder.
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(path)
+}
+
 fn delete_inbox_source(
     inbox: &std::path::Path,
     path: &std::path::Path,
     proof: &SourceProof,
     retained: &mut Option<PathBuf>,
 ) -> Result<(), String> {
+    claim_and_remove(inbox, path, retained, |claimed| {
+        let current = hash_source(claimed).map_err(|e| e.reason)?;
+        if !same_source(&proof.metadata, &current.metadata) || proof.hash != current.hash {
+            return Err("Source changed after it was read; the changed file was preserved.".into());
+        }
+        Ok(())
+    })
+}
+
+/// Rename first so replacing the original pathname cannot make cleanup delete the replacement.
+/// A crash or changed source leaves the claimed file in a visible, automatically scanned folder.
+/// `verify` checks the claimed file is still the one that was imported.
+fn claim_and_remove(
+    inbox: &std::path::Path,
+    path: &std::path::Path,
+    retained: &mut Option<PathBuf>,
+    verify: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
     let parent = path.parent().ok_or("Source has no parent directory.")?;
     let claimed_dir = inbox.join(format!("Pending import {}", random_id()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&claimed_dir)
-            .map_err(|e| e.to_string())?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(&claimed_dir).map_err(|e| e.to_string())?;
+    create_private_dir(&claimed_dir).map_err(|e| e.to_string())?;
     let claimed = claimed_dir.join(path.file_name().ok_or("Source has no filename.")?);
     if let Err(e) = fs::rename(path, &claimed) {
         let _ = fs::remove_dir(&claimed_dir);
@@ -1903,10 +2269,7 @@ fn delete_inbox_source(
         sync_dir(&claimed_dir)?;
         sync_dir(inbox)?;
         sync_dir(parent)?;
-        let (_, current) = read_source(&claimed).map_err(|e| e.reason)?;
-        if !same_source(&proof.metadata, &current.metadata) || proof.hash != current.hash {
-            return Err("Source changed after it was read; the changed file was preserved.".into());
-        }
+        verify(&claimed)?;
         fs::remove_file(&claimed).map_err(|e| e.to_string())?;
         sync_dir(&claimed_dir)?;
         Ok(())
@@ -1960,8 +2323,8 @@ fn import_one(
         .unwrap_or_else(|| "photo".into());
     let media = prepare_media(path, &data);
     // Native media helpers use the pathname; reject a changed source before saving their output.
-    match read_source(path) {
-        Ok((_, current))
+    match hash_source(path) {
+        Ok(current)
             if same_source(&proof.metadata, &current.metadata) && proof.hash == current.hash => {}
         _ => {
             return ImportOutcome::Failed(ImportFailure::temporary(
@@ -1973,7 +2336,8 @@ fn import_one(
         Ok(media) => media,
         Err(e) => return ImportOutcome::Failed(e),
     };
-    let (Ok(enc), Ok(enc_thumb)) = (encrypt(key, &data), encrypt(key, &media.thumb)) else {
+    let size = data.len() as u64;
+    let (Ok(enc), Ok(enc_thumb)) = (encrypt_owned(key, data), encrypt(key, &media.thumb)) else {
         return ImportOutcome::Failed(ImportFailure::temporary("Could not encrypt media."));
     };
     let id = random_id();
@@ -1995,7 +2359,7 @@ fn import_one(
         PhotoInfo {
             name,
             added: now_secs(),
-            size: Some(data.len() as u64),
+            size: Some(size),
             taken: media.taken,
             hash: Some(hash),
             favorite: false,
@@ -2435,7 +2799,7 @@ async fn export_photo(id: String, dest: String, state: VaultState<'_>) -> Result
         (key, vault.objects_dir().join(&id))
     };
     let blob = fs::read(path).map_err(|e| e.to_string())?;
-    let data = decrypt(&key, &blob)?;
+    let data = decrypt_owned(&key, blob)?;
     fs::write(dest, data).map_err(|e| e.to_string())
 }
 
@@ -2518,8 +2882,8 @@ fn export_entries(
             }
             let blob = fs::read(objects.join(id))
                 .map_err(|error| format!("Cannot read encrypted original: {error}"))?;
-            let data =
-                decrypt(key, &blob).map_err(|error| format!("Cannot decrypt original: {error}"))?;
+            let data = decrypt_owned(key, blob)
+                .map_err(|error| format!("Cannot decrypt original: {error}"))?;
             write_export(dir, name, &data)
         };
         match exported() {
@@ -2627,7 +2991,7 @@ async fn scan_dates(app: tauri::AppHandle, state: VaultState<'_>) -> Result<usiz
         let Ok(blob) = fs::read(objects.join(id)) else {
             continue;
         };
-        let Ok(data) = decrypt(&key, &blob) else {
+        let Ok(data) = decrypt_owned(&key, blob) else {
             continue;
         };
         if let Some(t) = exif_taken(&data) {
@@ -2638,13 +3002,15 @@ async fn scan_dates(app: tauri::AppHandle, state: VaultState<'_>) -> Result<usiz
     let mut vault = vlock(&state);
     let key = vault.key.ok_or("locked")?;
     let n = updates.len();
-    for (id, t) in updates {
-        if let Some(p) = vault.photos.get_mut(&id) {
-            p.taken = Some(t);
-        }
-    }
     if n > 0 {
-        persist_index(&vault, &key)?;
+        edit_library(&mut vault, &key, |vault| {
+            for (id, t) in updates {
+                if let Some(p) = vault.photos.get_mut(&id) {
+                    p.taken = Some(t);
+                }
+            }
+            Ok(())
+        })?;
     }
     Ok(n)
 }
@@ -2752,6 +3118,17 @@ fn media_error(status: u16) -> tauri::http::Response<Vec<u8>> {
         .unwrap()
 }
 
+/// The grid reloads thumbnails on every redraw, including the automatic ones
+/// after Inbox passes, so only full media (opening a photo, playing a video)
+/// counts as activity. The UI reports real scrolling with touch_activity.
+fn media_key(vault: &mut Vault, thumb: bool) -> Option<[u8; 32]> {
+    if thumb {
+        vault.background_key()
+    } else {
+        vault.active_key()
+    }
+}
+
 fn serve_media(
     app: &tauri::AppHandle,
     req: &tauri::http::Request<Vec<u8>>,
@@ -2768,7 +3145,7 @@ fn serve_media(
     let state: State<Mutex<Vault>> = app.state();
     let (key, fpath, name, cached) = {
         let mut vault = vlock(&state);
-        let Some(key) = vault.active_key() else {
+        let Some(key) = media_key(&mut vault, thumb) else {
             return media_error(403);
         };
         let Some(info) = vault.photos.get(id) else {
@@ -2805,7 +3182,7 @@ fn serve_media(
             let Ok(blob) = fs::read(&fpath) else {
                 return media_error(404);
             };
-            let Ok(plain) = decrypt(&key, &blob) else {
+            let Ok(plain) = decrypt_owned(&key, blob) else {
                 return media_error(500);
             };
             let plain = Arc::new(plain);
@@ -2856,10 +3233,11 @@ fn file_signature(metadata: &fs::Metadata) -> FileSig {
     )
 }
 
-/// Media files anywhere under the inbox — folders dropped in are walked
-/// recursively, and the result is sorted by name so files are imported in the
-/// order the inbox folder shows them. Hidden entries and symlinks are skipped;
-/// depth is bounded so a pathological tree can't wedge the watcher.
+/// Media files and zip archives anywhere under the inbox — folders dropped in
+/// are walked recursively, and the result is sorted by name so files are
+/// imported in the order the inbox folder shows them. Hidden entries and
+/// symlinks are skipped; depth is bounded so a pathological tree can't wedge
+/// the watcher.
 fn scan_inbox_media(dir: &std::path::Path, depth: u32, out: &mut Vec<(PathBuf, FileSig)>) {
     if depth > 8 {
         return;
@@ -2883,13 +3261,16 @@ fn scan_inbox_media(dir: &std::path::Path, depth: u32, out: &mut Vec<(PathBuf, F
         }
         if ft.is_dir() {
             scan_inbox_media(&path, depth + 1, out);
-        } else if ft.is_file() && is_media_path(&path) {
+        } else if ft.is_file() && (is_media_path(&path) || is_zip_path(&path)) {
             if let Ok(md) = entry.metadata() {
                 out.push((path, file_signature(&md)));
             }
         }
     }
     if depth == 0 {
+        // Zips inside an extracted folder stay put, so nested archives can't
+        // keep unpacking with a fresh size budget each.
+        out.retain(|(path, _)| !is_zip_path(path) || inbox_album_name(dir, path).is_none());
         out.sort_by_cached_key(|(path, _)| path_sort_key(path));
     }
 }
@@ -2897,17 +3278,18 @@ fn scan_inbox_media(dir: &std::path::Path, depth: u32, out: &mut Vec<(PathBuf, F
 /// After importing a folder's media, remove the folders it leaves empty,
 /// walking up to (but never into or past) the inbox root. `remove_dir` only
 /// deletes empty directories, so anything still holding files survives —
-/// except a lone Finder .DS_Store, which shouldn't keep a folder alive.
+/// except a Finder .DS_Store or album marker, which shouldn't keep a folder alive.
 fn prune_empty_dirs(inbox: &std::path::Path, from: &std::path::Path) {
+    const LEFTOVERS: [&str; 2] = [".DS_Store", INBOX_ALBUM_MARKER];
     let mut dir = from.to_path_buf();
     while dir != *inbox && dir.starts_with(inbox) {
-        let ds = dir.join(".DS_Store");
-        let only_ds = ds.exists()
-            && fs::read_dir(&dir).map_or(false, |mut entries| {
-                entries.all(|e| e.map_or(false, |e| e.file_name() == ".DS_Store"))
-            });
-        if only_ds {
-            let _ = fs::remove_file(&ds);
+        let only_leftovers = fs::read_dir(&dir).map_or(false, |mut entries| {
+            entries.all(|e| e.map_or(false, |e| LEFTOVERS.iter().any(|n| e.file_name() == *n)))
+        });
+        if only_leftovers {
+            for name in LEFTOVERS {
+                let _ = fs::remove_file(dir.join(name));
+            }
         }
         if fs::remove_dir(&dir).is_err() {
             return; // not empty (or already gone) — parents aren't empty either
@@ -2919,9 +3301,395 @@ fn prune_empty_dirs(inbox: &std::path::Path, from: &std::path::Path) {
     }
 }
 
+/// The album named by the nearest marker between `path` and the inbox root.
+fn inbox_album_name(inbox: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let read_marker = |dir: &std::path::Path| {
+        let marker = dir.join(INBOX_ALBUM_MARKER);
+        // Only a regular file: a planted FIFO would block the watcher.
+        if !fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file()) {
+            return None;
+        }
+        let mut name = String::new();
+        fs::File::open(marker)
+            .and_then(|f| f.take(1024).read_to_string(&mut name))
+            .ok()
+            .map(|_| name)
+    };
+    path.ancestors()
+        .skip(1)
+        .take_while(|dir| *dir != inbox && dir.starts_with(inbox))
+        .find_map(read_marker)
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty() && name.len() <= MAX_PHOTO_NAME_BYTES)
+}
+
+/// The id of the album called `name` (ignoring case), created if none exists,
+/// and whether it was created.
+fn ensure_album(state: &Mutex<Vault>, name: &str) -> Result<(String, bool), String> {
+    let mut vault = vlock(state);
+    let key = vault.key.ok_or("locked")?;
+    let lower = name.to_lowercase();
+    if let Some((id, _)) = vault
+        .albums
+        .iter()
+        .filter(|(_, a)| a.name.to_lowercase() == lower)
+        .min_by(|a, b| a.1.created.total_cmp(&b.1.created))
+    {
+        return Ok((id.clone(), false));
+    }
+    let id = random_id();
+    vault.albums.insert(
+        id.clone(),
+        Album {
+            name: name.to_string(),
+            created: now_secs(),
+        },
+    );
+    if let Err(e) = persist_index(&vault, &key) {
+        vault.albums.remove(&id);
+        return Err(e);
+    }
+    Ok((id, true))
+}
+
+/// Discard staging folders left by an extraction that was interrupted.
+fn remove_unzip_staging(inbox: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(inbox) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(UNZIP_STAGING_PREFIX)
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn zip_failure(error: zip::result::ZipError) -> ImportFailure {
+    match error {
+        zip::result::ZipError::Io(e) => unzip_io_failure(e),
+        other => ImportFailure::permanent(format!("Cannot extract archive: {other}")),
+    }
+}
+
+/// Errors the archive itself causes recur on every attempt, so they're
+/// permanent until the zip changes or Process Inbox runs. A full or read-only
+/// disk can be fixed by the user, so it retries after a long wait instead of
+/// refilling the disk every minute.
+fn unzip_io_failure(e: std::io::Error) -> ImportFailure {
+    use std::io::ErrorKind::*;
+    let reason = format!("Cannot extract archive: {e}");
+    match e.kind() {
+        StorageFull | QuotaExceeded | ReadOnlyFilesystem => ImportFailure {
+            reason: format!("{reason}. It will be retried later."),
+            retryable: true,
+            slow_retry: true,
+        },
+        FileTooLarge | InvalidFilename | AlreadyExists | NotADirectory | IsADirectory
+        | InvalidData => ImportFailure::permanent(reason),
+        _ => ImportFailure::temporary(reason),
+    }
+}
+
+/// Give an extracted file the entry's UTC timestamp, which videos use as
+/// their date. The basic zip time has no time zone, so it is ignored, and a
+/// future time is capped so the inbox age check never holds the file back.
+fn set_entry_time(file: &fs::File, entry: &zip::read::ZipFile<'_>) {
+    let Some(secs) = entry.extra_data_fields().find_map(|field| match field {
+        zip::ExtraField::ExtendedTimestamp(t) => t.mod_time(),
+        _ => None,
+    }) else {
+        return;
+    };
+    let time = (UNIX_EPOCH + Duration::from_secs(secs.into())).min(SystemTime::now());
+    let times = fs::FileTimes::new().set_modified(time);
+    #[cfg(target_os = "macos")]
+    let times = {
+        use std::os::macos::fs::FileTimesExt;
+        times.set_created(time)
+    };
+    let _ = file.set_times(times);
+}
+
+/// Write the archive's files under `dest`. Returns the media among them and
+/// how many symlink entries were left out. `__MACOSX` resource forks,
+/// `.DS_Store`, and album markers are skipped, so an archive can't choose
+/// its own album.
+fn extract_archive(
+    archive: &mut zip::ZipArchive<fs::File>,
+    dest: &std::path::Path,
+) -> Result<(Vec<PathBuf>, usize), ImportFailure> {
+    if archive.len() > MAX_UNZIP_ENTRIES {
+        return Err(ImportFailure::permanent(format!(
+            "Archive has more than {MAX_UNZIP_ENTRIES} entries."
+        )));
+    }
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        total = total.saturating_add(archive.by_index_raw(i).map_err(zip_failure)?.size());
+    }
+    if total > MAX_UNZIP_BYTES {
+        return Err(ImportFailure::permanent(format!(
+            "Archive expands to more than {} GB.",
+            MAX_UNZIP_BYTES >> 30
+        )));
+    }
+    let mut media = Vec::new();
+    let mut links = 0;
+    let mut dirs = HashSet::new();
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(zip_failure)?;
+        let entry_name = entry.name().to_string();
+        let unsafe_path =
+            || ImportFailure::permanent(format!("Archive entry has an unsafe path: {entry_name}"));
+        let enclosed = entry.enclosed_name().ok_or_else(unsafe_path)?;
+        let mut relative = PathBuf::new();
+        for part in enclosed.components() {
+            match part {
+                std::path::Component::Normal(part) => relative.push(part),
+                std::path::Component::ParentDir => {
+                    relative.pop();
+                }
+                std::path::Component::CurDir => {}
+                _ => return Err(unsafe_path()),
+            }
+        }
+        let Some(file_name) = relative
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        if entry.is_dir()
+            || relative.components().any(|c| c.as_os_str() == "__MACOSX")
+            || file_name == ".DS_Store"
+            || file_name == INBOX_ALBUM_MARKER
+        {
+            continue;
+        }
+        if entry.is_symlink() {
+            links += 1;
+            continue;
+        }
+        // The extracted folder sits one level below the inbox, and the scanner
+        // stops eight levels down.
+        if relative.components().count() > 8 {
+            return Err(ImportFailure::permanent(format!(
+                "Archive entry is nested too deeply to import: {entry_name}"
+            )));
+        }
+        let size = entry.size();
+        let parent = dest.join(&relative);
+        let parent = parent.parent().unwrap_or(dest);
+        fs::create_dir_all(parent).map_err(unzip_io_failure)?;
+        dirs.extend(
+            parent
+                .ancestors()
+                .take_while(|d| d.starts_with(dest))
+                .map(PathBuf::from),
+        );
+        let path = unique_dest(parent, &file_name);
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(unzip_io_failure)?;
+        // One extra byte detects an entry that inflates past its declared size.
+        let copied =
+            std::io::copy(&mut (&mut entry).take(size + 1), &mut out).map_err(unzip_io_failure)?;
+        if copied != size {
+            return Err(ImportFailure::permanent(format!(
+                "Archive entry {entry_name} does not match its recorded size."
+            )));
+        }
+        set_entry_time(&out, &entry);
+        out.sync_all().map_err(unzip_io_failure)?;
+        // Hidden files are kept but not imported, as the scanner treats them.
+        let hidden = relative
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+        if is_media_path(&path) && !hidden {
+            media.push(path);
+        }
+    }
+    for dir in &dirs {
+        sync_dir(dir).map_err(ImportFailure::temporary)?;
+    }
+    Ok((media, links))
+}
+
+/// Hash a file in chunks. Archives are too big to read into memory.
+/// Extract an inbox zip into a folder named after it, marked so its media is
+/// filed into an album of the same name. Entries are written to a hidden
+/// staging folder first, so the scanner never sees a partly written file.
+/// Returns the folder, its media, the skipped symlink count, and the
+/// identity and content hash of the zip that was read.
+fn extract_inbox_archive(
+    inbox: &std::path::Path,
+    zip_path: &std::path::Path,
+) -> Result<(PathBuf, Vec<PathBuf>, usize, SourceProof), ImportFailure> {
+    let album = zip_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ImportFailure::permanent("Archive name can't be used as an album name."))?;
+    let before = fs::symlink_metadata(zip_path).map_err(ImportFailure::temporary)?;
+    let mut file = fs::File::open(zip_path).map_err(ImportFailure::temporary)?;
+    let metadata = file.metadata().map_err(ImportFailure::temporary)?;
+    if before.file_type().is_symlink() || !same_source(&before, &metadata) {
+        return Err(ImportFailure::temporary(
+            "Archive changed before it could be read.",
+        ));
+    }
+    // Cleanup deletes the zip only if its contents still match this hash.
+    let hash = hash_file(&mut file).map_err(ImportFailure::temporary)?;
+    std::io::Seek::rewind(&mut file).map_err(ImportFailure::temporary)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(zip_failure)?;
+    let staging = inbox.join(format!("{UNZIP_STAGING_PREFIX}{}", random_id()));
+    create_private_dir(&staging).map_err(ImportFailure::temporary)?;
+    let finished = extract_archive(&mut archive, &staging).and_then(|(media, links)| {
+        if media.is_empty() {
+            return Err(ImportFailure::permanent(
+                "Archive contains no photos or videos.",
+            ));
+        }
+        write_file_durably(
+            &staging.join(format!("{INBOX_ALBUM_MARKER}.tmp")),
+            &staging.join(INBOX_ALBUM_MARKER),
+            album.as_bytes(),
+            &staging,
+        )
+        .map_err(|e| ImportFailure::temporary(String::from(e)))?;
+        // A leading dot would hide the folder from the scanner.
+        let folder = match album.trim_start_matches('.') {
+            "" => "Archive",
+            name => name,
+        };
+        let folder = unique_dest(inbox, folder);
+        fs::rename(&staging, &folder).map_err(ImportFailure::temporary)?;
+        Ok((folder, media, links))
+    });
+    let (folder, media, links) = finished.inspect_err(|_| {
+        let _ = fs::remove_dir_all(&staging);
+    })?;
+    let media = media
+        .into_iter()
+        .filter_map(|p| p.strip_prefix(&staging).ok().map(|p| folder.join(p)))
+        .collect();
+    Ok((folder, media, links, SourceProof { metadata, hash }))
+}
+
+/// Extract an inbox zip, then delete it if it is unchanged. Returns the
+/// extracted media; failures are reported against the zip, which is kept.
+fn unzip_inbox_archive(
+    inbox: &std::path::Path,
+    zip_path: &std::path::Path,
+    result: &mut ImportResult,
+) -> Vec<PathBuf> {
+    let (folder, media, links, source) = match extract_inbox_archive(inbox, zip_path) {
+        Ok(extracted) => extracted,
+        Err(e) => {
+            result.issue(zip_path, e.reason, "import", e.retryable);
+            result.issues.last_mut().unwrap().slow_retry = e.slow_retry;
+            return Vec::new();
+        }
+    };
+    let mut retained = None;
+    let removed = if links > 0 {
+        Err(format!(
+            "{links} symbolic links in the archive were not extracted."
+        ))
+    } else {
+        sync_dir(inbox).and_then(|_| {
+            claim_and_remove(inbox, zip_path, &mut retained, |claimed| {
+                let current = fs::symlink_metadata(claimed).map_err(|e| e.to_string())?;
+                if !same_source(&source.metadata, &current)
+                    || fs::File::open(claimed)
+                        .and_then(|mut file| hash_file(&mut file))
+                        .map_err(|e| e.to_string())?
+                        != source.hash
+                {
+                    return Err("Archive changed while it was being extracted; the changed file was preserved.".into());
+                }
+                Ok(())
+            })
+        })
+    };
+    if let Err(e) = removed {
+        // Not retryable: extracting again would only produce a second copy.
+        result.issue(
+            zip_path,
+            format!(
+                "{e} The archive was kept. Its contents are in {}.",
+                folder.display()
+            ),
+            "cleanup",
+            false,
+        );
+        result.issues.last_mut().unwrap().retry_path = retained;
+    }
+    media
+}
+
+/// File duplicates found in album folders into their album, then remove their
+/// sources. Sources stay in the inbox if the album assignment can't be saved.
+/// Returns false if any assignment wasn't saved.
+fn file_inbox_duplicates(
+    state: &Mutex<Vault>,
+    filing: &mut Vec<(PathBuf, String, SourceProof, String)>,
+    inbox: &std::path::Path,
+    result: &mut ImportResult,
+    notify: &mut impl FnMut(InboxEvent),
+) -> bool {
+    let mut by_album: HashMap<&str, Vec<String>> = HashMap::new();
+    for (_, id, _, album) in filing.iter() {
+        by_album.entry(album).or_default().push(id.clone());
+    }
+    let albums = by_album.len();
+    let failed: HashMap<String, String> = by_album
+        .into_iter()
+        .filter_map(|(album, ids)| {
+            file_existing_into_album(state, &ids, album)
+                .err()
+                .map(|e| (album.to_string(), e))
+        })
+        .collect();
+    if failed.len() < albums {
+        notify(InboxEvent::LibraryChanged);
+    }
+    for (path, id, proof, album) in filing.drain(..) {
+        match failed.get(&album) {
+            Some(e) => result.issue(
+                &path,
+                format!("Could not add existing photo to album: {e}"),
+                "import",
+                true,
+            ),
+            None => {
+                result.skipped += 1;
+                cleanup_inbox_source(state, inbox, &path, &id, &proof, result);
+            }
+        }
+    }
+    failed.is_empty()
+}
+
+/// What `run_inbox_import` reports while it works.
+enum InboxEvent {
+    Progress(ImportProgress),
+    /// An index save added photos, an album, or album filings.
+    LibraryChanged,
+}
+
 /// Import inbox files and remove only plaintext originals whose encrypted
 /// object and index entry are safely persisted. Failed/undecodable files stay
-/// in the inbox so the user can inspect or replace them.
+/// in the inbox so the user can inspect or replace them. Loose files go
+/// first, then each zip is extracted and imported in turn, so one archive's
+/// photos are saved before the next is unpacked. Media under an album marker
+/// is filed into that album.
 fn run_inbox_import(
     files: Vec<PathBuf>,
     key: [u8; 32],
@@ -2929,63 +3697,159 @@ fn run_inbox_import(
     mut hashes: HashMap<String, String>,
     skip_dups: bool,
     inbox: &std::path::Path,
-    mut progress: impl FnMut(ImportProgress),
+    mut notify: impl FnMut(InboxEvent),
     state: &Mutex<Vault>,
 ) -> ImportResult {
-    let total = files.len();
+    let mut result = ImportResult::default();
+    remove_unzip_staging(inbox);
+    let (zips, mut files): (Vec<_>, Vec<_>) = files.into_iter().partition(|p| is_zip_path(p));
+    let mut zips = zips.iter();
+    // Files attempted in earlier groups, and all files found so far.
+    let mut done = 0;
+    let mut total = files.len();
+    // Progress is sent at most twice a second so a large pass doesn't flood the UI.
+    let mut last_progress: Option<Instant> = None;
     let mut batch = Vec::new();
     let mut pending = Vec::new();
-    let mut result = ImportResult::default();
-    for (i, path) in files.iter().enumerate() {
-        if i % 25 == 0 {
-            progress(ImportProgress { done: i, total });
-        }
-        let mut outcome = import_one(&key, &objects, path, &mut hashes, skip_dups);
-        if let ImportOutcome::Skipped(existing, _) = &outcome {
-            if batch.iter().any(|(id, _)| id == existing)
-                && !commit_inbox_batch(state, &mut batch, &mut pending, inbox, &mut result)
-            {
-                for path in &files[i..] {
-                    result.issue(
-                        path,
-                        "Not imported because the index could not be saved.".into(),
-                        "import",
-                        true,
-                    );
+    // Duplicates from album folders, waiting to be filed into their album.
+    let mut filing = Vec::new();
+    let mut albums: HashMap<String, Result<String, String>> = HashMap::new();
+    loop {
+        let mut saved = true;
+        for (i, path) in files.iter().enumerate() {
+            if last_progress.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) {
+                notify(InboxEvent::Progress(ImportProgress {
+                    done: done + i,
+                    total,
+                }));
+                last_progress = Some(Instant::now());
+            }
+            let album = match inbox_album_name(inbox, path).map(|name| {
+                albums.entry(name).or_insert_with_key(|name| {
+                    ensure_album(state, name).map(|(id, created)| {
+                        if created {
+                            notify(InboxEvent::LibraryChanged);
+                        }
+                        id
+                    })
+                })
+            }) {
+                None => None,
+                Some(Ok(id)) => Some(id.clone()),
+                Some(Err(e)) => {
+                    result.issue(path, format!("Could not create album: {e}"), "import", true);
+                    saved = false;
+                    continue;
                 }
-                return result;
-            }
-            if !skipped_target_is_live(state, existing) {
-                outcome = import_one(&key, &objects, path, &mut hashes, false);
-            }
-        }
-        match outcome {
-            ImportOutcome::Added(id, info, proof) => {
-                pending.push((path.clone(), id.clone(), proof));
-                batch.push((id, info));
-                if batch.len() >= 20
-                    && !commit_inbox_batch(state, &mut batch, &mut pending, inbox, &mut result)
+            };
+            let mut outcome = import_one(&key, &objects, path, &mut hashes, skip_dups);
+            if let ImportOutcome::Skipped(existing, _) = &outcome {
+                if batch.iter().any(|(id, _)| id == existing)
+                    && !commit_inbox_batch(
+                        state,
+                        &mut batch,
+                        &mut pending,
+                        inbox,
+                        &mut result,
+                        &mut notify,
+                    )
                 {
-                    for path in &files[i + 1..] {
+                    for path in &files[i..] {
                         result.issue(
                             path,
-                            "Not attempted because the index could not be saved.".into(),
+                            "Not imported because the index could not be saved.".into(),
                             "import",
                             true,
                         );
                     }
-                    return result;
+                    saved = false;
+                    break;
+                }
+                if !skipped_target_is_live(state, existing) {
+                    outcome = import_one(&key, &objects, path, &mut hashes, false);
                 }
             }
-            ImportOutcome::Skipped(id, proof) => {
-                result.skipped += 1;
-                cleanup_inbox_source(state, inbox, path, &id, &proof, &mut result);
+            match outcome {
+                ImportOutcome::Added(id, mut info, proof) => {
+                    info.albums.extend(album);
+                    pending.push((path.clone(), id.clone(), proof));
+                    batch.push((id, info));
+                    if batch.len() >= 20
+                        && !commit_inbox_batch(
+                            state,
+                            &mut batch,
+                            &mut pending,
+                            inbox,
+                            &mut result,
+                            &mut notify,
+                        )
+                    {
+                        for path in &files[i + 1..] {
+                            result.issue(
+                                path,
+                                "Not attempted because the index could not be saved.".into(),
+                                "import",
+                                true,
+                            );
+                        }
+                        saved = false;
+                        break;
+                    }
+                }
+                ImportOutcome::Skipped(id, proof) => match album {
+                    Some(album) => {
+                        filing.push((path.clone(), id, proof, album));
+                        if filing.len() >= 20
+                            && !file_inbox_duplicates(
+                                state,
+                                &mut filing,
+                                inbox,
+                                &mut result,
+                                &mut notify,
+                            )
+                        {
+                            saved = false;
+                        }
+                    }
+                    None => {
+                        result.skipped += 1;
+                        cleanup_inbox_source(state, inbox, path, &id, &proof, &mut result);
+                    }
+                },
+                ImportOutcome::Failed(e) => result.issue(path, e.reason, "import", e.retryable),
             }
-            ImportOutcome::Failed(e) => result.issue(path, e.reason, "import", e.retryable),
         }
+        done += files.len();
+        // Save this group before unpacking the next zip, which can take minutes.
+        // Always try: a failed album save still leaves other photos to commit.
+        let committed = commit_inbox_batch(
+            state,
+            &mut batch,
+            &mut pending,
+            inbox,
+            &mut result,
+            &mut notify,
+        );
+        let filed = file_inbox_duplicates(state, &mut filing, inbox, &mut result, &mut notify);
+        if !(saved && committed && filed) {
+            for zip in zips.by_ref() {
+                result.issue(
+                    zip,
+                    "Not attempted because the index could not be saved.".into(),
+                    "import",
+                    true,
+                );
+            }
+        }
+        let Some(zip) = zips.next() else { break };
+        // A zero total tells the UI an archive is being unpacked.
+        notify(InboxEvent::Progress(ImportProgress { done: 0, total: 0 }));
+        last_progress = None;
+        files = unzip_inbox_archive(inbox, zip, &mut result);
+        sort_paths_by_name(&mut files);
+        total += files.len();
     }
-    commit_inbox_batch(state, &mut batch, &mut pending, inbox, &mut result);
-    progress(ImportProgress { done: total, total });
+    notify(InboxEvent::Progress(ImportProgress { done: total, total }));
     result
 }
 
@@ -3013,7 +3877,7 @@ fn cleanup_inbox_source(
         // Old objects may predate durable writes. Verify and sync duplicates before discarding plaintext.
         let object = vault.objects_dir().join(id);
         let encrypted = fs::read(&object).map_err(|e| e.to_string())?;
-        if blake3::hash(&decrypt(&key, &encrypted)?) != proof.hash {
+        if blake3::hash(&decrypt_owned(&key, encrypted)?) != proof.hash {
             return Err("Saved encrypted original is damaged.".into());
         }
         fs::File::open(&object)
@@ -3037,8 +3901,14 @@ fn commit_inbox_batch(
     pending: &mut Vec<(PathBuf, String, SourceProof)>,
     inbox: &std::path::Path,
     result: &mut ImportResult,
+    notify: &mut impl FnMut(InboxEvent),
 ) -> bool {
+    if batch.is_empty() {
+        return true;
+    }
     if let Err(e) = flush_batch(state, batch) {
+        // A lock failure leaves the batch intact; never commit it after reporting it failed.
+        batch.clear();
         for (path, _, _) in pending.drain(..) {
             result.issue(
                 &path,
@@ -3049,6 +3919,7 @@ fn commit_inbox_batch(
         }
         return false;
     }
+    notify(InboxEvent::LibraryChanged);
     result.imported += pending.len();
     for (path, id, proof) in pending.drain(..) {
         cleanup_inbox_source(state, inbox, &path, &id, &proof, result);
@@ -3101,8 +3972,10 @@ async fn process_inbox(
         hashes,
         skip_dups,
         &inbox,
-        |progress| {
-            let _ = app.emit("import-progress", progress);
+        |event| {
+            if let InboxEvent::Progress(progress) = event {
+                let _ = app.emit("import-progress", progress);
+            }
         },
         &state,
     ))
@@ -3125,11 +3998,21 @@ struct InboxRetry {
 }
 
 impl InboxRetry {
-    fn record(signature: FileSig, previous: Option<&Self>, retryable: bool, now: Instant) -> Self {
+    fn record(
+        signature: FileSig,
+        previous: Option<&Self>,
+        retryable: bool,
+        slow: bool,
+        now: Instant,
+    ) -> Self {
         let attempts = previous
             .filter(|p| p.signature == signature)
             .map_or(1, |p| p.attempts.saturating_add(1));
-        let delay = 2u64.saturating_pow(attempts.min(6)).min(60);
+        let delay = match (slow, attempts) {
+            (true, 1) => 10 * 60,
+            (true, _) => 30 * 60,
+            (false, _) => 2u64.saturating_pow(attempts.min(6)).min(60),
+        };
         Self {
             signature,
             attempts,
@@ -3162,7 +4045,13 @@ fn inbox_retry_after_failure(
         retry.signature = retry_sig;
         retry
     });
-    let retry = InboxRetry::record(retry_sig, previous.as_ref(), issue.retryable, now);
+    let retry = InboxRetry::record(
+        retry_sig,
+        previous.as_ref(),
+        issue.retryable,
+        issue.slow_retry,
+        now,
+    );
     (retry_path.to_path_buf(), retry)
 }
 
@@ -3191,7 +4080,7 @@ fn inbox_watcher(app: tauri::AppHandle) {
         if ready.is_empty() {
             continue;
         }
-        let _import_guard = match claim_import(&*state) {
+        let _import_guard = match claim_background_import(&*state) {
             Ok(guard) => guard,
             Err(_) => continue,
         };
@@ -3212,7 +4101,15 @@ fn inbox_watcher(app: tauri::AppHandle) {
             hashes,
             skip_dups,
             &inbox,
-            |_| {},
+            |event| match event {
+                InboxEvent::Progress(progress) => {
+                    let _ = app.emit("inbox-progress", progress);
+                }
+                // Lets the UI show photos and albums as soon as they're saved.
+                InboxEvent::LibraryChanged => {
+                    let _ = app.emit("library-changed", ());
+                }
+            },
             &state,
         );
         for (path, sig) in ready {
@@ -3321,6 +4218,9 @@ fn main() {
                 dir,
                 inbox,
                 key: None,
+                pending_recovery: None,
+                session: 0,
+                lock_unreported: false,
                 photos: HashMap::new(),
                 albums: HashMap::new(),
                 recovery_required: false,
@@ -3366,6 +4266,7 @@ fn main() {
             touch_activity,
             change_password,
             recovery_generate,
+            recovery_confirm,
             recovery_disable,
             recovery_unlock,
             touchid_available,
@@ -3413,6 +4314,9 @@ mod tests {
             dir,
             inbox: PathBuf::new(),
             key,
+            pending_recovery: None,
+            session: 0,
+            lock_unreported: false,
             photos: HashMap::new(),
             albums: HashMap::new(),
             recovery_required: false,
@@ -3627,7 +4531,17 @@ mod tests {
         let (_, proof) = read_source(&plaintext).unwrap();
         let mut pending = vec![(plaintext.clone(), "id".into(), proof)];
         let mut result = ImportResult::default();
-        assert!(!commit_inbox_batch(&state, &mut batch, &mut pending, &inbox, &mut result));
+        let mut changed = false;
+        let mut notify = |_| changed = true;
+        assert!(!commit_inbox_batch(
+            &state,
+            &mut batch,
+            &mut pending,
+            &inbox,
+            &mut result,
+            &mut notify
+        ));
+        assert!(!changed);
         assert_eq!(result.imported, 0);
         assert_eq!(result.failed, 1);
         assert!(plaintext.exists());
@@ -3912,6 +4826,9 @@ mod tests {
             dir: PathBuf::new(),
             inbox: PathBuf::new(),
             key: None,
+            pending_recovery: None,
+            session: 0,
+            lock_unreported: false,
             photos: HashMap::new(),
             albums: HashMap::new(),
             recovery_required: false,
@@ -3978,6 +4895,11 @@ mod tests {
         prune_empty_dirs(&root, &root.join("Keep"));
         assert!(root.join("Keep/left.jpg").exists());
         assert!(root.join("Keep/.DS_Store").exists());
+        // An extracted zip folder holding only its album marker goes too.
+        fs::create_dir_all(root.join("Zip")).unwrap();
+        fs::write(root.join("Zip").join(INBOX_ALBUM_MARKER), b"Zip").unwrap();
+        prune_empty_dirs(&root, &root.join("Zip"));
+        assert!(!root.join("Zip").exists());
         // Never climbs above the inbox root.
         prune_empty_dirs(&root.join("nope"), &root);
         assert!(root.exists());
@@ -4026,7 +4948,7 @@ mod tests {
             path
         }
 
-        fn run(&self, files: Vec<PathBuf>, progress: impl FnMut(ImportProgress)) -> ImportResult {
+        fn run(&self, files: Vec<PathBuf>, notify: impl FnMut(InboxEvent)) -> ImportResult {
             let vault = vlock(&self.state);
             let objects = vault.objects_dir();
             let hashes = existing_hashes(&vault);
@@ -4038,7 +4960,7 @@ mod tests {
                 hashes,
                 true,
                 &self.inbox,
-                progress,
+                notify,
                 &self.state,
             )
         }
@@ -4048,6 +4970,217 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn png_bytes(color: u8) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(2, 2, image::Rgb([color, 1, 2]))
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    fn write_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn inbox_names(inbox: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(inbox)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn inbox_zip_is_extracted_into_an_album_named_after_it() {
+        let fixture = ImportFixture::new();
+        let owned = fixture.inbox.join("owned.png");
+        fs::write(&owned, png_bytes(9)).unwrap();
+        assert_eq!(fixture.run(vec![owned], |_| {}).imported, 1);
+
+        let zip_path = fixture.inbox.join("Summer Trip.zip");
+        let inner = fixture.root.join("inner.zip");
+        write_zip(&inner, &[("deep.png", &png_bytes(5))]);
+        write_zip(
+            &zip_path,
+            &[
+                ("a.png", &png_bytes(1)),
+                ("./day2/b.png", &png_bytes(2)),
+                ("owned-again.png", &png_bytes(9)),
+                ("notes.txt", b"kept"),
+                (".trashed-c.png", &png_bytes(3)),
+                ("nested.zip", &fs::read(&inner).unwrap()),
+                ("__MACOSX/._a.png", b"resource fork"),
+                (INBOX_ALBUM_MARKER, b"Hijacked"),
+                ("day2/.photovault-album", b"Hijacked"),
+            ],
+        );
+        let result = fixture.run(vec![zip_path.clone()], |_| {});
+        assert_eq!((result.imported, result.skipped, result.failed), (2, 1, 0));
+        assert!(!zip_path.exists());
+        // Files that aren't imported stay behind; everything imported is gone.
+        let folder = fixture.inbox.join("Summer Trip");
+        assert_eq!(inbox_names(&fixture.inbox), ["Summer Trip"]);
+        assert_eq!(
+            inbox_names(&folder),
+            [
+                INBOX_ALBUM_MARKER,
+                ".trashed-c.png",
+                "nested.zip",
+                "notes.txt"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(folder.join(INBOX_ALBUM_MARKER)).unwrap(),
+            "Summer Trip"
+        );
+        // A nested zip is not unpacked on later passes.
+        let mut found = Vec::new();
+        scan_inbox_media(&fixture.inbox, 0, &mut found);
+        assert!(found.is_empty());
+        {
+            let vault = vlock(&fixture.state);
+            assert_eq!(vault.albums.len(), 1);
+            let (album, info) = vault.albums.iter().next().unwrap();
+            assert_eq!(info.name, "Summer Trip");
+            assert_eq!(vault.photos.len(), 3);
+            // The duplicate of an owned photo is filed into the album too.
+            assert!(vault.photos.values().all(|p| p.albums == [album.clone()]));
+        }
+
+        // A later zip with the same name (ignoring case) reuses the album, and
+        // a folder left with nothing but its marker is removed.
+        let again = fixture.inbox.join("summer trip.zip");
+        write_zip(&again, &[("c.png", &png_bytes(4))]);
+        let result = fixture.run(vec![again], |_| {});
+        assert_eq!((result.imported, result.failed), (1, 0));
+        assert_eq!(inbox_names(&fixture.inbox), ["Summer Trip"]);
+        let vault = vlock(&fixture.state);
+        assert_eq!(vault.albums.len(), 1);
+        assert_eq!(vault.photos.len(), 4);
+        assert!(vault.photos.values().all(|p| p.albums.len() == 1));
+    }
+
+    #[test]
+    fn extracted_files_keep_the_archive_timestamp() {
+        let fixture = ImportFixture::new();
+        let zip_path = fixture.inbox.join("Dated.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32
+            + 86400;
+        let entries = [
+            ("a.png", 1_588_748_890u32),
+            ("notes.txt", 1_588_748_890),
+            ("later.txt", future),
+        ];
+        for (name, secs) in entries {
+            let mut opts = zip::write::FullFileOptions::default();
+            // Extended timestamp field: flags (modified time present), then UTC seconds.
+            let mut field = vec![1u8];
+            field.extend_from_slice(&secs.to_le_bytes());
+            opts.add_extra_data(0x5455, field.into_boxed_slice(), false)
+                .unwrap();
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(&png_bytes(1)).unwrap();
+        }
+        zip.finish().unwrap();
+        assert_eq!(fixture.run(vec![zip_path], |_| {}).imported, 1);
+        let modified = |name: &str| {
+            fs::metadata(fixture.inbox.join("Dated").join(name))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        assert_eq!(
+            modified("notes.txt"),
+            UNIX_EPOCH + Duration::from_secs(1_588_748_890)
+        );
+        assert!(modified("later.txt") <= SystemTime::now());
+    }
+
+    #[test]
+    fn zip_with_symlinks_or_a_replaced_path_is_kept() {
+        let fixture = ImportFixture::new();
+        let linked = fixture.inbox.join("Linked.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&linked).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("a.png", opts).unwrap();
+        zip.write_all(&png_bytes(1)).unwrap();
+        zip.add_symlink("link.png", "a.png", opts).unwrap();
+        zip.finish().unwrap();
+        let result = fixture.run(vec![linked.clone()], |_| {});
+        assert_eq!((result.imported, result.cleanup_failed), (1, 1));
+        assert!(!result.issues[0].retryable);
+        assert!(result.issues[0].reason.contains("symbolic links"));
+        assert!(linked.exists());
+
+        // A new zip saved at the same path during cleanup is left untouched.
+        let replaced = fixture.inbox.join("Replaced.zip");
+        write_zip(&replaced, &[("b.png", &png_bytes(2))]);
+        let path = replaced.clone();
+        AFTER_SOURCE_CLAIM.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(path, b"newer zip").unwrap()))
+        });
+        let result = fixture.run(vec![replaced.clone()], |_| {});
+        assert_eq!((result.imported, result.cleanup_failed), (1, 0));
+        assert_eq!(fs::read(&replaced).unwrap(), b"newer zip");
+    }
+
+    #[test]
+    fn manual_import_ignores_zips() {
+        let fixture = ImportFixture::new();
+        fixture.photo("a.png", 1);
+        write_zip(&fixture.inbox.join("b.zip"), &[("c.png", &png_bytes(2))]);
+        let found = collect_files(
+            &[fixture.inbox.to_string_lossy().into_owned()],
+            &mut ImportResult::default(),
+        );
+        assert_eq!(found, [fixture.inbox.join("a.png")]);
+    }
+
+    #[test]
+    fn unusable_zips_are_kept_and_reported_without_writing_files() {
+        let fixture = ImportFixture::new();
+        let escaping = fixture.inbox.join("escaping.zip");
+        write_zip(&escaping, &[("../evil.png", &png_bytes(1))]);
+        let empty = fixture.inbox.join("documents.zip");
+        write_zip(&empty, &[("notes.txt", b"not media")]);
+        let broken = fixture.inbox.join("broken.zip");
+        fs::write(&broken, b"not a zip").unwrap();
+        let result = fixture.run(vec![escaping, empty, broken], |_| {});
+        assert_eq!((result.imported, result.failed), (0, 3));
+        assert!(result.issues.iter().all(|issue| !issue.retryable));
+        assert!(result.issues[0].reason.contains("unsafe path"));
+        assert!(result.issues[1].reason.contains("no photos or videos"));
+        assert_eq!(
+            inbox_names(&fixture.inbox),
+            ["broken.zip", "documents.zip", "escaping.zip"]
+        );
+        assert!(!fixture.root.join("evil.png").exists());
+        assert!(vlock(&fixture.state).albums.is_empty());
+    }
+
+    #[test]
+    fn interrupted_extraction_staging_is_discarded() {
+        let fixture = ImportFixture::new();
+        let staging = fixture.inbox.join(format!("{UNZIP_STAGING_PREFIX}crashed"));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("half.png"), b"partial").unwrap();
+        let photo = fixture.photo("loose.png", 4);
+        assert_eq!(fixture.run(vec![photo], |_| {}).imported, 1);
+        assert!(inbox_names(&fixture.inbox).is_empty());
     }
 
     #[test]
@@ -4163,7 +5296,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(result.issues[0].retry_path.as_ref(), Some(&found[0].0));
         let now = Instant::now();
-        let retry = InboxRetry::record(found[0].1, None, true, now);
+        let retry = InboxRetry::record(found[0].1, None, true, false, now);
         assert!(!retry.ready(found[0].1, now));
         assert_eq!(fs::read(&found[0].0).unwrap(), original);
         let retried = fixture.run(vec![found[0].0.clone()], |_| {});
@@ -4199,9 +5332,10 @@ mod tests {
             .map(|i| fixture.photo(&format!("{i}.png"), i))
             .collect();
         let index_tmp = vlock(&fixture.state).index_path().with_extension("tmp");
-        let result = fixture.run(files.clone(), |progress| {
-            if progress.done == 25 {
-                fs::create_dir(&index_tmp).unwrap();
+        // Block index saves once the first batch is saved.
+        let result = fixture.run(files.clone(), |event| {
+            if matches!(event, InboxEvent::LibraryChanged) {
+                let _ = fs::create_dir(&index_tmp);
             }
         });
         assert_eq!(
@@ -4239,19 +5373,166 @@ mod tests {
         let path = fixture.photo("source.png", 1);
         let sig = file_signature(&fs::metadata(&path).unwrap());
         let now = Instant::now();
-        let mut retry = InboxRetry::record(sig, None, true, now);
+        let mut retry = InboxRetry::record(sig, None, true, false, now);
         assert!(!retry.ready(sig, now));
         assert!(retry.ready(sig, now + Duration::from_secs(2)));
         for _ in 0..100 {
-            retry = InboxRetry::record(sig, Some(&retry), true, now);
+            retry = InboxRetry::record(sig, Some(&retry), true, false, now);
         }
         assert!(retry.ready(sig, now + Duration::from_secs(60)));
-        let permanent = InboxRetry::record(sig, None, false, now);
+        // A full disk waits 10 minutes, then 30, so retries don't keep refilling it.
+        let slow = InboxRetry::record(sig, None, true, true, now);
+        assert!(!slow.ready(sig, now + Duration::from_secs(599)));
+        assert!(slow.ready(sig, now + Duration::from_secs(600)));
+        let slow = InboxRetry::record(sig, Some(&slow), true, true, now);
+        assert!(!slow.ready(sig, now + Duration::from_secs(1799)));
+        assert!(slow.ready(sig, now + Duration::from_secs(1800)));
+        let permanent = InboxRetry::record(sig, None, false, false, now);
         assert!(!permanent.ready(sig, now + Duration::from_secs(86400)));
         fs::remove_file(&path).unwrap();
         fixture.photo("source.png", 2);
         let replaced = file_signature(&fs::metadata(path).unwrap());
         assert!(permanent.ready(replaced, now));
+    }
+
+    #[test]
+    fn full_disk_zip_failures_retry_after_a_long_wait() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::StorageFull, ErrorKind::ReadOnlyFilesystem] {
+            let failure = unzip_io_failure(Error::from(kind));
+            assert!(failure.retryable && failure.slow_retry);
+            assert!(failure.reason.ends_with("It will be retried later."));
+        }
+        for kind in [ErrorKind::InvalidFilename, ErrorKind::InvalidData] {
+            let failure = unzip_io_failure(Error::from(kind));
+            assert!(!failure.retryable && !failure.slow_retry);
+        }
+        assert!(!unzip_io_failure(Error::from(ErrorKind::Interrupted)).slow_retry);
+
+        let path = PathBuf::from("/inbox/Trip.zip");
+        let failure = unzip_io_failure(Error::from(ErrorKind::StorageFull));
+        let mut result = ImportResult::default();
+        result.issue(&path, failure.reason, "import", failure.retryable);
+        result.issues[0].slow_retry = failure.slow_retry;
+        let sig = (0, UNIX_EPOCH, 0, 0, 0, 0);
+        let now = Instant::now();
+        let (_, retry) = inbox_retry_after_failure(&path, sig, &result.issues[0], None, now);
+        assert!(!retry.ready(sig, now + Duration::from_secs(60)));
+        assert!(retry.ready(sig, now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn library_change_notifications_follow_index_saves() {
+        let fixture = ImportFixture::new();
+        let files: Vec<_> = (0..45)
+            .map(|i| fixture.photo(&format!("{i:02}.png"), i))
+            .collect();
+        let mut saved = Vec::new();
+        let mut progress = Vec::new();
+        let result = fixture.run(files, |event| match event {
+            InboxEvent::LibraryChanged => saved.push(
+                load_index(&vlock(&fixture.state), &fixture.key)
+                    .unwrap()
+                    .photos
+                    .len(),
+            ),
+            InboxEvent::Progress(p) => progress.push((p.done, p.total)),
+        });
+        assert_eq!(result.imported, 45);
+        // One notification per committed batch, each after its save reached disk.
+        assert_eq!(saved, [20, 40, 45]);
+        assert_eq!(progress.first(), Some(&(0, 45)));
+        assert_eq!(progress.last(), Some(&(45, 45)));
+    }
+
+    #[test]
+    fn album_creation_and_filing_notify_library_changes() {
+        let fixture = ImportFixture::new();
+        let owned = fixture.inbox.join("owned.png");
+        fs::write(&owned, png_bytes(1)).unwrap();
+        let mut changes = 0;
+        fixture.run(vec![owned], |event| {
+            changes += matches!(event, InboxEvent::LibraryChanged) as usize;
+        });
+        assert_eq!(changes, 1);
+
+        // A new album notifies once it's saved, then filing the duplicate into it.
+        let zip_path = fixture.inbox.join("Trip.zip");
+        write_zip(&zip_path, &[("a.png", &png_bytes(1))]);
+        let mut saved_albums = Vec::new();
+        fixture.run(vec![zip_path], |event| {
+            if matches!(event, InboxEvent::LibraryChanged) {
+                let index = load_index(&vlock(&fixture.state), &fixture.key).unwrap();
+                let filed = index
+                    .photos
+                    .values()
+                    .filter(|p| !p.albums.is_empty())
+                    .count();
+                saved_albums.push((index.albums.len(), filed));
+            }
+        });
+        assert_eq!(saved_albums, [(1, 0), (1, 1)]);
+
+        // Reusing the album doesn't notify; only the new photo's batch does.
+        let again = fixture.inbox.join("trip.zip");
+        write_zip(&again, &[("b.png", &png_bytes(2))]);
+        let mut changes = 0;
+        let result = fixture.run(vec![again], |event| {
+            changes += matches!(event, InboxEvent::LibraryChanged) as usize;
+        });
+        assert_eq!((result.imported, changes), (1, 1));
+        assert_eq!(vlock(&fixture.state).albums.len(), 1);
+    }
+
+    #[test]
+    fn inbox_zips_are_imported_one_at_a_time() {
+        let fixture = ImportFixture::new();
+        let first = fixture.inbox.join("A.zip");
+        let second = fixture.inbox.join("B.zip");
+        write_zip(&first, &[("a.png", &png_bytes(1))]);
+        write_zip(&second, &[("b.png", &png_bytes(2))]);
+        let mut saved_before_unzip = Vec::new();
+        let result = fixture.run(vec![first, second], |event| {
+            if let InboxEvent::Progress(ImportProgress { total: 0, .. }) = event {
+                saved_before_unzip.push(vlock(&fixture.state).photos.len());
+            }
+        });
+        assert_eq!((result.imported, result.failed), (2, 0));
+        // The first zip's photo is saved before the second zip is unpacked.
+        assert_eq!(saved_before_unzip, [0, 1]);
+    }
+
+    #[test]
+    fn zip_rewritten_in_place_during_cleanup_is_kept() {
+        let fixture = ImportFixture::new();
+        let zip_path = fixture.inbox.join("Rewritten.zip");
+        write_zip(&zip_path, &[("a.png", &png_bytes(1))]);
+        let inbox = fixture.inbox.clone();
+        let rewritten = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let bytes = rewritten.clone();
+        AFTER_SOURCE_CLAIM.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Same inode and size with the mtime restored: only the contents differ.
+                let claimed = fs::read_dir(&inbox)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| p.to_string_lossy().contains("Pending import"))
+                    .unwrap()
+                    .join("Rewritten.zip");
+                let modified = fs::metadata(&claimed).unwrap().modified().unwrap();
+                let mut data = fs::read(&claimed).unwrap();
+                data[0] ^= 0xff;
+                let mut file = fs::OpenOptions::new().write(true).open(&claimed).unwrap();
+                file.write_all(&data).unwrap();
+                file.set_modified(modified).unwrap();
+                *bytes.borrow_mut() = data;
+            }))
+        });
+        let result = fixture.run(vec![zip_path], |_| {});
+        assert_eq!((result.imported, result.cleanup_failed), (1, 1));
+        assert!(result.issues[0].reason.contains("Archive changed"));
+        let kept = result.issues[0].retry_path.as_ref().unwrap();
+        assert_eq!(fs::read(kept).unwrap(), *rewritten.borrow());
     }
 
     #[test]
@@ -4638,5 +5919,473 @@ mod tests {
         assert!(restored.photos.is_empty());
         assert!(restored.recovery_required);
         assert!(vault.dir.join("index.unconfirmed").exists());
+    }
+
+    #[test]
+    fn background_claims_do_not_hold_off_auto_lock() {
+        let idle_vault = |idle_secs: u64| {
+            let mut vault = test_vault(PathBuf::new(), Some(random_key()));
+            vault.settings.auto_lock_secs = 60;
+            vault.last_activity = Instant::now()
+                .checked_sub(Duration::from_secs(idle_secs))
+                .unwrap();
+            let since = vault.last_activity;
+            (Mutex::new(vault), since)
+        };
+
+        let (state, since) = idle_vault(120);
+        assert!(claim_background_import(&state).is_err());
+        {
+            let mut vault = vlock(&state);
+            assert_eq!(vault.last_activity, since);
+            assert!(!vault.importing);
+            // lock_timer's check, and any later user check, locks it.
+            assert!(vault.idle_too_long());
+            assert!(vault.active_key().is_none());
+            assert!(vault.key.is_none());
+        }
+
+        let (state, since) = idle_vault(30);
+        drop(claim_background_import(&state).unwrap());
+        assert_eq!(vlock(&state).last_activity, since);
+        drop(claim_import(&state).unwrap());
+        assert!(vlock(&state).last_activity > since);
+
+        let (state, _) = idle_vault(120);
+        assert!(claim_import(&state).is_err());
+        assert!(vlock(&state).key.is_none());
+    }
+
+    fn library_json(
+        photos: &HashMap<String, PhotoInfo>,
+        albums: &HashMap<String, Album>,
+    ) -> serde_json::Value {
+        serde_json::to_value(IndexOut {
+            photos,
+            albums,
+            recovery_required: false,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_library_edits_restore_memory() {
+        let fixture = ImportFixture::new();
+        let key = fixture.key;
+        let mut vault = vlock(&fixture.state);
+        let mut photo = test_photo(None);
+        photo.albums = vec!["album".into()];
+        photo.tags = vec!["beach".into()];
+        vault.photos.insert("photo".into(), photo);
+        vault.photos.insert("other".into(), test_photo(None));
+        for id in ["album", "empty"] {
+            vault.albums.insert(
+                id.into(),
+                Album {
+                    name: id.into(),
+                    created: 1.0,
+                },
+            );
+        }
+        persist_index(&vault, &key).unwrap();
+        let before = library_json(&vault.photos, &vault.albums);
+        let index_tmp = vault.index_path().with_extension("tmp");
+        fs::create_dir(&index_tmp).unwrap();
+        let ids = vec!["photo".to_string(), "other".to_string()];
+        let edits: Vec<(&str, Box<dyn Fn(&mut Vault) -> Result<(), String>>)> = vec![
+            ("album create", Box::new(|v| create_album(v, &key, "New".into()).map(|_| ()))),
+            ("album delete", Box::new(|v| delete_album(v, &key, "album"))),
+            ("assign", Box::new(|v| assign_album(v, &key, &ids, "empty", true))),
+            ("unassign", Box::new(|v| assign_album(v, &key, &ids, "album", false))),
+            ("favorite", Box::new(|v| mark_favorite(v, &key, &ids, true))),
+            ("tags", Box::new(|v| set_photo_tags(v, &key, "photo", vec!["new".into()]))),
+        ];
+        for (name, edit) in &edits {
+            assert!(edit(&mut vault).is_err(), "{name} should fail");
+            assert_eq!(library_json(&vault.photos, &vault.albums), before, "{name}");
+        }
+        // A later successful save must not carry any of the failed edits.
+        fs::remove_dir(&index_tmp).unwrap();
+        persist_index(&vault, &key).unwrap();
+        let index = load_index(&vault, &key).unwrap();
+        assert_eq!(library_json(&index.photos, &index.albums), before);
+        mark_favorite(&mut vault, &key, &ids, true).unwrap();
+        assert!(load_index(&vault, &key).unwrap().photos["photo"].favorite);
+    }
+
+    #[test]
+    fn interrupted_library_save_restores_memory_and_recovers_after_restart() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        vault.photos.insert("photo".into(), test_photo(None));
+        persist_index(&vault, &fixture.key).unwrap();
+        fail_sync_after_index_replacement(vault.dir.clone());
+        assert!(mark_favorite(&mut vault, &fixture.key, &["photo".into()], true).is_err());
+        assert!(!vault.photos["photo"].favorite);
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        let restarted = Mutex::new(test_vault(vault.dir.clone(), None));
+        drop(vault);
+        finish_unlock(&restarted, fixture.key).unwrap();
+        assert!(!vlock(&restarted).photos["photo"].favorite);
+    }
+
+    #[test]
+    fn in_place_crypto_matches_the_object_format() {
+        let key = random_key();
+        let blob = encrypt_owned(&key, b"hello".to_vec()).unwrap();
+        assert_eq!(decrypt(&key, &blob).unwrap(), b"hello");
+        assert_eq!(
+            decrypt_owned(&key, encrypt(&key, b"world").unwrap()).unwrap(),
+            b"world"
+        );
+        let mut tampered = blob.clone();
+        tampered[14] ^= 1;
+        assert!(decrypt_owned(&key, tampered).is_err());
+        assert!(decrypt_owned(&random_key(), blob).is_err());
+        assert!(decrypt_owned(&key, vec![0; 12]).is_err());
+    }
+
+    #[test]
+    fn streamed_source_check_matches_full_read() {
+        let fixture = ImportFixture::new();
+        let path = fixture.photo("photo.png", 7);
+        let (data, proof) = read_source(&path).unwrap();
+        assert!(data.capacity() >= data.len() + ENCRYPTION_OVERHEAD);
+        let streamed = hash_source(&path).unwrap();
+        assert_eq!(streamed.hash, proof.hash);
+        assert!(same_source(&proof.metadata, &streamed.metadata));
+    }
+
+    #[test]
+    fn files_over_the_import_cap_fail_permanently_without_being_read() {
+        let fixture = ImportFixture::new();
+        // Sparse: no real disk space is used.
+        let at_cap = fixture.inbox.join("at-cap.mov");
+        fs::File::create(&at_cap).unwrap().set_len(MAX_IMPORT_BYTES).unwrap();
+        let proof = scan_source(&at_cap, |_, len| {
+            assert_eq!(len, MAX_IMPORT_BYTES);
+            Ok(blake3::hash(b""))
+        });
+        assert!(proof.is_ok());
+        fs::remove_file(&at_cap).unwrap();
+
+        let huge = fixture.inbox.join("huge.mov");
+        fs::File::create(&huge).unwrap().set_len(MAX_IMPORT_BYTES + 1).unwrap();
+        let Err(failure) = hash_source(&huge) else {
+            panic!("an oversized file was accepted");
+        };
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.reason,
+            "File is larger than 4 GB, which PhotoVault can't import yet."
+        );
+
+        // Inbox: reported as permanent, so the watcher doesn't retry it.
+        let signature = file_signature(&fs::metadata(&huge).unwrap());
+        let result = fixture.run(vec![huge.clone()], |_| {});
+        assert_eq!((result.imported, result.failed), (0, 1));
+        assert!(!result.issues[0].retryable);
+        assert!(result.issues[0].reason.contains("larger than 4 GB"));
+        let (_, retry) =
+            inbox_retry_after_failure(&huge, signature, &result.issues[0], None, Instant::now());
+        assert!(!retry.ready(signature, Instant::now() + Duration::from_secs(3600)));
+
+        // Manual import.
+        let objects = vlock(&fixture.state).objects_dir();
+        let manual = run_import(
+            vec![huge.clone()],
+            fixture.key,
+            objects.clone(),
+            HashMap::new(),
+            true,
+            None,
+            |_| {},
+            &fixture.state,
+        )
+        .unwrap();
+        assert_eq!((manual.imported, manual.failed), (0, 1));
+        assert!(!manual.issues[0].retryable);
+        assert!(huge.exists());
+        assert!(vlock(&fixture.state).photos.is_empty());
+        assert_eq!(fs::read_dir(objects).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn background_saves_and_refreshes_do_not_hold_off_auto_lock() {
+        let fixture = ImportFixture::new();
+        let ago = |secs| Instant::now().checked_sub(Duration::from_secs(secs)).unwrap();
+        let since = ago(30);
+        {
+            let mut vault = vlock(&fixture.state);
+            vault.settings.auto_lock_secs = 60;
+            vault.last_activity = since;
+        }
+        // Refreshing the lists and thumbnails doesn't count as use. Opening
+        // full media (like playing a video) does.
+        photo_list(&fixture.state).unwrap();
+        album_list(&fixture.state).unwrap();
+        assert!(media_key(&mut vlock(&fixture.state), true).is_some());
+        assert_eq!(vlock(&fixture.state).last_activity, since);
+        assert!(media_key(&mut vlock(&fixture.state), false).is_some());
+        assert!(vlock(&fixture.state).last_activity > since);
+
+        // A watcher pass whose index save fails, outlasting the auto-lock time.
+        vlock(&fixture.state).last_activity = since;
+        let photo = fixture.photo("a.png", 1);
+        let index_tmp = vlock(&fixture.state).index_path().with_extension("tmp");
+        fs::create_dir(&index_tmp).unwrap();
+        let guard = claim_background_import(&fixture.state).unwrap();
+        let since = ago(120);
+        vlock(&fixture.state).last_activity = since;
+        let result = fixture.run(vec![photo.clone()], |_| {});
+        assert_eq!((result.imported, result.failed), (0, 1));
+        assert!(photo.exists());
+        drop(guard);
+
+        // The UI refreshes after the pass. Those reads see a locked vault and
+        // leave it idle, so lock_timer locks it and tells the UI.
+        assert_eq!(photo_list(&fixture.state).err().as_deref(), Some("locked"));
+        assert_eq!(album_list(&fixture.state).err().as_deref(), Some("locked"));
+        assert!(media_key(&mut vlock(&fixture.state), true).is_none());
+        let vault = vlock(&fixture.state);
+        assert_eq!(vault.last_activity, since);
+        assert!(vault.key.is_some());
+        assert!(vault.idle_too_long());
+    }
+
+    #[test]
+    fn index_save_failure_leaves_later_zips_untouched() {
+        // First the new album can't be saved, then filing a duplicate into an
+        // existing album can't be saved.
+        for album_exists in [false, true] {
+            let fixture = ImportFixture::new();
+            if album_exists {
+                let owned = fixture.inbox.join("owned.png");
+                fs::write(&owned, png_bytes(1)).unwrap();
+                assert_eq!(fixture.run(vec![owned], |_| {}).imported, 1);
+                ensure_album(&fixture.state, "A").unwrap();
+            }
+            let first = fixture.inbox.join("A.zip");
+            let second = fixture.inbox.join("B.zip");
+            write_zip(&first, &[("a.png", &png_bytes(1))]);
+            write_zip(&second, &[("b.png", &png_bytes(2))]);
+            let index_tmp = vlock(&fixture.state).index_path().with_extension("tmp");
+            fs::create_dir(&index_tmp).unwrap();
+            let result = fixture.run(vec![first, second.clone()], |_| {});
+            assert_eq!(result.imported, 0, "album exists: {album_exists}");
+            assert!(second.exists(), "album exists: {album_exists}");
+            assert!(!fixture.inbox.join("B").exists(), "album exists: {album_exists}");
+            let issue = result
+                .issues
+                .iter()
+                .find(|issue| issue.name == second.to_string_lossy())
+                .unwrap();
+            assert_eq!(
+                issue.reason,
+                "Not attempted because the index could not be saved."
+            );
+            assert!(issue.retryable);
+        }
+    }
+
+    fn blank_meta() -> Meta {
+        Meta {
+            salt: String::new(),
+            verifier: String::new(),
+            n: LEGACY_SCRYPT_LOG_N,
+            r: DEFAULT_SCRYPT_R,
+            p: DEFAULT_SCRYPT_P,
+            wrapped_master: None,
+            recovery: None,
+        }
+    }
+
+    /// Whether the recovery key in meta.json is this one.
+    fn recovery_opens(dir: &std::path::Path, key: &[u8; 32], text: &str) -> bool {
+        let wrapped = hex::decode(read_meta(dir).unwrap().recovery.unwrap()).unwrap();
+        decrypt(&parse_recovery_key(text).unwrap(), &wrapped).is_ok_and(|m| m == key)
+    }
+
+    #[test]
+    fn recovery_key_is_saved_only_after_it_is_confirmed() {
+        let fixture = ImportFixture::new();
+        let dir = vlock(&fixture.state).dir.clone();
+        let opens = |text: &str| recovery_opens(&dir, &fixture.key, text);
+        let mut meta = blank_meta();
+        rewrap_master(&mut meta, "first password", &fixture.key).unwrap();
+        let old = random_key();
+        meta.recovery = Some(hex::encode(encrypt(&old, &fixture.key).unwrap()));
+        write_meta(&dir, &meta).unwrap();
+        persist_index(&vlock(&fixture.state), &fixture.key).unwrap();
+        let old = format_recovery_key(&old);
+
+        // Generated but not confirmed: only the old key opens the vault.
+        let shown = generate_recovery_key(&fixture.state).unwrap();
+        assert!(opens(&old) && !opens(&shown.key));
+
+        // Locking drops the new key, so confirming fails and the old key still unlocks.
+        wipe_vault(&mut vlock(&fixture.state));
+        assert!(confirm_recovery_key(&fixture.state, &shown.id).is_err());
+        assert!(opens(&old) && !opens(&shown.key));
+        unlock_with_recovery_key(&old, "second password", &fixture.state).unwrap();
+        assert!(vlock(&fixture.state).key.is_some());
+        assert!(confirm_recovery_key(&fixture.state, &shown.id).is_err());
+
+        // Done on a replaced key fails and writes nothing, even though a newer
+        // key is waiting. Done on the shown key saves it and retires the old one.
+        let replaced = generate_recovery_key(&fixture.state).unwrap();
+        let latest = generate_recovery_key(&fixture.state).unwrap();
+        let files = || (fs::read(dir.join("meta.json")).unwrap(), fs::read(dir.join("meta.bak")).unwrap());
+        let before = files();
+        assert!(confirm_recovery_key(&fixture.state, &replaced.id).is_err());
+        assert_eq!(files(), before);
+        assert!(vlock(&fixture.state).pending_recovery.is_some());
+        let confirmed = confirm_recovery_key(&fixture.state, &latest.id).unwrap();
+        assert!(confirmed.warning.is_none());
+        assert!(opens(&latest.key) && !opens(&replaced.key) && !opens(&old));
+        assert!(vlock(&fixture.state).pending_recovery.is_none());
+        assert!(confirm_recovery_key(&fixture.state, &latest.id).is_err());
+    }
+
+    #[test]
+    fn recovery_confirm_that_waited_across_a_lock_and_unlock_saves_nothing() {
+        let fixture = ImportFixture::new();
+        let dir = vlock(&fixture.state).dir.clone();
+        write_meta(&dir, &blank_meta()).unwrap();
+        persist_index(&vlock(&fixture.state), &fixture.key).unwrap();
+        let shown = generate_recovery_key(&fixture.state).unwrap();
+        let meta_mutex = vlock(&fixture.state).meta_lock.clone();
+        let meta_guard = meta_lock(&meta_mutex);
+        std::thread::scope(|scope| {
+            let confirming = scope.spawn(|| confirm_recovery_key(&fixture.state, &shown.id));
+            // The confirm clones the meta lock while it reads the session, then waits.
+            while Arc::strong_count(&meta_mutex) < 3 {
+                std::thread::yield_now();
+            }
+            wipe_vault(&mut vlock(&fixture.state));
+            finish_unlock(&fixture.state, fixture.key).unwrap();
+            // Unlock restores the same master key. Even a pending key with the
+            // same id belongs to the new session, so the old confirm can't save it.
+            vlock(&fixture.state).pending_recovery = Some((shown.id.clone(), Zeroizing::new(random_key())));
+            drop(meta_guard);
+            assert!(confirming.join().unwrap().is_err());
+        });
+        assert!(read_meta(&dir).unwrap().recovery.is_none());
+        assert!(vlock(&fixture.state).pending_recovery.is_some());
+    }
+
+    #[test]
+    fn recovery_confirm_reports_whether_the_new_key_replaced_the_old_one() {
+        let fixture = ImportFixture::new();
+        let dir = vlock(&fixture.state).dir.clone();
+        let opens = |text: &str| recovery_opens(&dir, &fixture.key, text);
+        let old = random_key();
+        let mut meta = blank_meta();
+        meta.recovery = Some(hex::encode(encrypt(&old, &fixture.key).unwrap()));
+        write_meta(&dir, &meta).unwrap();
+        let old = format_recovery_key(&old);
+        let shown = generate_recovery_key(&fixture.state).unwrap();
+
+        // The backup's sync fails before meta.json is touched: an error, and the
+        // old key still works.
+        FAIL_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(dir.clone()));
+        assert!(confirm_recovery_key(&fixture.state, &shown.id).is_err());
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        assert!(opens(&old) && !opens(&shown.key));
+        assert!(vlock(&fixture.state).pending_recovery.is_some());
+
+        // The sync fails after meta.json is replaced: the new key is the one
+        // that works, so it's saved with a warning and no longer pending.
+        FAIL_SYNC_AFTER_REPLACING.with(|path| *path.borrow_mut() = Some(dir.join("meta.json")));
+        let confirmed = confirm_recovery_key(&fixture.state, &shown.id).unwrap();
+        FAIL_SYNC_AFTER_REPLACING.with(|path| path.borrow_mut().take());
+        FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        assert!(confirmed.warning.unwrap().contains("any old key no longer works"));
+        assert!(opens(&shown.key) && !opens(&old));
+        assert!(vlock(&fixture.state).pending_recovery.is_none());
+    }
+
+    #[test]
+    fn lock_timer_reports_each_lock_the_ui_was_not_told_about() {
+        let mut vault = test_vault(PathBuf::new(), Some(random_key()));
+        vault.settings.auto_lock_secs = 60;
+        let idle = |vault: &mut Vault| {
+            vault.last_activity = Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
+        };
+        assert!(!lock_tick(&mut vault, false));
+
+        // A command or touch_activity finds the vault idle and wipes it
+        // instead of reviving it. The next pass reports that once.
+        idle(&mut vault);
+        assert!(vault.active_key().is_none());
+        assert!(lock_tick(&mut vault, false));
+        assert!(!lock_tick(&mut vault, false));
+
+        // The timer's own idle lock and a missed sleep are reported once too.
+        vault.key = Some(random_key());
+        idle(&mut vault);
+        assert!(lock_tick(&mut vault, false));
+        assert!(!lock_tick(&mut vault, false));
+        vault.key = Some(random_key());
+        vault.last_activity = Instant::now();
+        assert!(lock_tick(&mut vault, true));
+        assert!(!lock_tick(&mut vault, true));
+
+        // A lock the UI already knows about isn't reported again.
+        vault.key = Some(random_key());
+        wipe_vault(&mut vault);
+        vault.lock_unreported = false;
+        assert!(!lock_tick(&mut vault, false));
+
+        // An unlock before the next pass drops the stale report.
+        vault.key = Some(random_key());
+        wipe_vault(&mut vault);
+        vault.key = Some(random_key());
+        assert!(!lock_tick(&mut vault, false));
+        wipe_vault(&mut vault);
+        vault.lock_unreported = false;
+        assert!(!lock_tick(&mut vault, false));
+    }
+
+    #[test]
+    fn source_reads_stop_at_the_checked_size() {
+        let data = read_capped(&mut &b"12345"[..], 5).unwrap();
+        assert_eq!(data, b"12345");
+        assert!(data.capacity() >= 5 + ENCRYPTION_OVERHEAD);
+        // The file grew after its size was checked.
+        let grown = read_capped(&mut &b"123456"[..], 5).unwrap_err();
+        assert_eq!(grown.to_string(), "Source changed while it was being read.");
+        let huge = read_capped(&mut &b""[..], isize::MAX as u64).unwrap_err();
+        assert_eq!(huge.to_string(), "Not enough memory to import this file.");
+    }
+
+    #[test]
+    fn failed_settings_save_keeps_the_old_file() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        save_settings(&vault).unwrap();
+        let before = fs::read(vault.settings_path()).unwrap();
+        vault.settings.auto_lock_secs = 5;
+        fs::create_dir(vault.dir.join("settings.json.tmp")).unwrap();
+        assert!(save_settings(&vault).is_err());
+        assert_eq!(fs::read(vault.settings_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn settings_save_counts_once_the_new_file_is_in_place() {
+        let fixture = ImportFixture::new();
+        let mut vault = vlock(&fixture.state);
+        save_settings(&vault).unwrap();
+        vault.settings.auto_lock_secs = 0;
+        // The rename lands but the directory sync fails. A restart reads the new
+        // file, so callers must keep the new values instead of rolling back.
+        FAIL_SYNC_AFTER_REPLACING.with(|path| *path.borrow_mut() = Some(vault.settings_path()));
+        let saved = save_settings(&vault);
+        FAIL_SYNC_AFTER_REPLACING.with(|path| path.borrow_mut().take());
+        let failed_sync = FAIL_DIRECTORY_SYNC.with(|failure| failure.borrow_mut().take());
+        assert_eq!(failed_sync.as_ref(), Some(&vault.dir));
+        assert!(saved.is_ok());
+        let on_disk: Settings = serde_json::from_slice(&fs::read(vault.settings_path()).unwrap()).unwrap();
+        assert_eq!(on_disk.auto_lock_secs, 0);
     }
 }

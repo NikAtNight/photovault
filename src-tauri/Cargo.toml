@@ -23,7 +23,9 @@ base64 = "0.22"
 hex = "0.4"
 blake3 = "1"
 zeroize = "1"
-zip = { version = "2", default-features = false }
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
+# Picks the pure-Rust inflate backend for zip; nothing else uses it directly.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

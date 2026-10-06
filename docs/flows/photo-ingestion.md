@@ -55,9 +55,13 @@ credentials in fixtures or this record.
 
 `collect_files` records discovery failures for requested files and folders.
 `read_source` captures the content hash and identity from an open file, checking
-metadata before and after the read. `import_one` verifies the source again
-after preparing media. `write_object` syncs the encrypted original and thumbnail;
-the objects directory is synced before an index commit can succeed.
+metadata before and after the read. Files over 4 GB (`MAX_IMPORT_BYTES`) fail
+permanently before any read. `read_capped` reads at most the checked size and
+reports a failed allocation as a temporary "Not enough memory" failure.
+`import_one` verifies the source again after preparing media with
+`hash_source`, a streamed blake3 hash plus metadata, so the file isn't loaded
+twice. Encryption and decryption work in place. `write_object` syncs the
+encrypted original and thumbnail; the objects directory is synced before an index commit can succeed.
 
 Both manual and automatic Inbox processing call `run_inbox_import`.
 `commit_inbox_batch` counts committed files, then `cleanup_inbox_source` verifies
@@ -67,8 +71,46 @@ claimed file against the imported source proof. Changed files and failed
 cleanup remain recoverable and scanner-visible, with the location in the report.
 The original pathname is never unlinked after the claim.
 
+`run_inbox_import` imports loose files first, then each zip in turn: it is
+extracted by `unzip_inbox_archive`, its media imported, and that group's
+batch and duplicate filings saved before the next zip is unpacked. If the
+index can't be saved (a batch, a new album, or a duplicate filing), remaining
+zips are left untouched and reported "Not attempted". Entries go to a hidden
+`.photovault-unzip-*` staging folder, which is synced, marked with a `.photovault-album` file holding the zip's name,
+then renamed to a visible folder at the Inbox root. Staging left by a crash is
+discarded on the next pass. `__MACOSX`, `.DS_Store`, and marker entries are
+skipped, so an archive can't choose its own album. Hidden files and nested zips
+are extracted but not imported, and the scanner ignores zips under a marker.
+Extracted files take the entry's UTC extended timestamp, capped at the current
+time, as modified and (on macOS) creation time. The basic zip time has no time
+zone and is ignored.
+The archive is hashed (streamed blake3) from the opened file before
+extraction. The zip is removed through `claim_and_remove`, the same
+rename-then-verify claim used for media, only if it has no symlink entries and
+the claimed file still matches that identity and hash. Unsafe paths, damage,
+archives without media, more than 20 GB or 100,000 entries, and errors that
+waiting won't fix fail permanently and keep the zip. Process Inbox retries
+them. A full, quota-limited, or read-only disk is marked `slow_retry` instead. `inbox_album_name` finds the nearest marker above
+each file, and `ensure_album` reuses a same-named album (ignoring case) or
+creates one. New photos carry the album in their index entry. Duplicates are
+filed in batches by `file_inbox_duplicates` before their sources are removed.
+The watcher emits `inbox-progress` (`{done, total}`) at the start, at most
+every 500ms, and at the end, plus `{0, 0}` before each zip is unpacked. The UI
+shows it as a toast. It emits `library-changed` (null payload) after each saved
+batch, each newly created album, and each duplicate filing; the UI reloads
+albums and photos on that, so a large zip appears in batches. A failed refresh
+stays pending and retries after 1s, 2s, 4s, up to 30s, reporting once per
+streak. `loadAlbums` and `loadGrid` drop stale responses and keep the current
+lists on failure.
+
 `InboxRetry` distinguishes permanent input failures from temporary I/O and
 helper failures. Temporary failures use increasing delays capped at 60 seconds.
+`slow_retry` failures wait 10 minutes, then 30 minutes per repeat. The 4 GB
+cap is permanent. Background work doesn't count as user activity: the watcher
+claims imports with `claim_background_import`, `flush_batch` doesn't touch
+`last_activity`, and `list_photos`, `list_albums`, and thumbnail requests use
+`background_key`. A file that keeps failing can't hold the vault open past
+auto-lock. Full media requests still count, so playing a video does.
 Retry bookkeeping follows a retained recovery path without resetting attempts.
 For failures at the original path, it retains the scanned signature so a
 replacement remains eligible for processing.
