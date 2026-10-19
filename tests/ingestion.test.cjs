@@ -70,7 +70,7 @@ function app() {
     document: { getElementById: element, createElement: tag => new Element(tag),
       createDocumentFragment: () => new Element(), querySelector: element,
       querySelectorAll: () => [], addEventListener: (name, handler) => listeners.set(`dom:${name}`, handler), documentElement: new Element() },
-    window: { addEventListener() {}, __TAURI__: {
+    window: { addEventListener() {}, scrollY: 0, scrollTo() {}, __TAURI__: {
       core: { invoke: async (command, args) => {
         calls.push({ command, args });
         if (state.handlers[command]) return state.handlers[command](args);
@@ -960,4 +960,42 @@ test('settings cannot open over the lock screen after a slow load', async () => 
   available.resolve(true);
   await opening;
   assert.equal(a.element('settings').classList.contains('open'), false);
+});
+
+test('albums view shows a card per album with full-name tooltips, and lock clears the title', async () => {
+  const a = app();
+  const long = 'Grandma <90th> birthday at the lake house';
+  a.state.handlers.list_albums = () => [{ id: 'x', name: long, created: 1 }, { id: 'y', name: 'Pets', created: 2 }];
+  await a.run('loadAlbums()');
+  await a.seed([{ ...photo('old'), albums: ['x'], added: 1 }, { ...photo('new'), albums: ['x'], added: 5 },
+    { ...photo('gone'), albums: ['x'], added: 9, deleted: 9 }]);
+  a.run('currentView = { type: "albums", album: null }; renderPhotos()');
+  const grid = a.element('grid');
+  assert.equal(grid.className, 'albums');
+  assert.equal(a.element('count').textContent, '2 albums');
+  assert.equal(a.element('viewopts').hidden, true);
+  assert.match(grid.innerHTML, /title="Grandma &lt;90th&gt; birthday at the lake house"/);
+  // The newest photo not in Recently Deleted is the cover, and only live photos count.
+  assert.match(grid.innerHTML, /pvmedia:\/\/localhost\/new\/thumb/);
+  assert.match(grid.innerHTML, /2 items/);
+  a.run('query = "pet"; renderPhotos()');
+  assert.equal(a.element('count').textContent, '1 matching album');
+  a.run('query = ""; currentView = { type: "album", album: "x" }; renderPhotos()');
+  assert.equal(a.element('viewtitle').title, long);
+  assert.equal(a.element('viewopts').hidden, false);
+  a.run('clearVaultUI()');
+  assert.equal(a.element('viewtitle').title, undefined);
+});
+
+test('a library refresh, such as after filing into an album, keeps the scroll position', async () => {
+  const a = app();
+  await a.seed(Array.from({ length: 600 }, (_, i) => photo(`p${i}`)));
+  a.run('renderMore(499); window.scrollY = 9000; window.scrollTo = (x, y) => { window.restored = y; }');
+  a.state.photos[3].albums = ['x'];
+  await a.run('loadGrid()');
+  assert.equal(a.run('renderedCount'), 500);
+  assert.equal(a.run('window.restored'), 9000);
+  // Opening another view still starts from the first batch.
+  a.run('window.restored = undefined; currentView = { type: "favorites" }; renderPhotos()');
+  assert.equal(a.run('window.restored'), undefined);
 });

@@ -61,7 +61,7 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   drop anywhere while browsing an album — new photos are filed into it, and
   duplicates you already own are added to the album too. Importing from the
   Import menu while browsing an album does the same. (Create an album with the
-  **+** next to *Albums*; it opens right away, ready for a drop.)
+  **+** next to *My Albums*; it opens right away, ready for a drop.)
 - **Import and export results** retain the latest 50 operations until dismissed
   or the vault locks. Import reports list imported, duplicate, failed, and cleanup-failed
   counts, with file paths and reasons.
@@ -70,9 +70,13 @@ folder in Finder or the CLI shows only random-named opaque blobs.
 - **Formats:** JPEG, PNG, GIF, WebP, BMP, TIFF, **HEIC/HEIF** (iPhone photos,
   converted for thumbnails via macOS `sips`, originals kept), and **video**
   (MP4, MOV, M4V — poster frames via QuickLook, streamed with seeking).
-- **Browse:** sidebar with **All Photos / Favorites / Videos / Recently
-  Deleted / Albums**. Drag its right edge to resize it (double-click the edge
-  to reset); grid or list view; sort by date added, **date taken**
+- **Browse:** sidebar with **All Photos / Favorites / Videos / Albums /
+  Recently Deleted / My Albums**. **Albums** shows every album as a card with
+  its newest photo as the cover, and search filters albums by name there. The
+  chevron next to *My Albums* collapses the sidebar's album list, and the app
+  remembers that choice. Hover a cut-off album name to see all of it. Drag the
+  sidebar's right edge to resize it (double-click the edge to reset); grid or
+  list view; sort by date added, **date taken**
   (EXIF), name, size, or type; **search** by filename (`/` focuses the box).
 - **Sort by multiple columns:** in list view, click **Added**, then
   **Shift-click Name**. Photos group by local calendar day, then sort by name
@@ -126,15 +130,26 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   check the result report for their location. Recovery folders named
   `Pending import ...` stay inside Inbox and are scanned on subsequent passes.
   Encrypted files are synced before the index is saved and originals removed.
+- **Folders in the Inbox** become albums named after the top folder: photos in
+  `Trip/` and `Trip/day1/` both go into *Trip*, and an existing album with that
+  name (any letter case) is reused. Photos you already own are added to the
+  album too, and so are zips inside the folder. Loose files and
+  `Pending import ...` folders get no album. A folder is deleted once its
+  photos are imported and it's empty (a leftover `.DS_Store` doesn't count).
+  Any other file in it, such as notes or documents, keeps it.
 - **Zip files in the Inbox** are unzipped into a folder of the same name, and
   their photos and videos go into an album named after the zip (`Summer
   Trip.zip` files into *Summer Trip*). An existing album with that name, in any
   letter case, is reused. Photos you already own are added to the album too.
   Zips are handled one at a time, so the first zip's photos appear before the
   next one is unpacked. The zip is deleted once it's extracted, unless its
-  contents changed during extraction, in which case it's kept. Files that aren't imported (text,
-  JSON, hidden files, zips inside the zip) stay in the extracted folder.
-  A zip placed inside an extracted folder is left alone. Extracted files keep
+  contents changed during extraction, in which case it's kept. Once every
+  photo and video from the folder is imported, the folder is deleted along
+  with everything else the zip held (text, JSON, hidden files, zips inside the
+  zip). Media that failed to import keeps the folder until it's imported or
+  removed. A zip placed inside an extracted folder isn't unpacked. Extracted
+  folders are marked with a hidden `.photovault-album` file, so don't keep
+  your own files in them. Extracted files keep
   the zip's UTC timestamps when it has them (Finder and `zip` write these).
   Zips that are damaged,
   password protected, hold no media, contain paths escaping the folder, or

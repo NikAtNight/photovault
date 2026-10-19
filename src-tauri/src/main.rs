@@ -42,6 +42,10 @@ const INBOX_MIN_FILE_AGE: Duration = Duration::from_secs(2);
 /// Hidden file naming the album for media in its Inbox folder (written when a zip is extracted).
 const INBOX_ALBUM_MARKER: &str = ".photovault-album";
 const UNZIP_STAGING_PREFIX: &str = ".photovault-unzip-";
+/// How many folders deep the inbox scanner looks below the inbox.
+const INBOX_MAX_DEPTH: u32 = 8;
+/// Inbox folder holding a source that couldn't be removed after import.
+const PENDING_IMPORT_PREFIX: &str = "Pending import ";
 const MAX_UNZIP_BYTES: u64 = 20 << 30;
 const MAX_UNZIP_ENTRIES: usize = 100_000;
 /// Objects are encrypted in one piece, so import holds the whole file in memory.
@@ -2332,7 +2336,7 @@ fn claim_and_remove(
     verify: impl FnOnce(&std::path::Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let parent = path.parent().ok_or("Source has no parent directory.")?;
-    let claimed_dir = inbox.join(format!("Pending import {}", random_id()));
+    let claimed_dir = inbox.join(format!("{PENDING_IMPORT_PREFIX}{}", random_id()));
     create_private_dir(&claimed_dir).map_err(|e| e.to_string())?;
     let claimed = claimed_dir.join(path.file_name().ok_or("Source has no filename.")?);
     if let Err(e) = fs::rename(path, &claimed) {
@@ -3321,7 +3325,7 @@ fn file_signature(metadata: &fs::Metadata) -> FileSig {
 /// symlinks are skipped; depth is bounded so a pathological tree can't wedge
 /// the watcher.
 fn scan_inbox_media(dir: &std::path::Path, depth: u32, out: &mut Vec<(PathBuf, FileSig)>) {
-    if depth > 8 {
+    if depth > INBOX_MAX_DEPTH {
         return;
     }
     if depth == 0 {
@@ -3405,6 +3409,20 @@ fn inbox_album_name(inbox: &std::path::Path, path: &std::path::Path) -> Option<S
         .filter(|name| !name.is_empty() && name.len() <= MAX_PHOTO_NAME_BYTES)
 }
 
+/// The album for media in a folder dropped into the inbox: the top folder's
+/// name, so `Trip/day1/a.jpg` files into *Trip* the way `Trip.zip` would.
+/// Loose files and recovery folders get no album.
+fn inbox_folder_album(inbox: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let mut parts = path.strip_prefix(inbox).ok()?.components();
+    let top = parts.next()?.as_os_str().to_string_lossy();
+    let top = top.trim();
+    parts.next()?;
+    (!top.is_empty()
+        && top.len() <= MAX_PHOTO_NAME_BYTES
+        && !top.starts_with(PENDING_IMPORT_PREFIX))
+    .then(|| top.to_string())
+}
+
 /// The id of the album called `name` (ignoring case), created if none exists,
 /// and whether it was created.
 fn ensure_album(state: &Mutex<Vault>, name: &str) -> Result<(String, bool), String> {
@@ -3446,6 +3464,48 @@ fn remove_unzip_staging(inbox: &std::path::Path) {
             .starts_with(UNZIP_STAGING_PREFIX)
         {
             let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether `dir` still holds media the inbox scanner would import. `depth`
+/// counts from the inbox, as in `scan_inbox_media`. Anything unreadable
+/// counts as media, so it isn't deleted unseen.
+fn holds_inbox_media(dir: &std::path::Path, depth: u32) -> bool {
+    if depth > INBOX_MAX_DEPTH {
+        return false;
+    }
+    let Ok(mut entries) = fs::read_dir(dir) else {
+        return true;
+    };
+    entries.any(|entry| {
+        let Ok((path, ft)) = entry.and_then(|e| Ok((e.path(), e.file_type()?))) else {
+            return true;
+        };
+        if is_hidden(&path) || ft.is_symlink() {
+            false
+        } else if ft.is_dir() {
+            holds_inbox_media(&path, depth + 1)
+        } else {
+            ft.is_file() && is_media_path(&path)
+        }
+    })
+}
+
+/// Delete folders unpacked from inbox zips once no media is left in them to
+/// import. The rest of the zip (text, JSON, hidden files, nested zips) goes
+/// with them, as the zip itself is already gone.
+fn remove_finished_zip_folders(inbox: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(inbox) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let unpacked = entry.file_type().is_ok_and(|ft| ft.is_dir())
+            && !is_hidden(&path)
+            && fs::symlink_metadata(path.join(INBOX_ALBUM_MARKER)).is_ok_and(|m| m.is_file());
+        if unpacked && !holds_inbox_media(&path, 1) {
+            let _ = fs::remove_dir_all(&path);
         }
     }
 }
@@ -3558,7 +3618,7 @@ fn extract_archive(
         }
         // The extracted folder sits one level below the inbox, and the scanner
         // stops eight levels down.
-        if relative.components().count() > 8 {
+        if relative.components().count() > INBOX_MAX_DEPTH as usize {
             return Err(ImportFailure::permanent(format!(
                 "Archive entry is nested too deeply to import: {entry_name}"
             )));
@@ -3613,11 +3673,13 @@ fn extract_inbox_archive(
     inbox: &std::path::Path,
     zip_path: &std::path::Path,
 ) -> Result<(PathBuf, Vec<PathBuf>, usize, SourceProof), ImportFailure> {
-    let album = zip_path
+    let stem = zip_path
         .file_stem()
         .map(|s| s.to_string_lossy().trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ImportFailure::permanent("Archive name can't be used as an album name."))?;
+    // A zip inside a dropped folder joins that folder's album.
+    let album = inbox_folder_album(inbox, zip_path).unwrap_or_else(|| stem.clone());
     let before = fs::symlink_metadata(zip_path).map_err(ImportFailure::temporary)?;
     let mut file = fs::File::open(zip_path).map_err(ImportFailure::temporary)?;
     let metadata = file.metadata().map_err(ImportFailure::temporary)?;
@@ -3646,7 +3708,7 @@ fn extract_inbox_archive(
         )
         .map_err(|e| ImportFailure::temporary(String::from(e)))?;
         // A leading dot would hide the folder from the scanner.
-        let folder = match album.trim_start_matches('.') {
+        let folder = match stem.trim_start_matches('.') {
             "" => "Archive",
             name => name,
         };
@@ -3771,7 +3833,8 @@ enum InboxEvent {
 /// in the inbox so the user can inspect or replace them. Loose files go
 /// first, then each zip is extracted and imported in turn, so one archive's
 /// photos are saved before the next is unpacked. Media under an album marker
-/// is filed into that album.
+/// is filed into that album, and other media in a folder into an album named
+/// after its top folder. Unpacked zip folders with no media left are deleted.
 fn run_inbox_import(
     files: Vec<PathBuf>,
     key: [u8; 32],
@@ -3806,7 +3869,8 @@ fn run_inbox_import(
                 }));
                 last_progress = Some(Instant::now());
             }
-            let album = match inbox_album_name(inbox, path).map(|name| {
+            let name = inbox_album_name(inbox, path).or_else(|| inbox_folder_album(inbox, path));
+            let album = match name.map(|name| {
                 albums.entry(name).or_insert_with_key(|name| {
                     ensure_album(state, name).map(|(id, created)| {
                         if created {
@@ -3931,6 +3995,7 @@ fn run_inbox_import(
         sort_paths_by_name(&mut files);
         total += files.len();
     }
+    remove_finished_zip_folders(inbox);
     notify(InboxEvent::Progress(ImportProgress { done: total, total }));
     result
 }
@@ -4160,6 +4225,11 @@ fn inbox_watcher(app: tauri::AppHandle) {
         retries.retain(|path, retry| cur.get(path) == Some(&retry.signature));
         prev = cur;
         if ready.is_empty() {
+            // Zip folders can also finish when their last photo is removed by
+            // hand, or be left over from an earlier version.
+            if let Ok(_import_guard) = claim_background_import(&*state) {
+                remove_finished_zip_folders(&inbox);
+            }
             continue;
         }
         let _import_guard = match claim_background_import(&*state) {
@@ -5127,12 +5197,13 @@ mod tests {
                 ("__MACOSX/._a.png", b"resource fork"),
                 (INBOX_ALBUM_MARKER, b"Hijacked"),
                 ("day2/.photovault-album", b"Hijacked"),
+                ("bad.png", b"not an image"),
             ],
         );
         let result = fixture.run(vec![zip_path.clone()], |_| {});
-        assert_eq!((result.imported, result.skipped, result.failed), (2, 1, 0));
+        assert_eq!((result.imported, result.skipped, result.failed), (2, 1, 1));
         assert!(!zip_path.exists());
-        // Files that aren't imported stay behind; everything imported is gone.
+        // Media that failed keeps the folder, with everything not imported.
         let folder = fixture.inbox.join("Summer Trip");
         assert_eq!(inbox_names(&fixture.inbox), ["Summer Trip"]);
         assert_eq!(
@@ -5140,6 +5211,7 @@ mod tests {
             [
                 INBOX_ALBUM_MARKER,
                 ".trashed-c.png",
+                "bad.png",
                 "nested.zip",
                 "notes.txt"
             ]
@@ -5151,7 +5223,13 @@ mod tests {
         // A nested zip is not unpacked on later passes.
         let mut found = Vec::new();
         scan_inbox_media(&fixture.inbox, 0, &mut found);
-        assert!(found.is_empty());
+        assert_eq!(found.len(), 1);
+        assert!(found[0].0.ends_with("bad.png"));
+        // Once no media is left, the next pass deletes the folder and the
+        // rest of the zip's contents.
+        fs::remove_file(folder.join("bad.png")).unwrap();
+        fixture.run(Vec::new(), |_| {});
+        assert!(inbox_names(&fixture.inbox).is_empty());
         {
             let vault = vlock(&fixture.state);
             assert_eq!(vault.albums.len(), 1);
@@ -5163,16 +5241,61 @@ mod tests {
         }
 
         // A later zip with the same name (ignoring case) reuses the album, and
-        // a folder left with nothing but its marker is removed.
+        // its folder is removed in the same pass.
         let again = fixture.inbox.join("summer trip.zip");
-        write_zip(&again, &[("c.png", &png_bytes(4))]);
+        write_zip(&again, &[("c.png", &png_bytes(4)), ("notes.txt", b"x")]);
         let result = fixture.run(vec![again], |_| {});
         assert_eq!((result.imported, result.failed), (1, 0));
-        assert_eq!(inbox_names(&fixture.inbox), ["Summer Trip"]);
+        assert!(inbox_names(&fixture.inbox).is_empty());
         let vault = vlock(&fixture.state);
         assert_eq!(vault.albums.len(), 1);
         assert_eq!(vault.photos.len(), 4);
         assert!(vault.photos.values().all(|p| p.albums.len() == 1));
+    }
+
+    #[test]
+    fn inbox_folders_file_into_an_album_named_after_the_top_folder() {
+        let fixture = ImportFixture::new();
+        for dir in ["Trip/day1", "Keep", "Pending import x"] {
+            fs::create_dir_all(fixture.inbox.join(dir)).unwrap();
+        }
+        let owned = fixture.photo("owned.png", 9);
+        assert_eq!(fixture.run(vec![owned], |_| {}).imported, 1);
+        let files = vec![
+            fixture.photo("Trip/a.png", 1),
+            fixture.photo("Trip/day1/b.png", 2),
+            fixture.photo("Trip/day1/owned-again.png", 9),
+            fixture.photo("Keep/c.png", 3),
+            fixture.photo("loose.png", 4),
+            fixture.photo("Pending import x/d.png", 5),
+            fixture.inbox.join("Trip/extra.zip"),
+        ];
+        write_zip(&files[6], &[("e.png", &png_bytes(6))]);
+        fs::write(fixture.inbox.join("Keep/notes.txt"), b"mine").unwrap();
+        let result = fixture.run(files, |_| {});
+        assert_eq!((result.imported, result.skipped, result.failed), (6, 1, 0));
+        // Emptied folders go. A folder you dropped in keeps your other files,
+        // so it stays.
+        assert_eq!(inbox_names(&fixture.inbox), ["Keep"]);
+        assert_eq!(inbox_names(&fixture.inbox.join("Keep")), ["notes.txt"]);
+        let vault = vlock(&fixture.state);
+        let album = |name: &str| {
+            let (id, _) = vault.albums.iter().find(|(_, a)| a.name == name).unwrap();
+            vault
+                .photos
+                .values()
+                .filter(|p| p.albums.contains(id))
+                .map(|p| p.name.clone())
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(vault.albums.len(), 2);
+        assert_eq!(
+            album("Trip"),
+            HashSet::from(["a.png", "b.png", "e.png", "owned.png"].map(String::from))
+        );
+        assert_eq!(album("Keep"), HashSet::from(["c.png".to_string()]));
+        let unfiled = vault.photos.values().filter(|p| p.albums.is_empty());
+        assert_eq!(unfiled.count(), 2);
     }
 
     #[test]
@@ -5185,8 +5308,10 @@ mod tests {
             .unwrap()
             .as_secs() as u32
             + 86400;
+        // The broken photo keeps the folder, so its files can be checked.
         let entries = [
             ("a.png", 1_588_748_890u32),
+            ("bad.png", 1_588_748_890),
             ("notes.txt", 1_588_748_890),
             ("later.txt", future),
         ];
@@ -5198,7 +5323,10 @@ mod tests {
             opts.add_extra_data(0x5455, field.into_boxed_slice(), false)
                 .unwrap();
             zip.start_file(name, opts).unwrap();
-            zip.write_all(&png_bytes(1)).unwrap();
+            match name {
+                "bad.png" => zip.write_all(b"not an image").unwrap(),
+                _ => zip.write_all(&png_bytes(1)).unwrap(),
+            }
         }
         zip.finish().unwrap();
         assert_eq!(fixture.run(vec![zip_path], |_| {}).imported, 1);
