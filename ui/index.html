@@ -125,6 +125,12 @@
   #sidebar .head button { margin-left: auto; background: none; border: 0; color: var(--secondary);
     min-width: 24px; min-height: 24px; border-radius: 6px; font-size: 18px; }
   #sidebar .head button:hover { background: var(--hover); }
+  #sidebar .head .disclose { display: flex; align-items: center; gap: 3px; margin: 0 0 0 -6px;
+    padding: 0 6px; color: inherit; font-size: 11px; font-weight: 600; }
+  #sidebar .head .disclose .icon { width: 12px; height: 12px; stroke-width: 2.2;
+    color: var(--secondary); transform: rotate(90deg); transition: transform .15s; }
+  #sidebar .head .disclose[aria-expanded="false"] .icon { transform: none; }
+  #sidebar .album-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #sidebar .item .tools { display: none; margin-left: auto; gap: 2px; }
   #sidebar .item:hover .tools, #sidebar .item:focus-within .tools { display: flex; }
   #sidebar .item:hover .n, #sidebar .item:focus-within .n { display: none; }
@@ -184,6 +190,18 @@
   .grid .ph .fbadge { position: absolute; top: 8px; left: 8px; color: white; font-size: 15px; text-shadow: 0 1px 4px #000; }
   .grid .ph .vbadge { position: absolute; inset: 0; display: grid; place-items: center;
     font-size: 30px; color: #ffffffe0; text-shadow: 0 1px 6px #000; pointer-events: none; }
+  .albums { display: grid; grid-template-columns: repeat(auto-fill,minmax(176px,1fr));
+    gap: 22px 16px; padding: 20px 24px; }
+  .acard { display: flex; flex-direction: column; min-width: 0; padding: 0; border: 0;
+    border-radius: 12px; background: none; color: var(--text); text-align: left; }
+  .acard .acover { display: grid; place-items: center; aspect-ratio: 1; margin-bottom: 8px;
+    overflow: hidden; border-radius: 12px; background: var(--well); color: var(--secondary); }
+  .acard .acover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .acard .acover .icon { width: 38px; height: 38px; stroke-width: 1.2; opacity: .7; }
+  .acard:hover .acover { filter: brightness(.96); }
+  .acard .aname { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    overflow: hidden; overflow-wrap: anywhere; font-weight: 600; line-height: 1.35; }
+  .acard .acount { color: var(--secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
   .empty { padding: 100px 28px; text-align: center; color: var(--secondary); line-height: 1.9; }
   .empty > .icon { display: block; margin: 0 auto 18px; width: 42px; height: 42px; stroke-width: 1.2; opacity: .7; }
   .empty strong { font-size: 18px; color: var(--text); font-weight: 600; }
@@ -304,6 +322,7 @@
     #sidebar .item .icon { width: 16px; }
     #sidebar .brand { font-size: 14px; }
     .grid { grid-template-columns: repeat(auto-fill,minmax(135px,1fr)); padding: 12px 14px; }
+    .albums { grid-template-columns: repeat(auto-fill,minmax(140px,1fr)); gap: 18px 12px; padding: 14px; }
     #sorthint { padding: 8px 14px; }
     #importresults, #trashbanner, #recoverynotice { margin: 12px 14px; }
     .list th, .list td { padding-left: 6px; padding-right: 6px; }
@@ -321,7 +340,7 @@
 </style>
 </head>
 <body>
-<svg class="symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs><symbol id="icon-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol><symbol id="icon-photos" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.5"/><path d="m5 17 5-5 3 3 3-4 4 6"/></symbol><symbol id="icon-heart" viewBox="0 0 24 24"><path d="M20.8 5.6a5 5 0 0 0-7.1 0L12 7.3l-1.7-1.7a5 5 0 0 0-7.1 7.1L12 21l8.8-8.3a5 5 0 0 0 0-7.1Z"/></symbol><symbol id="icon-video" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="12" rx="3"/><path d="m15 10 6-3v10l-6-3Z"/></symbol><symbol id="icon-duplicate" viewBox="0 0 24 24"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></symbol><symbol id="icon-delete" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></symbol><symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3Z"/></symbol><symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol><symbol id="icon-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol><symbol id="icon-list" viewBox="0 0 24 24"><path d="M8 5h13M8 12h13M8 19h13M3 5h.1M3 12h.1M3 19h.1"/></symbol><symbol id="icon-select" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol><symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="icon-inbox" viewBox="0 0 24 24"><path d="m3 13 3-9h12l3 9v7H3ZM3 13h5l2 3h4l2-3h5"/></symbol><symbol id="icon-settings" viewBox="0 0 24 24"><path d="m10 3-.6 2-2 .9-1.9-.5L3.5 9l1.5 1.5v3L3.5 15l2 3.6 1.9-.5 2 .9.6 2h4l.6-2 2-.9 1.9.5 2-3.6-1.5-1.5v-3L20.5 9l-2-3.6-1.9.5-2-.9L14 3Z"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="icon-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol><symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol><symbol id="icon-play" viewBox="0 0 24 24"><path d="m8 4 12 8-12 8Z"/></symbol><symbol id="icon-export" viewBox="0 0 24 24"><path d="M12 15V3m-4 4 4-4 4 4M6 10H4v11h16V10h-2"/></symbol><symbol id="icon-edit" viewBox="0 0 24 24"><path d="m4 16-1 5 5-1L21 7l-4-4ZM14 6l4 4"/></symbol></defs></svg>
+<svg class="symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs><symbol id="icon-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol><symbol id="icon-photos" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.5"/><path d="m5 17 5-5 3 3 3-4 4 6"/></symbol><symbol id="icon-heart" viewBox="0 0 24 24"><path d="M20.8 5.6a5 5 0 0 0-7.1 0L12 7.3l-1.7-1.7a5 5 0 0 0-7.1 7.1L12 21l8.8-8.3a5 5 0 0 0 0-7.1Z"/></symbol><symbol id="icon-video" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="12" rx="3"/><path d="m15 10 6-3v10l-6-3Z"/></symbol><symbol id="icon-duplicate" viewBox="0 0 24 24"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></symbol><symbol id="icon-delete" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></symbol><symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3Z"/></symbol><symbol id="icon-albums" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="13" rx="2.5"/><path d="M6 5h12M8.5 2h7"/></symbol><symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol><symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol><symbol id="icon-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol><symbol id="icon-list" viewBox="0 0 24 24"><path d="M8 5h13M8 12h13M8 19h13M3 5h.1M3 12h.1M3 19h.1"/></symbol><symbol id="icon-select" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol><symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="icon-inbox" viewBox="0 0 24 24"><path d="m3 13 3-9h12l3 9v7H3ZM3 13h5l2 3h4l2-3h5"/></symbol><symbol id="icon-settings" viewBox="0 0 24 24"><path d="m10 3-.6 2-2 .9-1.9-.5L3.5 9l1.5 1.5v3L3.5 15l2 3.6 1.9-.5 2 .9.6 2h4l.6-2 2-.9 1.9.5 2-3.6-1.5-1.5v-3L20.5 9l-2-3.6-1.9.5-2-.9L14 3Z"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="icon-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol><symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol><symbol id="icon-play" viewBox="0 0 24 24"><path d="m8 4 12 8-12 8Z"/></symbol><symbol id="icon-export" viewBox="0 0 24 24"><path d="M12 15V3m-4 4 4-4 4 4M6 10H4v11h16V10h-2"/></symbol><symbol id="icon-edit" viewBox="0 0 24 24"><path d="m4 16-1 5 5-1L21 7l-4-4ZM14 6l4 4"/></symbol></defs></svg>
 
 <div id="auth" class="center" style="display:none">
   <form class="card" id="authform">
@@ -349,11 +368,11 @@
   <header aria-label="Library toolbar">
     <div class="view-heading"><h1 id="viewtitle">All Photos</h1><span id="count"></span></div>
     <label class="search-field"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg>
-      <span class="sr-only">Search photos and tags</span>
+      <span class="sr-only" id="searchlabel">Search photos and tags</span>
       <input id="search" type="search" placeholder="Search" autocomplete="off" spellcheck="false">
     </label>
     <div class="toolbar-actions">
-      <div class="control-group" role="group" aria-label="View options">
+      <div class="control-group" id="viewopts" role="group" aria-label="View options">
     <select class="sel" id="sortsel" aria-label="Sort photos">
       <option value="added-desc">Newest</option>
       <option value="added-asc">Oldest</option>
@@ -743,6 +762,7 @@ function clearVaultUI() {
   $("grid").innerHTML = "";
   $("sidebar").innerHTML = "";
   $("viewtitle").textContent = "";
+  $("viewtitle").removeAttribute("title");
   $("count").textContent = "";
   $("lbname").textContent = "";
   $("lbrename").value = "";
@@ -1013,6 +1033,7 @@ const renderObserver = new IntersectionObserver(entries => {
 // -------------------------------------------------------------- rendering ---
 
 let layout = localStorage.getItem("pv-view") || "grid";
+let albumsCollapsed = localStorage.getItem("pv-albums-collapsed") === "1";
 const sortColumns = { added: "Date added", taken: "Date taken", name: "Name", size: "Size", type: "Type" };
 const defaultSort = () => ({
   rules: [{ key: "added", dir: "desc" }, { key: "name", dir: "asc" }],
@@ -1081,6 +1102,7 @@ function setSort(key, append = false, dirOverride) {
 }
 
 function computeVisible() {
+  if (currentView.type === "albums") return [];
   let v = photos.filter(p => currentView.type === "trash" ? p.deleted : !p.deleted);
   if (currentView.type === "favorites") v = v.filter(p => p.favorite);
   if (currentView.type === "videos") v = v.filter(isVideo);
@@ -1108,6 +1130,8 @@ function emptyMessage() {
     case "videos": return "No videos yet.<br>Import .mp4, .mov or .m4v files.";
     case "duplicates": return "No exact duplicates.<br>Photos with identical file contents show up here.";
     case "trash": return "Recently Deleted is empty.";
+    case "albums": return "No albums yet.<br>Click + next to My Albums, or drop a folder or zip " +
+      "into PhotoVault Inbox.";
     case "album": return "This album is empty.<br>Drag photos here (or onto the album in the " +
       "sidebar) to import straight into it,<br>or select photos already in your vault and use Album ▾.";
     default: return "<strong>Your photos, kept private</strong><br>Import photos and videos, or drag them into this window.";
@@ -1137,20 +1161,25 @@ function renderSidebar() {
     + row("all", "All Photos", "photos", counts.all)
     + row("favorites", "Favorites", "heart", counts.favorites)
     + row("videos", "Videos", "video", counts.videos)
+    + row("albums", "Albums", "albums", albums.length)
     + `<div class="head">Utilities</div>`
     + row("duplicates", "Duplicates", "duplicate", counts.duplicates)
     + row("trash", "Recently Deleted", "delete", counts.trash)
-    + `<div class="head">Albums<button id="albadd" title="New album" aria-label="New album">+</button></div>`;
+    + `<div class="head"><button class="disclose" id="albtoggle" aria-expanded="${!albumsCollapsed}" ` +
+      `aria-controls="albumlist" title="${albumsCollapsed ? "Show" : "Hide"} albums">${icon("chevron")}My Albums</button>` +
+      `<button id="albadd" title="New album" aria-label="New album">+</button></div>` +
+      `<div id="albumlist"${albumsCollapsed ? " hidden" : ""}>`;
   for (const a of albums) {
     const n = albumCounts.get(a.id) || 0;
     const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
-    html += `<div class="item${act}" data-v="album" data-id="${a.id}"><button class="album-open" aria-current="${act ? "page" : "false"}">${icon("folder")} ` +
-      `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.name)}</span>` +
+    html += `<div class="item${act}" data-v="album" data-id="${a.id}"><button class="album-open" title="${esc(a.name)}" aria-current="${act ? "page" : "false"}">${icon("folder")} ` +
+      `<span class="album-name">${esc(a.name)}</span>` +
       `<span class="n">${n}</span></button>` +
       `<span class="tools"><button data-act="ren" title="Rename album" aria-label="Rename album">&#9998;</button>` +
       `<button data-act="del" title="Delete album" aria-label="Delete album">&#10005;</button></span></div>`;
   }
   if (!albums.length) html += `<p class="sidebar-note">Create an album to organize your photos.</p>`;
+  html += `</div>`;
   const sb = $("sidebar");
   sb.innerHTML = html;
   sb.querySelectorAll(".item").forEach(el => {
@@ -1179,6 +1208,12 @@ function renderSidebar() {
       }
     };
   });
+  $("albtoggle").onclick = () => {
+    albumsCollapsed = !albumsCollapsed;
+    localStorage.setItem("pv-albums-collapsed", albumsCollapsed ? "1" : "0");
+    renderSidebar();
+    $("albtoggle").focus();
+  };
   $("albadd").onclick = async e => {
     e.stopPropagation();
     const name = await promptText("New album");
@@ -1201,7 +1236,7 @@ async function renameAlbum(id) {
     await invoke("album_rename", { id, name });
     await loadAlbums();
     renderSidebar();
-    renderPhotos();
+    renderPhotos({ keepScroll: true });
   } catch (err) { toast("" + err); }
 }
 
@@ -1232,18 +1267,28 @@ function tileClick(i, e) {
   }
 }
 
-function renderPhotos() {
+// `keepScroll` is for refreshing the view in place, such as after filing
+// photos into an album or an Inbox import.
+function renderPhotos({ keepScroll = false } = {}) {
   visible = computeVisible();
   syncViewer();
   focusIdx = Math.min(focusIdx, visible.length - 1);
-  const titles = { all: "All Photos", favorites: "Favorites", videos: "Videos", duplicates: "Duplicates", trash: "Recently Deleted" };
+  const albumsView = currentView.type === "albums";
+  const shownAlbums = albumsView ? albums.filter(a => a.name.toLowerCase().includes(query)) : [];
+  const shown = albumsView ? shownAlbums.length : visible.length;
+  const noun = albumsView ? "album" : "item";
+  const titles = { all: "All Photos", favorites: "Favorites", videos: "Videos", albums: "Albums", duplicates: "Duplicates", trash: "Recently Deleted" };
   $("viewtitle").textContent = currentView.type === "album"
     ? albums.find(a => a.id === currentView.album)?.name || "Album" : titles[currentView.type];
+  // Long album names are cut off, so hovering shows the whole name.
+  $("viewtitle").title = $("viewtitle").textContent;
   $("count").style.display = "block";
-  $("count").textContent = query ? `${visible.length.toLocaleString()} matching items`
-    : `${visible.length.toLocaleString()} item${visible.length === 1 ? "" : "s"}`;
-  $("empty").style.display = visible.length ? "none" : "block";
-  $("empty").innerHTML = icon("photos") + emptyMessage();
+  $("count").textContent = `${shown.toLocaleString()} ${query ? "matching " : ""}${noun}${shown === 1 ? "" : "s"}`;
+  $("empty").style.display = shown ? "none" : "block";
+  $("empty").innerHTML = icon(albumsView ? "albums" : "photos") + emptyMessage();
+  $("search").placeholder = albumsView ? "Search albums" : "Search";
+  $("searchlabel").textContent = albumsView ? "Search albums" : "Search photos and tags";
+  $("viewopts").hidden = albumsView; // sorting, layout, and selection are for photos
   $("trashbanner").style.display = currentView.type === "trash" && visible.length ? "flex" : "none";
   $("viewbtn").innerHTML = icon(layout === "grid" ? "list" : "grid");
   $("viewbtn").title = layout === "grid" ? "Switch to list view" : "Switch to grid view";
@@ -1255,11 +1300,17 @@ function renderPhotos() {
   $("sortsel").title = duplicates ? "Duplicates stay grouped by file contents"
     : photoSort.rules.map(r => `${sortColumns[r.key]} ${r.dir === "asc" ? "↑" : "↓"}`).join(", ")
       + ". Switch to list view to sort by multiple columns.";
-  $("sorthint").hidden = layout !== "list";
+  $("sorthint").hidden = layout !== "list" || albumsView;
   $("sorthint").textContent = duplicates ? "Duplicates stay grouped by file contents."
     : "Click a column to sort. Shift-click another to sort within it. Dates then group by day.";
   setHeaderHeight();
   const grid = $("grid");
+  // Rebuild as many items as were showing, reuse their loaded thumbnails, and
+  // restore the scroll offsets, so the view doesn't jump back to the top.
+  const kept = keepScroll && {
+    winY: window.scrollY, listY: grid.scrollTop, count: renderedCount,
+    thumbs: [...tileById].map(([id, tile]) => [id, tile.querySelector("img")?.src]).filter(([, src]) => src),
+  };
   loadObserver.disconnect();
   unloadObserver.disconnect();
   renderObserver.disconnect();
@@ -1268,6 +1319,15 @@ function renderPhotos() {
   renderedCount = 0;
   renderBody = null;
   lastDateGroup = null;
+  renderSentinel = null;
+  if (albumsView) {
+    grid.className = "albums";
+    renderAlbumCards(shownAlbums);
+    renderedSelection = new Set();
+    updateSelectionUI();
+    if (kept) window.scrollTo(0, kept.winY);
+    return;
+  }
   if (layout === "grid") {
     grid.className = "grid";
     renderSentinel = document.createElement("div");
@@ -1320,11 +1380,52 @@ function renderPhotos() {
     renderSentinel.className = "render-sentinel";
     grid.appendChild(renderSentinel);
   }
-  renderMore();
+  renderMore(kept ? kept.count - 1 : -1);
+  if (kept) {
+    for (const [id, src] of kept.thumbs) {
+      const img = tileById.get(id)?.querySelector("img");
+      if (img) img.src = src;
+    }
+    grid.scrollTop = kept.listY;
+    window.scrollTo(0, kept.winY);
+  }
   if (renderedCount < visible.length) renderObserver.observe(renderSentinel);
   // Tiles were just built with their .sel classes in place.
   renderedSelection = new Set(selection);
   updateSelectionUI();
+}
+
+// One card per album, with its newest photo as the cover.
+function renderAlbumCards(list) {
+  const counts = new Map(), covers = new Map();
+  for (const p of photos) {
+    if (p.deleted) continue;
+    for (const id of p.albums) {
+      counts.set(id, (counts.get(id) || 0) + 1);
+      const cover = covers.get(id);
+      if (!cover || p.added > cover.added) covers.set(id, p);
+    }
+  }
+  const grid = $("grid");
+  grid.innerHTML = list.map(a => {
+    const n = counts.get(a.id) || 0, cover = covers.get(a.id);
+    return `<button class="acard" data-id="${a.id}" title="${esc(a.name)}"><span class="acover">` +
+      (cover ? `<img src="${mediaURL(cover.id, true)}" alt="" loading="lazy" decoding="async">` : icon("folder")) +
+      `</span><span class="aname">${esc(a.name)}</span>` +
+      `<span class="acount">${n.toLocaleString()} item${n === 1 ? "" : "s"}</span></button>`;
+  }).join("");
+  grid.querySelectorAll(".acard").forEach(card => {
+    card.onclick = e => {
+      const id = card.dataset.id;
+      currentView = { type: "album", album: id };
+      clearSelection();
+      renderPhotos();
+      renderSidebar();
+      window.scrollTo(0, 0);
+      if (e.detail === 0)
+        $("sidebar").querySelector(`[data-v="album"][data-id="${id}"] .album-open`)?.focus();
+    };
+  });
 }
 
 function renderMore(throughIndex = -1) {
@@ -1390,7 +1491,7 @@ async function loadGrid() {
   if (session !== sessionVersion || request !== gridRequest
       || $("gallery").style.display === "none") return;
   photos = loadedPhotos;
-  renderPhotos();
+  renderPhotos({ keepScroll: true });
   renderSidebar();
 }
 
@@ -1461,7 +1562,7 @@ function applyFavorite(ids, favorite) {
       if (favorite) el.insertAdjacentHTML("beforeend", `<div class="fbadge">&#9829;</div>`);
     }
   }
-  if (currentView.type === "favorites") renderPhotos();
+  if (currentView.type === "favorites") renderPhotos({ keepScroll: true });
   renderSidebar();
 }
 
@@ -1574,7 +1675,7 @@ $("selalbum").onclick = e => {
   if (menu.classList.contains("open")) { menu.classList.remove("open"); return; }
   let html = "";
   for (const a of albums)
-    html += `<button data-id="${a.id}">${esc(a.name)}</button>`;
+    html += `<button data-id="${a.id}" title="${esc(a.name)}">${esc(a.name)}</button>`;
   if (albums.length) html += `<div class="sep"></div>`;
   html += `<button data-new="1">New album…</button>`;
   if (currentView.type === "album")

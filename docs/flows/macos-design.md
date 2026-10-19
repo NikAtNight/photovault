@@ -29,7 +29,17 @@ Liquid Glass. The existing native title bar and window controls remain.
 `ui/index.html` owns the semantic CSS color tokens, light/dark media queries,
 responsive toolbar, shared SVG symbol definitions, sidebar, and existing
 screens. `icon` reuses the symbols across the toolbar, sidebar, and viewer.
-`renderSidebar` builds navigation buttons and separate album tools.
+`renderSidebar` builds navigation buttons and separate album tools. The
+*My Albums* heading toggles the album list; `pv-albums-collapsed` saves it.
+The `albums` view hides photo sorting, layout, and selection controls, and
+`renderAlbumCards` shows one card per album, matching the search, with its
+newest photo as the cover. Album names in the sidebar, cards, selection menu,
+and view title carry a `title` tooltip with the full name.
+`loadGrid` and other refreshes of the same view call
+`renderPhotos({ keepScroll: true })`. It rebuilds as many items as were
+showing, reuses loaded thumbnails, and restores the window and list scroll
+offsets, so filing photos into an album or an Inbox batch doesn't jump to the
+top. Switching views still starts at the first batch.
 `renderPhotos` updates the view title/count and renders a scrollable list.
 `setHeaderHeight` measures the toolbar to size the list's scroll area.
 `--sbw` controls the sidebar boundary, content inset, and file-drop overlay.

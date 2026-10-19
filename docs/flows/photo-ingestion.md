@@ -81,6 +81,11 @@ then renamed to a visible folder at the Inbox root. Staging left by a crash is
 discarded on the next pass. `__MACOSX`, `.DS_Store`, and marker entries are
 skipped, so an archive can't choose its own album. Hidden files and nested zips
 are extracted but not imported, and the scanner ignores zips under a marker.
+`remove_finished_zip_folders` deletes every marked folder at the Inbox root
+that `holds_inbox_media` finds no importable media in, along with its text,
+JSON, hidden files, and nested zips. It runs after each pass, and on watcher
+ticks with nothing to import while the vault is unlocked and no import holds
+the claim. Media that failed keeps the folder.
 Extracted files take the entry's UTC extended timestamp, capped at the current
 time, as modified and (on macOS) creation time. The basic zip time has no time
 zone and is ignored.
@@ -91,8 +96,10 @@ the claimed file still matches that identity and hash. Unsafe paths, damage,
 archives without media, more than 20 GB or 100,000 entries, and errors that
 waiting won't fix fail permanently and keep the zip. Process Inbox retries
 them. A full, quota-limited, or read-only disk is marked `slow_retry` instead. `inbox_album_name` finds the nearest marker above
-each file, and `ensure_album` reuses a same-named album (ignoring case) or
-creates one. New photos carry the album in their index entry. Duplicates are
+each file. Without a marker, `inbox_folder_album` uses the top folder under
+the Inbox, except `Pending import ...` folders; loose files get no album.
+A zip inside such a folder writes that folder's name into its marker.
+`ensure_album` reuses a same-named album (ignoring case) or creates one. New photos carry the album in their index entry. Duplicates are
 filed in batches by `file_inbox_duplicates` before their sources are removed.
 The watcher emits `inbox-progress` (`{done, total}`) at the start, at most
 every 500ms, and at the end, plus `{0, 0}` before each zip is unpacked. The UI
