@@ -88,11 +88,27 @@ folder in Finder or the CLI shows only random-named opaque blobs.
   Preferences persist and apply to grid, list, and viewer navigation. Grid
   view keeps the original sort dropdown; choose a new option to reset to one
   column. Duplicates keep their existing grouping by file contents.
+- **Folders:** group albums into folders, and folders inside folders. Use the
+  folder button next to *My Albums* to make one; it goes into the folder you're
+  browsing. Click a folder's arrow in the sidebar to open it, or click its name
+  to see its folders and albums as cards with a breadcrumb back up. Move an
+  album or folder with its ↗ button, or ⌘-click several cards in Albums and
+  choose **Move to…**. Deleting a folder moves what's inside up a level and
+  never deletes albums or photos. Album search looks inside every folder and
+  shows each result's folder path. Folders and smart albums need this version or
+  newer. An older PhotoVault build drops them the next time it saves.
+- **Not in an Album** lists every photo that isn't in any album yet.
+- **Smart albums** are saved filters: name or tag text, photos or videos,
+  favorites, not in any album, and a date range (date taken, else date added).
+  Every rule you set must match, and the album updates as your library
+  changes. Make one with the **+** next to *Smart Albums*.
+- **Jump to a year:** when the grid is sorted by date, a list of years on the
+  right edge jumps straight to that year.
 - **Select** multiple items (Select button, ⌘-click, shift-click, or Space
-  with keyboard focus; ⌘A selects all) to favorite, add to an album, export,
-  or delete together.
+  with keyboard focus; ⌘A selects all) to favorite, add to an album, add or
+  remove tags, export, or delete together.
 - **Viewer:** click any item — ← / → to browse, scroll or double-click to
-  **zoom**, drag to pan, `f` favorites, `i` shows the info panel
+  **zoom**, drag, ⇧ + arrows, or ↑ / ↓ to pan, `f` favorites, `i` shows the info panel
   (size, dimensions, dates, albums), click the name to rename, ▶ starts a
   **slideshow**. Videos play inline with seeking.
 - **Deleting moves items to Recently Deleted** for 30 days (undo from the

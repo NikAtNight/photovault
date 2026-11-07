@@ -49,7 +49,7 @@
   .btn.on { color: var(--accent); background: var(--selected); }
   .btn.ghost { border-color: transparent; background: transparent; box-shadow: none; padding: 6px 8px; }
   .btnrow { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
-  input[type=password], input[type=text].ti {
+  input[type=password], input[type=text].ti, input[type=date].ti {
     width: 100%; padding: 10px 12px; margin-bottom: 12px; background: var(--surface);
     border: 1px solid var(--line); border-radius: 9px; color: var(--text);
     user-select: text; -webkit-user-select: text; }
@@ -131,6 +131,16 @@
     color: var(--secondary); transform: rotate(90deg); transition: transform .15s; }
   #sidebar .head .disclose[aria-expanded="false"] .icon { transform: none; }
   #sidebar .album-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #albumlist .item { padding-left: calc(10px + var(--depth, 0) * 14px); }
+  #albumlist .item[data-v="album"] { padding-left: calc(30px + var(--depth, 0) * 14px); }
+  #sidebar .twisty { display: grid; place-items: center; flex: none; width: 16px; height: 22px;
+    margin-right: -5px; padding: 0; border: 0; border-radius: 5px; background: none; color: var(--secondary); }
+  #sidebar .twisty:hover { background: var(--hover); }
+  #sidebar .twisty .icon { width: 11px; height: 11px; stroke-width: 2.4; transition: transform .15s; }
+  #sidebar .twisty[aria-expanded="true"] .icon { transform: rotate(90deg); }
+  #sidebar .head .headbtns { display: flex; gap: 2px; margin-left: auto; }
+  #sidebar .head .headbtns button { margin-left: 0; }
+  #sidebar .head .headbtns .icon { width: 15px; height: 15px; }
   #sidebar .item .tools { display: none; margin-left: auto; gap: 2px; }
   #sidebar .item:hover .tools, #sidebar .item:focus-within .tools { display: flex; }
   #sidebar .item:hover .n, #sidebar .item:focus-within .n { display: none; }
@@ -201,7 +211,29 @@
   .acard:hover .acover { filter: brightness(.96); }
   .acard .aname { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
     overflow: hidden; overflow-wrap: anywhere; font-weight: 600; line-height: 1.35; }
-  .acard .acount { color: var(--secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .acard .acount, .acard .apath { color: var(--secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .acard .apath { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .acard.sel .acover { outline: 3px solid var(--accent); outline-offset: -3px; }
+  .cardbar { grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    min-height: 32px; font-size: 13px; color: var(--secondary); }
+  .cardbar .crumb { background: none; border: 0; padding: 4px 6px; border-radius: 7px; color: var(--accent); }
+  .cardbar .crumb:hover { background: var(--hover); }
+  .cardbar .crumb[aria-current="page"] { color: var(--text); font-weight: 600; }
+  .cardbar .cardsel { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  #yearrail { position: fixed; right: 6px; top: calc(var(--hh, 80px) + 12px); bottom: 24px; z-index: 10;
+    display: flex; flex-direction: column; gap: 1px; overflow-y: auto; }
+  #yearrail[hidden] { display: none; }
+  #yearrail button { background: none; border: 0; border-radius: 6px; padding: 3px 6px;
+    color: var(--secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+  #yearrail button:hover { background: var(--hover); color: var(--text); }
+  #content.has-rail .grid { padding-right: 58px; }
+  .modal .field { display: block; font-size: 12px; color: var(--secondary); }
+  .modal .field .ti, .modal .field select { display: block; width: 100%; margin-top: 4px; }
+  .modal .field select { margin-bottom: 12px; }
+  .modal .fieldrow { display: flex; gap: 12px; }
+  .modal .fieldrow .field { flex: 1; min-width: 0; }
+  .modal .checkrow { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 10px; }
+  .modal .formhint { font-size: 11px; color: var(--secondary); margin: 6px 0 10px; }
   .empty { padding: 100px 28px; text-align: center; color: var(--secondary); line-height: 1.9; }
   .empty > .icon { display: block; margin: 0 auto 18px; width: 42px; height: 42px; stroke-width: 1.2; opacity: .7; }
   .empty strong { font-size: 18px; color: var(--text); font-weight: 600; }
@@ -246,11 +278,13 @@
   #lightbox .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transform-origin: center; }
   #lightbox .stage video { position: absolute; inset: 0; width: 100%; height: 100%; background: #000; }
   #lightbox .nav { position: absolute; top: 50%; transform: translateY(-50%); background: #242424b8;
-    border: 1px solid #ffffff28; color: white; font-size: 28px; width: 38px; height: 38px;
-    border-radius: 50%; z-index: 5; -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); }
+    border: 1px solid #ffffff28; color: white; width: 38px; height: 38px; padding: 0;
+    display: grid; place-items: center; border-radius: 50%; z-index: 5; -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); }
   #lightbox .nav:hover { background: #242424e8; }
   #lightbox.slideshow .nav { display: none; }
   #lbprev { left: 12px; } #lbnext { right: 12px; }
+  #lightbox .nav .icon { width: 20px; height: 20px; stroke-width: 2.2; }
+  #lbprev .icon { transform: scaleX(-1); }
   #lbzoom { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); display: flex;
     gap: 2px; align-items: center; background: #242424d9; border: 1px solid #ffffff28;
     border-radius: 99px; padding: 5px 8px; z-index: 5; opacity: 0; transition: opacity .15s;
@@ -423,6 +457,7 @@
       </section>
       <p id="sorthint" hidden></p>
       <div class="grid" id="grid"></div>
+      <nav id="yearrail" aria-label="Jump to year" hidden></nav>
       <div class="empty" id="empty" style="display:none"></div>
     </main>
   </div>
@@ -434,6 +469,13 @@
   <div class="menuwrap">
     <button class="btn" id="selalbum">Album &#9662;</button>
     <div class="menu" id="albummenu"></div>
+  </div>
+  <div class="menuwrap">
+    <button class="btn" id="seltags">Tags &#9662;</button>
+    <div class="menu" id="tagmenu">
+      <button id="tagadd">Add tags&hellip;</button>
+      <button id="tagremove">Remove tags&hellip;</button>
+    </div>
   </div>
   <button class="btn" id="selexport">Export&hellip;</button>
   <button class="btn" id="selrestore" style="display:none">Restore</button>
@@ -460,8 +502,8 @@
   <div class="stage" id="lbstage">
     <img id="lbimg" alt="">
     <video id="lbvid" controls playsinline style="display:none"></video>
-    <button class="nav" id="lbprev" aria-label="Previous photo">&#8249;</button>
-    <button class="nav" id="lbnext" aria-label="Next photo">&#8250;</button>
+    <button class="nav" id="lbprev" aria-label="Previous photo"><svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg></button>
+    <button class="nav" id="lbnext" aria-label="Next photo"><svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg></button>
     <div id="lbzoom">
       <button id="lbzout" title="Zoom out (&minus;)">&minus;</button>
       <span id="lbzpct">100%</span>
@@ -573,6 +615,41 @@
   </form>
 </div>
 
+<div class="modal" id="foldermodal" role="dialog" aria-modal="true" aria-labelledby="fmtitle">
+  <form class="box" id="folderform">
+    <h2 id="fmtitle">Move to folder</h2>
+    <label class="field">Folder<select class="sel" id="fmselect"></select></label>
+    <div class="btnrow">
+      <button class="btn primary" type="submit">Move</button>
+      <button class="btn" type="button" id="fmcancel">Cancel</button>
+    </div>
+  </form>
+</div>
+
+<div class="modal" id="smartmodal" role="dialog" aria-modal="true" aria-labelledby="smtitle">
+  <form class="box" id="smartform">
+    <h2 id="smtitle">New smart album</h2>
+    <label class="field">Name<input type="text" class="ti" id="smname" autocomplete="off" spellcheck="false"></label>
+    <label class="field">Name or tag contains<input type="text" class="ti" id="smquery" autocomplete="off" spellcheck="false"></label>
+    <label class="field">Type<select class="sel" id="smkind">
+      <option value="">Photos and videos</option>
+      <option value="photo">Photos only</option>
+      <option value="video">Videos only</option>
+    </select></label>
+    <div class="fieldrow">
+      <label class="field">From<input type="date" class="ti" id="smfrom"></label>
+      <label class="field">To<input type="date" class="ti" id="smto"></label>
+    </div>
+    <label class="checkrow"><input type="checkbox" id="smfav"> Favorites only</label>
+    <label class="checkrow"><input type="checkbox" id="smunfiled"> Not in any album</label>
+    <p class="formhint">Every rule you set must match. Dates use the date taken, or the date added when a photo has none.</p>
+    <div class="btnrow">
+      <button class="btn primary" type="submit">Save</button>
+      <button class="btn" type="button" id="smcancel">Cancel</button>
+    </div>
+  </form>
+</div>
+
 <div class="modal" id="helpmodal" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
   <div class="box">
     <button class="close" id="helpclose">&#10005;</button>
@@ -585,6 +662,7 @@
     <div class="setrow"><span class="grow">Move to Recently Deleted</span><span class="hint">Delete</span></div>
     <div class="setrow"><span class="grow">Favorite &middot; Info (in viewer)</span><span class="hint">F &middot; I</span></div>
     <div class="setrow"><span class="grow">Zoom in / out / reset (in viewer)</span><span class="hint">+ / &minus; / 0</span></div>
+    <div class="setrow"><span class="grow">Pan while zoomed (in viewer)</span><span class="hint">&#8679; Arrows &middot; &#8593; &#8595;</span></div>
     <div class="setrow"><span class="grow">Close viewer &middot; clear selection</span><span class="hint">Esc</span></div>
     <div class="setrow"><span class="grow">This help</span><span class="hint">?</span></div>
   </div>
@@ -606,7 +684,11 @@ const mediaURL = (id, thumb) => `pvmedia://localhost/${id}${thumb ? "/thumb" : "
 
 let mode = "login";        // login | setup | recovery
 let photos = [];           // full library metadata
-let albums = [];           // [{id, name, created}]
+let albums = [];           // [{id, name, created, folder}]
+let folders = [];          // [{id, name, parent}]
+let folderById = new Map();
+let smartAlbums = [];      // [{id, name, rules}]
+let cardSelection = new Set(); // "a:<id>" and "f:<id>" picked in the Albums grid
 let visible = [];          // photos in the current view, sorted
 let currentView = { type: "all", album: null };
 let query = "";
@@ -746,17 +828,32 @@ function clearVaultUI() {
   closeLightbox();
   endDrag(); // a drag in flight when the vault locks must not leave its
              // overlay (which can name an album) painted over the lock screen
-  for (const m of ["settings", "keymodal", "offermodal", "promptmodal"])
+  for (const m of ["settings", "keymodal", "offermodal", "promptmodal", "foldermodal", "smartmodal"])
     $(m).classList.remove("open");
   // Closed modals keep their contents, so wipe the recovery key, passwords,
-  // and album name they may still hold.
+  // and the album, folder, and smart album details they may still hold.
   $("rkey").textContent = "";
   $("cpw0").value = ""; $("cpw1").value = ""; $("cpw2").value = "";
   $("pminput").value = "";
+  $("pmtitle").textContent = "";
+  $("yearrail").innerHTML = "";
+  $("yearrail").hidden = true;
+  $("fmtitle").textContent = "";
+  $("fmselect").innerHTML = "";
+  fmResolve?.(undefined);
+  fmResolve = null;
+  for (const id of ["smname", "smquery", "smkind", "smfrom", "smto"]) $(id).value = "";
+  $("smfav").checked = false;
+  $("smunfiled").checked = false;
+  smartEditing = null;
   $("gallery").style.display = "none";
   $("auth").style.display = "grid";
   photos = [];
   albums = [];
+  folders = [];
+  folderById = new Map();
+  smartAlbums = [];
+  cardSelection.clear();
   visible = [];
   tileById.clear();
   $("grid").innerHTML = "";
@@ -1034,6 +1131,8 @@ const renderObserver = new IntersectionObserver(entries => {
 
 let layout = localStorage.getItem("pv-view") || "grid";
 let albumsCollapsed = localStorage.getItem("pv-albums-collapsed") === "1";
+let openFolders = new Set();
+try { openFolders = new Set(JSON.parse(localStorage.getItem("pv-folders-open") || "[]")); } catch {}
 const sortColumns = { added: "Date added", taken: "Date taken", name: "Name", size: "Size", type: "Type" };
 const defaultSort = () => ({
   rules: [{ key: "added", dir: "desc" }, { key: "name", dir: "asc" }],
@@ -1107,13 +1206,17 @@ function computeVisible() {
   if (currentView.type === "favorites") v = v.filter(p => p.favorite);
   if (currentView.type === "videos") v = v.filter(isVideo);
   if (currentView.type === "album") v = v.filter(p => p.albums.includes(currentView.album));
+  if (currentView.type === "unfiled") v = v.filter(p => !p.albums.length);
+  if (currentView.type === "smart") {
+    const rules = smartAlbums.find(a => a.id === currentView.smart)?.rules;
+    v = rules ? v.filter(p => matchesSmart(p, rules)) : [];
+  }
   if (currentView.type === "duplicates") {
     const seen = new Map();
     for (const p of v) if (p.hash) seen.set(p.hash, (seen.get(p.hash) || 0) + 1);
     v = v.filter(p => p.hash && seen.get(p.hash) > 1);
   }
-  if (query) v = v.filter(p => p.name.toLowerCase().includes(query)
-    || (p.tags || []).some(t => t.toLowerCase().includes(query)));
+  if (query) v = v.filter(p => matchesQuery(p, query));
   if (currentView.type === "duplicates") {
     // Identical copies stay adjacent regardless of the chosen sort.
     v.sort((a, b) => a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : a.added - b.added);
@@ -1123,20 +1226,70 @@ function computeVisible() {
   return v;
 }
 
+function matchesQuery(p, q) {
+  return p.name.toLowerCase().includes(q) || (p.tags || []).some(t => t.toLowerCase().includes(q));
+}
+
+// Every rule that is set must match. `to` is the start of the day after the
+// chosen end date, so it's exclusive.
+function matchesSmart(p, r) {
+  const t = p.taken ?? p.added;
+  return (!r.kind || (r.kind === "video") === isVideo(p))
+    && (!r.favorite || p.favorite)
+    && (!r.unfiled || !p.albums.length)
+    && (r.from == null || t >= r.from)
+    && (r.to == null || t < r.to)
+    && (!r.query || matchesQuery(p, r.query.toLowerCase()));
+}
+
 function emptyMessage() {
   if (query) return "No matches for “" + esc(query) + "”.";
   switch (currentView.type) {
     case "favorites": return "No favorites yet.<br>Click the heart on a photo to find it here.";
     case "videos": return "No videos yet.<br>Import .mp4, .mov or .m4v files.";
+    case "unfiled": return "Every photo is in an album.";
+    case "smart": return "Nothing matches this smart album yet.";
     case "duplicates": return "No exact duplicates.<br>Photos with identical file contents show up here.";
     case "trash": return "Recently Deleted is empty.";
-    case "albums": return "No albums yet.<br>Click + next to My Albums, or drop a folder or zip " +
+    case "albums": if (currentView.folder) return "This folder is empty.<br>Use the move button on an album or folder to put it here.";
+      return "No albums yet.<br>Click + next to My Albums, or drop a folder or zip " +
       "into PhotoVault Inbox.";
     case "album": return "This album is empty.<br>Drag photos here (or onto the album in the " +
       "sidebar) to import straight into it,<br>or select photos already in your vault and use Album ▾.";
     default: return "<strong>Your photos, kept private</strong><br>Import photos and videos, or drag them into this window.";
   }
 }
+
+const folderOf = id => folderById.get(id);
+
+// [id, parent, grandparent, ...] for a folder, stopping at a missing parent.
+function folderChain(id) {
+  const out = [];
+  while (id && !out.includes(id) && folderOf(id)) {
+    out.push(id);
+    id = folderOf(id).parent;
+  }
+  return out;
+}
+
+const folderPath = id => folderChain(id).reverse().map(f => folderOf(f).name).join(" › ");
+
+// Folders in sidebar order with their depth, leaving out `skip` and everything inside it.
+function folderTree(skip = new Set()) {
+  const out = [];
+  const walk = (parent, depth) => {
+    for (const f of folders) {
+      if ((folderOf(f.parent) ? f.parent : null) !== parent || skip.has(f.id)) continue;
+      out.push({ f, depth });
+      walk(f.id, depth + 1);
+    }
+  };
+  walk(null, 0);
+  return out;
+}
+
+const sidebarRow = (v, id) =>
+  $("sidebar").querySelector(`[data-v="${v}"]${id ? `[data-id="${id}"]` : ""}`);
 
 function renderSidebar() {
   const live = photos.filter(p => !p.deleted);
@@ -1150,35 +1303,69 @@ function renderSidebar() {
     all: live.length,
     favorites: live.filter(p => p.favorite).length,
     videos: live.filter(isVideo).length,
+    unfiled: live.filter(p => !p.albums.length).length,
     duplicates: live.filter(p => p.hash && byHash.get(p.hash) > 1).length,
     trash: photos.length - live.length,
   };
-  const active = t => (currentView.type === t ? " active" : "");
+  const isActive = view => currentView.type === view && !currentView.folder;
   const row = (view, label, symbol, count) =>
-    `<button class="item${active(view)}" data-v="${view}" aria-current="${currentView.type === view ? "page" : "false"}">` +
+    `<button class="item${isActive(view) ? " active" : ""}" data-v="${view}" aria-current="${isActive(view) ? "page" : "false"}">` +
     icon(symbol) + `<span>${label}</span><span class="n">${count.toLocaleString()}</span></button>`;
+  const tools = (kind, edit = "Rename") =>
+    `<span class="tools"><button data-act="ren" title="${edit} ${kind}" aria-label="${edit} ${kind}">&#9998;</button>` +
+    (kind === "smart album" ? "" : `<button data-act="move" title="Move to folder" aria-label="Move ${kind} to folder">&#8599;</button>`) +
+    `<button data-act="del" title="Delete ${kind}" aria-label="Delete ${kind}">&#10005;</button></span>`;
   let html = `<div class="brand">${icon("lock")} PhotoVault</div><div class="head">Library</div>`
     + row("all", "All Photos", "photos", counts.all)
     + row("favorites", "Favorites", "heart", counts.favorites)
     + row("videos", "Videos", "video", counts.videos)
+    + row("unfiled", "Not in an Album", "inbox", counts.unfiled)
     + row("albums", "Albums", "albums", albums.length)
     + `<div class="head">Utilities</div>`
     + row("duplicates", "Duplicates", "duplicate", counts.duplicates)
     + row("trash", "Recently Deleted", "delete", counts.trash)
-    + `<div class="head"><button class="disclose" id="albtoggle" aria-expanded="${!albumsCollapsed}" ` +
-      `aria-controls="albumlist" title="${albumsCollapsed ? "Show" : "Hide"} albums">${icon("chevron")}My Albums</button>` +
-      `<button id="albadd" title="New album" aria-label="New album">+</button></div>` +
-      `<div id="albumlist"${albumsCollapsed ? " hidden" : ""}>`;
-  for (const a of albums) {
-    const n = albumCounts.get(a.id) || 0;
-    const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
-    html += `<div class="item${act}" data-v="album" data-id="${a.id}"><button class="album-open" title="${esc(a.name)}" aria-current="${act ? "page" : "false"}">${icon("folder")} ` +
-      `<span class="album-name">${esc(a.name)}</span>` +
-      `<span class="n">${n}</span></button>` +
-      `<span class="tools"><button data-act="ren" title="Rename album" aria-label="Rename album">&#9998;</button>` +
-      `<button data-act="del" title="Delete album" aria-label="Delete album">&#10005;</button></span></div>`;
+    + `<div class="head">Smart Albums<button id="smartadd" title="New smart album" aria-label="New smart album">+</button></div>`;
+  for (const a of smartAlbums) {
+    const act = currentView.type === "smart" && currentView.smart === a.id ? " active" : "";
+    const n = live.filter(p => matchesSmart(p, a.rules)).length;
+    html += `<div class="item${act}" data-v="smart" data-id="${a.id}"><button class="album-open" title="${esc(a.name)}" aria-current="${act ? "page" : "false"}">${icon("search")} ` +
+      `<span class="album-name">${esc(a.name)}</span><span class="n">${n.toLocaleString()}</span></button>${tools("smart album", "Edit")}</div>`;
   }
-  if (!albums.length) html += `<p class="sidebar-note">Create an album to organize your photos.</p>`;
+  html += `<div class="head"><button class="disclose" id="albtoggle" aria-expanded="${!albumsCollapsed}" ` +
+      `aria-controls="albumlist" title="${albumsCollapsed ? "Show" : "Hide"} albums">${icon("chevron")}My Albums</button>` +
+      `<span class="headbtns"><button id="foladd" title="New folder" aria-label="New folder">${icon("folder")}</button>` +
+      `<button id="albadd" title="New album" aria-label="New album">+</button></span></div>` +
+      `<div id="albumlist"${albumsCollapsed ? " hidden" : ""}>`;
+  // Folders holding the current album or folder stay open so it's visible.
+  const shownFolder = currentView.type === "album" ? albums.find(a => a.id === currentView.album)?.folder
+    : currentView.type === "albums" ? currentView.folder : null;
+  const forcedOpen = new Set(folderChain(currentView.type === "album" ? shownFolder : folderOf(shownFolder)?.parent));
+  const foldersIn = new Map(), albumsIn = new Map();
+  const push = (map, key, item) => map.get(key)?.push(item) ?? map.set(key, [item]);
+  for (const f of folders) push(foldersIn, folderOf(f.parent) ? f.parent : null, f);
+  for (const a of albums) push(albumsIn, folderOf(a.folder) ? a.folder : null, a);
+  const tree = (parent, depth) => {
+    let out = "";
+    for (const f of foldersIn.get(parent) || []) {
+      const open = openFolders.has(f.id) || forcedOpen.has(f.id);
+      const act = currentView.type === "albums" && currentView.folder === f.id ? " active" : "";
+      out += `<div class="item${act}" data-v="folder" data-id="${f.id}" style="--depth:${depth}">` +
+        `<button class="twisty" data-act="twist" aria-expanded="${open}" aria-label="${open ? "Collapse" : "Expand"} folder">${icon("chevron")}</button>` +
+        `<button class="album-open" title="${esc(f.name)}" aria-current="${act ? "page" : "false"}">${icon("folder")} ` +
+        `<span class="album-name">${esc(f.name)}</span></button>${tools("folder")}</div>`;
+      if (open) out += tree(f.id, depth + 1);
+    }
+    for (const a of albumsIn.get(parent) || []) {
+      const n = albumCounts.get(a.id) || 0;
+      const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
+      out += `<div class="item${act}" data-v="album" data-id="${a.id}" style="--depth:${depth}"><button class="album-open" title="${esc(a.name)}" aria-current="${act ? "page" : "false"}">${icon("photos")} ` +
+        `<span class="album-name">${esc(a.name)}</span>` +
+        `<span class="n">${n}</span></button>${tools("album")}</div>`;
+    }
+    return out;
+  };
+  html += tree(null, 0);
+  if (!albums.length && !folders.length) html += `<p class="sidebar-note">Create an album to organize your photos.</p>`;
   html += `</div>`;
   const sb = $("sidebar");
   sb.innerHTML = html;
@@ -1188,22 +1375,23 @@ function renderSidebar() {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         e.stopPropagation();
+        const { v, id } = el.dataset;
         el.click();
-        $("sidebar").querySelector(`[data-v="${currentView.type}"]${currentView.album ? `[data-id="${currentView.album}"]` : ""}`)?.focus();
+        sidebarRow(v, id)?.focus();
       }
     };
     el.onclick = e => {
       const keyboard = e.detail === 0;
-      const act = e.target.dataset?.act;
-      const id = el.dataset.id;
-      if (act === "ren") { renameAlbum(id); return; }
-      if (act === "del") { deleteAlbum(id); return; }
-      currentView = { type: el.dataset.v, album: id || null };
-      clearSelection();
-      renderPhotos();
-      renderSidebar();
+      const act = e.target.closest("[data-act]")?.dataset.act;
+      const { v, id } = el.dataset;
+      if (act === "twist") { toggleFolder(id); return; }
+      if (act === "ren") { v === "folder" ? renameFolder(id) : v === "smart" ? editSmartAlbum(id) : renameAlbum(id); return; }
+      if (act === "del") { v === "folder" ? deleteFolder(id) : v === "smart" ? deleteSmartAlbum(id) : deleteAlbum(id); return; }
+      if (act === "move") { v === "folder" ? moveItems([], [id]) : moveItems([id], []); return; }
+      openView({ type: v === "folder" ? "albums" : v, album: v === "album" ? id : null,
+        folder: v === "folder" ? id : null, smart: v === "smart" ? id : null });
       if (keyboard) {
-        const row = $("sidebar").querySelector(`[data-v="${currentView.type}"]${id ? `[data-id="${id}"]` : ""}`);
+        const row = sidebarRow(v, id);
         (row?.querySelector(".album-open") || row)?.focus();
       }
     };
@@ -1214,18 +1402,46 @@ function renderSidebar() {
     renderSidebar();
     $("albtoggle").focus();
   };
+  // New albums and folders go into the folder being browsed.
+  const here = () => currentView.type === "albums" ? currentView.folder || null : null;
   $("albadd").onclick = async e => {
     e.stopPropagation();
+    const folder = here();
     const name = await promptText("New album");
     if (!name?.trim()) return;
     try {
-      const id = await invoke("album_create", { name });
+      const id = await invoke("album_create", { name, folder });
       await loadAlbums();
-      currentView = { type: "album", album: id };
-      renderPhotos();
-      renderSidebar();
+      openView({ type: "album", album: id });
     } catch (err) { toast("" + err); }
   };
+  $("foladd").onclick = async e => {
+    e.stopPropagation();
+    const parent = here();
+    const name = await promptText("New folder");
+    if (!name?.trim()) return;
+    try {
+      await invoke("folder_create", { name, parent });
+      await loadAlbums();
+      openView({ type: "albums", folder: parent });
+    } catch (err) { toast("" + err); }
+  };
+  $("smartadd").onclick = e => { e.stopPropagation(); editSmartAlbum(null); };
+}
+
+function openView(view) {
+  currentView = { album: null, folder: null, smart: null, ...view };
+  clearSelection();
+  renderPhotos();
+  renderSidebar();
+  window.scrollTo(0, 0);
+}
+
+function toggleFolder(id) {
+  openFolders.has(id) ? openFolders.delete(id) : openFolders.add(id);
+  localStorage.setItem("pv-folders-open", JSON.stringify([...openFolders]));
+  renderSidebar();
+  sidebarRow("folder", id)?.querySelector(".twisty")?.focus();
 }
 
 async function renameAlbum(id) {
@@ -1252,6 +1468,130 @@ async function deleteAlbum(id) {
   await loadGrid();
 }
 
+async function renameFolder(id) {
+  const f = folderOf(id);
+  const name = await promptText("Rename folder", f?.name || "");
+  if (!name?.trim() || name === f?.name) return;
+  try {
+    await invoke("folder_rename", { id, name });
+    await loadAlbums();
+    renderSidebar();
+    renderPhotos({ keepScroll: true });
+  } catch (err) { toast("" + err); }
+}
+
+async function deleteFolder(id) {
+  const f = folderOf(id);
+  const ok = await ask(`Delete the folder "${f?.name}"?\nAlbums and folders in it move up a level. No photos are deleted.`,
+    { title: "Delete folder", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel" });
+  if (!ok) return;
+  try { await invoke("folder_delete", { id }); }
+  catch (err) { toast("" + err); return; }
+  if (currentView.type === "albums" && currentView.folder === id) currentView.folder = f?.parent || null;
+  openFolders.delete(id);
+  localStorage.setItem("pv-folders-open", JSON.stringify([...openFolders]));
+  await loadAlbums();
+  renderSidebar();
+  renderPhotos();
+}
+
+// Resolves to a folder id, null for the top level, or undefined if cancelled.
+let fmResolve = null;
+function pickFolder(title, skip) {
+  return new Promise(resolve => {
+    fmResolve = resolve;
+    $("fmtitle").textContent = title;
+    $("fmselect").innerHTML = `<option value="">Top level</option>` + folderTree(skip).map(({ f, depth }) =>
+      `<option value="${f.id}">${"   ".repeat(depth + 1)}${esc(f.name)}</option>`).join("");
+    $("foldermodal").classList.add("open");
+    $("fmselect").focus();
+  });
+}
+$("folderform").addEventListener("submit", e => {
+  e.preventDefault();
+  $("foldermodal").classList.remove("open");
+  fmResolve?.($("fmselect").value || null);
+  fmResolve = null;
+});
+$("fmcancel").onclick = () => {
+  $("foldermodal").classList.remove("open");
+  fmResolve?.(undefined);
+  fmResolve = null;
+};
+
+async function moveItems(albumIds, folderIds) {
+  const n = albumIds.length + folderIds.length;
+  const label = n === 1 ? `“${albumIds.length ? albums.find(a => a.id === albumIds[0])?.name : folderOf(folderIds[0])?.name}”`
+    : `${n} items`;
+  const to = await pickFolder(`Move ${label} to`, new Set(folderIds));
+  if (to === undefined) return;
+  try { await invoke("move_to_folder", { albums: albumIds, folders: folderIds, to }); }
+  catch (err) { toast("" + err); return; }
+  if (to) {
+    openFolders.add(to);
+    localStorage.setItem("pv-folders-open", JSON.stringify([...openFolders]));
+  }
+  cardSelection.clear();
+  await loadAlbums();
+  renderSidebar();
+  renderPhotos({ keepScroll: true });
+}
+
+const dateValue = (s, addDays = 0) => {
+  if (!s) return null;
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d + addDays).getTime() / 1000;
+};
+const dateInput = t => {
+  if (t == null) return "";
+  const d = new Date(t * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+let smartEditing = null;
+function editSmartAlbum(id) {
+  const a = smartAlbums.find(x => x.id === id), r = a?.rules || {};
+  smartEditing = a ? id : null;
+  $("smtitle").textContent = a ? "Edit smart album" : "New smart album";
+  $("smname").value = a?.name || "";
+  $("smquery").value = r.query || "";
+  $("smkind").value = r.kind || "";
+  $("smfrom").value = dateInput(r.from);
+  $("smto").value = r.to == null ? "" : dateInput(r.to - 1);
+  $("smfav").checked = !!r.favorite;
+  $("smunfiled").checked = !!r.unfiled;
+  $("smartmodal").classList.add("open");
+  $("smname").focus();
+}
+$("smartform").addEventListener("submit", async e => {
+  e.preventDefault();
+  const rules = {
+    query: $("smquery").value.trim(), kind: $("smkind").value || null,
+    favorite: $("smfav").checked, unfiled: $("smunfiled").checked,
+    from: dateValue($("smfrom").value), to: dateValue($("smto").value, 1),
+  };
+  try {
+    const id = await invoke("smart_album_save", { id: smartEditing, name: $("smname").value, rules });
+    $("smartmodal").classList.remove("open");
+    await loadAlbums();
+    openView({ type: "smart", smart: id });
+  } catch (err) { toast("" + err); }
+});
+$("smcancel").onclick = () => $("smartmodal").classList.remove("open");
+
+async function deleteSmartAlbum(id) {
+  const a = smartAlbums.find(x => x.id === id);
+  const ok = await ask(`Delete the smart album "${a?.name}"?\nNo photos are deleted.`,
+    { title: "Delete smart album", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel" });
+  if (!ok) return;
+  try { await invoke("smart_album_delete", { id }); }
+  catch (err) { toast("" + err); return; }
+  if (currentView.type === "smart" && currentView.smart === id) currentView = { type: "all", album: null };
+  await loadAlbums();
+  renderSidebar();
+  renderPhotos();
+}
+
 function tileClick(i, e) {
   focusIdx = i;
   if (selectMode || e.metaKey || e.ctrlKey) {
@@ -1274,16 +1614,27 @@ function renderPhotos({ keepScroll = false } = {}) {
   syncViewer();
   focusIdx = Math.min(focusIdx, visible.length - 1);
   const albumsView = currentView.type === "albums";
-  const shownAlbums = albumsView ? albums.filter(a => a.name.toLowerCase().includes(query)) : [];
-  const shown = albumsView ? shownAlbums.length : visible.length;
-  const noun = albumsView ? "album" : "item";
-  const titles = { all: "All Photos", favorites: "Favorites", videos: "Videos", albums: "Albums", duplicates: "Duplicates", trash: "Recently Deleted" };
+  // Search looks through every folder. Otherwise show what's in the current one.
+  const here = (id, parent) => (folderOf(parent) ? parent : null) === id;
+  const cards = !albumsView ? null : query
+    ? { folders: folders.filter(f => f.name.toLowerCase().includes(query)),
+        albums: albums.filter(a => a.name.toLowerCase().includes(query)) }
+    : { folders: folders.filter(f => here(currentView.folder || null, f.parent)),
+        albums: albums.filter(a => here(currentView.folder || null, a.folder)) };
+  const shown = albumsView ? cards.folders.length + cards.albums.length : visible.length;
+  const titles = { all: "All Photos", favorites: "Favorites", videos: "Videos", unfiled: "Not in an Album", albums: "Albums", duplicates: "Duplicates", trash: "Recently Deleted" };
   $("viewtitle").textContent = currentView.type === "album"
-    ? albums.find(a => a.id === currentView.album)?.name || "Album" : titles[currentView.type];
+    ? albums.find(a => a.id === currentView.album)?.name || "Album"
+    : currentView.type === "smart" ? smartAlbums.find(a => a.id === currentView.smart)?.name || "Smart Album"
+    : albumsView && currentView.folder ? folderOf(currentView.folder)?.name || "Folder"
+    : titles[currentView.type];
   // Long album names are cut off, so hovering shows the whole name.
   $("viewtitle").title = $("viewtitle").textContent;
   $("count").style.display = "block";
-  $("count").textContent = `${shown.toLocaleString()} ${query ? "matching " : ""}${noun}${shown === 1 ? "" : "s"}`;
+  const counted = (n, noun) => `${n.toLocaleString()} ${query ? "matching " : ""}${noun}${n === 1 ? "" : "s"}`;
+  $("count").textContent = albumsView
+    ? [cards.folders.length && counted(cards.folders.length, "folder"), counted(cards.albums.length, "album")].filter(Boolean).join(" · ")
+    : counted(shown, "item");
   $("empty").style.display = shown ? "none" : "block";
   $("empty").innerHTML = icon(albumsView ? "albums" : "photos") + emptyMessage();
   $("search").placeholder = albumsView ? "Search albums" : "Search";
@@ -1320,9 +1671,11 @@ function renderPhotos({ keepScroll = false } = {}) {
   renderBody = null;
   lastDateGroup = null;
   renderSentinel = null;
+  $("yearrail").hidden = true;
+  $("content").classList.remove("has-rail");
   if (albumsView) {
     grid.className = "albums";
-    renderAlbumCards(shownAlbums);
+    renderAlbumCards(cards);
     renderedSelection = new Set();
     updateSelectionUI();
     if (kept) window.scrollTo(0, kept.winY);
@@ -1390,13 +1743,15 @@ function renderPhotos({ keepScroll = false } = {}) {
     window.scrollTo(0, kept.winY);
   }
   if (renderedCount < visible.length) renderObserver.observe(renderSentinel);
+  renderYearRail();
   // Tiles were just built with their .sel classes in place.
   renderedSelection = new Set(selection);
   updateSelectionUI();
 }
 
-// One card per album, with its newest photo as the cover.
-function renderAlbumCards(list) {
+// Folder cards, then one card per album with its newest photo as the cover.
+// A bar above them shows where you are and what's selected.
+function renderAlbumCards({ folders: shownFolders, albums: shownAlbums }) {
   const counts = new Map(), covers = new Map();
   for (const p of photos) {
     if (p.deleted) continue;
@@ -1406,26 +1761,95 @@ function renderAlbumCards(list) {
       if (!cover || p.added > cover.added) covers.set(id, p);
     }
   }
+  const inside = new Map();
+  for (const item of [...folders.map(f => f.parent), ...albums.map(a => a.folder)])
+    if (item) inside.set(item, (inside.get(item) || 0) + 1);
+  const path = parent => query && folderOf(parent) ? `<span class="apath">${esc(folderPath(parent))}</span>` : "";
+  const sel = key => cardSelection.has(key) ? " sel" : "";
+  const folderId = currentView.folder || null;
+  let bar = "";
+  if (!query && folderId) {
+    bar += [`<button class="crumb" data-crumb="">Albums</button>`,
+      ...folderChain(folderId).reverse().map(id =>
+        `<button class="crumb" data-crumb="${id}"${id === folderId ? ' aria-current="page"' : ""}>${esc(folderOf(id).name)}</button>`)]
+      .join(`<span aria-hidden="true">›</span>`);
+  }
+  if (cardSelection.size) {
+    bar += `<span class="cardsel">${cardSelection.size} selected` +
+      `<button class="btn" id="cardmove">Move to&hellip;</button><button class="btn" id="cardclear">Clear</button></span>`;
+  }
   const grid = $("grid");
-  grid.innerHTML = list.map(a => {
+  grid.innerHTML = (bar ? `<div class="cardbar">${bar}</div>` : "") + shownFolders.map(f => {
+    const n = inside.get(f.id) || 0;
+    return `<button class="acard${sel("f:" + f.id)}" data-key="f:${f.id}" title="${esc(f.name)}"><span class="acover">${icon("folder")}</span>` +
+      `<span class="aname">${esc(f.name)}</span>${path(f.parent)}<span class="acount">${plural(n, "item")}</span></button>`;
+  }).join("") + shownAlbums.map(a => {
     const n = counts.get(a.id) || 0, cover = covers.get(a.id);
-    return `<button class="acard" data-id="${a.id}" title="${esc(a.name)}"><span class="acover">` +
-      (cover ? `<img src="${mediaURL(cover.id, true)}" alt="" loading="lazy" decoding="async">` : icon("folder")) +
-      `</span><span class="aname">${esc(a.name)}</span>` +
-      `<span class="acount">${n.toLocaleString()} item${n === 1 ? "" : "s"}</span></button>`;
+    return `<button class="acard${sel("a:" + a.id)}" data-key="a:${a.id}" title="${esc(a.name)}"><span class="acover">` +
+      (cover ? `<img src="${mediaURL(cover.id, true)}" alt="" loading="lazy" decoding="async">` : icon("photos")) +
+      `</span><span class="aname">${esc(a.name)}</span>${path(a.folder)}` +
+      `<span class="acount">${plural(n, "item")}</span></button>`;
   }).join("");
+  grid.querySelectorAll(".crumb").forEach(b => {
+    b.onclick = () => openView({ type: "albums", folder: b.dataset.crumb || null });
+  });
+  if (cardSelection.size) {
+    $("cardmove").onclick = () => {
+      const picked = [...cardSelection];
+      const ids = kind => picked.filter(k => k.startsWith(kind)).map(k => k.slice(2));
+      moveItems(ids("a:"), ids("f:"));
+    };
+    $("cardclear").onclick = () => { cardSelection.clear(); renderPhotos({ keepScroll: true }); };
+  }
   grid.querySelectorAll(".acard").forEach(card => {
     card.onclick = e => {
-      const id = card.dataset.id;
-      currentView = { type: "album", album: id };
-      clearSelection();
-      renderPhotos();
-      renderSidebar();
-      window.scrollTo(0, 0);
-      if (e.detail === 0)
-        $("sidebar").querySelector(`[data-v="album"][data-id="${id}"] .album-open`)?.focus();
+      const key = card.dataset.key, id = key.slice(2);
+      // Command- or Shift-click picks cards to move together.
+      if (e.metaKey || e.ctrlKey || e.shiftKey) {
+        cardSelection.has(key) ? cardSelection.delete(key) : cardSelection.add(key);
+        renderPhotos({ keepScroll: true });
+        $("grid").querySelector(`.acard[data-key="${key}"]`)?.focus();
+        return;
+      }
+      // Album search text would otherwise filter the photos inside.
+      clearTimeout(searchTimer);
+      $("search").value = "";
+      query = "";
+      if (key.startsWith("f:")) {
+        openView({ type: "albums", folder: id });
+        return;
+      }
+      openView({ type: "album", album: id });
+      if (e.detail === 0) sidebarRow("album", id)?.querySelector(".album-open")?.focus();
     };
   });
+}
+
+// Year buttons down the right edge when the grid is sorted by date. Clicking
+// one renders up to that year's first item and scrolls to its month heading.
+function renderYearRail() {
+  const key = photoSort.rules[0].key;
+  if (layout !== "grid" || (key !== "added" && key !== "taken") || currentView.type === "duplicates") return;
+  const firstOfYear = new Map();
+  visible.forEach((p, i) => {
+    const year = new Date((key === "taken" ? p.taken ?? p.added : p.added) * 1000).getFullYear();
+    if (!firstOfYear.has(year)) firstOfYear.set(year, i);
+  });
+  if (firstOfYear.size < 2) return;
+  const rail = $("yearrail");
+  rail.innerHTML = [...firstOfYear].map(([year, i]) => `<button data-i="${i}">${year}</button>`).join("");
+  rail.querySelectorAll("button").forEach(b => { b.onclick = () => jumpTo(Number(b.dataset.i)); });
+  rail.hidden = false;
+  $("content").classList.add("has-rail");
+}
+
+function jumpTo(i) {
+  renderMore(i);
+  const tile = tileById.get(visible[i]?.id);
+  if (!tile) return;
+  const target = tile.previousElementSibling?.classList.contains("ghead") ? tile.previousElementSibling : tile;
+  const header = document.querySelector("#gallery header")?.offsetHeight || 0;
+  window.scrollTo(0, target.getBoundingClientRect().top + window.scrollY - header - 8);
 }
 
 function renderMore(throughIndex = -1) {
@@ -1499,10 +1923,17 @@ async function loadGrid() {
 // it keeps the albums already shown and returns the error so callers can retry.
 async function loadAlbums() {
   const session = sessionVersion, request = ++albumRequest;
-  let loadedAlbums;
-  try { loadedAlbums = await invoke("list_albums"); }
+  let loadedAlbums, loaded;
+  try { [loadedAlbums, loaded] = await Promise.all([invoke("list_albums"), invoke("list_collections")]); }
   catch (err) { return err; }
-  if (session === sessionVersion && request === albumRequest) albums = loadedAlbums;
+  if (session === sessionVersion && request === albumRequest) {
+    albums = loadedAlbums;
+    folders = loaded.folders;
+    folderById = new Map(folders.map(f => [f.id, f]));
+    smartAlbums = loaded.smart_albums;
+    const exists = new Set([...albums.map(a => "a:" + a.id), ...folders.map(f => "f:" + f.id)]);
+    for (const key of cardSelection) if (!exists.has(key)) cardSelection.delete(key);
+  }
   return null;
 }
 
@@ -1522,6 +1953,7 @@ $("search").addEventListener("input", e => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     query = e.target.value.trim().toLowerCase();
+    cardSelection.clear(); // a picked card the search hides shouldn't move unseen
     renderPhotos();
   }, 150);
 });
@@ -1535,6 +1967,7 @@ function toggleSelect(id) {
 
 function clearSelection() {
   selection.clear();
+  cardSelection.clear();
   selectMode = false;
   $("selectbtn").classList.remove("on");
   $("selectbtn").setAttribute("aria-pressed", "false");
@@ -1543,6 +1976,10 @@ function clearSelection() {
 }
 
 function selectedIds() { return [...selection]; }
+
+// Favorites and smart album views filter on favorites and tags, so editing
+// those can change which photos belong.
+const membershipMayChange = () => currentView.type === "favorites" || currentView.type === "smart";
 
 // Favorite is never a sort key, so tiles don't move — patch state and the
 // affected tiles instead of a full reload. Favorites view is the exception:
@@ -1553,7 +1990,7 @@ function applyFavorite(ids, favorite) {
     if (!idset.has(p.id)) continue;
     p.favorite = favorite;
     const el = tileById.get(p.id);
-    if (!el || currentView.type === "favorites") continue;
+    if (!el || membershipMayChange()) continue;
     if (el.tagName === "TR") {
       el.children[1].innerHTML =
         (favorite ? '<span class="fav">&#9829;</span>' : "") + esc(p.name);
@@ -1562,7 +1999,7 @@ function applyFavorite(ids, favorite) {
       if (favorite) el.insertAdjacentHTML("beforeend", `<div class="fbadge">&#9829;</div>`);
     }
   }
-  if (currentView.type === "favorites") renderPhotos({ keepScroll: true });
+  if (membershipMayChange()) renderPhotos({ keepScroll: true });
   renderSidebar();
 }
 
@@ -1581,6 +2018,7 @@ function updateSelectionUI() {
     const inTrash = currentView.type === "trash";
     $("selfav").style.display = inTrash ? "none" : "";
     $("selalbum").parentElement.style.display = inTrash ? "none" : "";
+    $("seltags").parentElement.style.display = inTrash ? "none" : "";
     $("seldelete").style.display = inTrash ? "none" : "";
     $("selrestore").style.display = inTrash ? "" : "none";
     $("selpurge").style.display = inTrash ? "" : "none";
@@ -1674,8 +2112,10 @@ $("selalbum").onclick = e => {
   const menu = $("albummenu");
   if (menu.classList.contains("open")) { menu.classList.remove("open"); return; }
   let html = "";
-  for (const a of albums)
-    html += `<button data-id="${a.id}" title="${esc(a.name)}">${esc(a.name)}</button>`;
+  for (const a of albums) {
+    const where = folderPath(a.folder);
+    html += `<button data-id="${a.id}" title="${esc(where ? `${where} › ${a.name}` : a.name)}">${esc(a.name)}</button>`;
+  }
   if (albums.length) html += `<div class="sep"></div>`;
   html += `<button data-new="1">New album…</button>`;
   if (currentView.type === "album")
@@ -1704,6 +2144,29 @@ $("selalbum").onclick = e => {
   });
   menu.classList.add("open");
 };
+
+// Tags menu in the selection bar.
+$("seltags").onclick = e => {
+  e.stopPropagation();
+  $("tagmenu").classList.toggle("open");
+};
+async function bulkTags(add) {
+  $("tagmenu").classList.remove("open");
+  const ids = selectedIds();
+  const current = [...new Set(photos.filter(p => selection.has(p.id)).flatMap(p => p.tags || []))];
+  const shown = current.slice(0, 12).join(", ") + (current.length > 12 ? ", …" : "");
+  const text = await promptText(add ? "Add tags, separated by commas"
+    : `Remove tags, separated by commas${current.length ? `. In use: ${shown}` : ""}`);
+  const tags = (text || "").split(",").map(t => t.trim()).filter(Boolean);
+  if (!tags.length) return;
+  try {
+    await invoke("edit_tags", { ids, add: add ? tags : [], remove: add ? [] : tags });
+    await loadGrid();
+    toast(`${add ? "Tagged" : "Removed tags from"} ${plural(ids.length, "item")}`);
+  } catch (err) { toast("" + err); }
+}
+$("tagadd").onclick = () => bulkTags(true);
+$("tagremove").onclick = () => bulkTags(false);
 
 // Close any open dropdown on outside click.
 document.addEventListener("click", e => {
@@ -1963,6 +2426,8 @@ function renderInfo() {
     try {
       await invoke("set_tags", { id: p.id, tags });
       p.tags = tags;
+      if (membershipMayChange()) renderPhotos({ keepScroll: true });
+      renderSidebar();
       renderInfo();
     } catch (err) { toast("" + err); }
   });
@@ -2508,6 +2973,9 @@ $("clearbtn").onclick = async () => {
   catch (err) { if (session === sessionVersion) toast("Could not delete photos: " + err); return; }
   if (session !== sessionVersion) return;
   $("settings").classList.remove("open");
+  // Delete All also removes albums, folders, and smart albums.
+  currentView = { type: "all", album: null };
+  await loadAlbums();
   try { await loadGrid(); }
   catch (err) {
     if (session === sessionVersion) toast(`Deleted ${deleted.toLocaleString()} items, but the library could not refresh: ${err}`);
@@ -2565,11 +3033,13 @@ document.addEventListener("keydown", e => {
     else if ((e.key === "+" || e.key === "=") && !isVideo(visible[cur])) setZoom(zoom.s * 1.5);
     else if (e.key === "-" && !isVideo(visible[cur])) setZoom(zoom.s / 1.5);
     else if (e.key === "0" && !isVideo(visible[cur])) setZoom(1);
-    // Arrows pan while zoomed in, navigate otherwise.
-    else if (e.key === "ArrowRight") zoom.s > 1 ? (zoom.x -= 60, applyZoom()) : show(cur + 1);
-    else if (e.key === "ArrowLeft") zoom.s > 1 ? (zoom.x += 60, applyZoom()) : show(cur - 1);
-    else if (e.key === "ArrowUp" && zoom.s > 1) { zoom.y += 60; applyZoom(); }
-    else if (e.key === "ArrowDown" && zoom.s > 1) { zoom.y -= 60; applyZoom(); }
+    // Left/Right always navigate. Shift+arrows (and Up/Down) pan while zoomed in.
+    else if (e.key.startsWith("Arrow") && zoom.s > 1 && (e.shiftKey || e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      const step = { ArrowLeft: [60, 0], ArrowRight: [-60, 0], ArrowUp: [0, 60], ArrowDown: [0, -60] }[e.key];
+      e.preventDefault(); zoom.x += step[0]; zoom.y += step[1]; applyZoom();
+    }
+    else if (e.key === "ArrowRight") { e.preventDefault(); show(cur + 1); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); show(cur - 1); }
     else if (e.key === "f") $("lbfav").click();
     else if (e.key === "i") $("lbinfobtn").click();
     else if ((e.key === "Delete" || e.key === "Backspace") && currentView.type !== "trash")
@@ -2585,6 +3055,7 @@ document.addEventListener("keydown", e => {
       else if (top.id === "keymodal") cancelRecoveryKey();
       else if (top.id === "offermodal") $("offerno").click();
       else if (top.id === "settings") $("setclose").click();
+      else if (top.id === "foldermodal") $("fmcancel").click();
       else top.classList.remove("open");
     }
     return;
@@ -2610,7 +3081,9 @@ document.addEventListener("keydown", e => {
     return;
   }
   if (e.key === "Escape") {
-    if (selection.size || selectMode) clearSelection();
+    const cards = cardSelection.size;
+    if (selection.size || selectMode || cards) clearSelection();
+    if (cards) renderPhotos({ keepScroll: true });
     return;
   }
   if (e.key === "Enter" && focusIdx >= 0) { show(focusIdx); return; }

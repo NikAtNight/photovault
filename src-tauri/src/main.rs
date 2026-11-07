@@ -108,6 +108,7 @@ struct Vault {
     // Decrypted once at unlock and kept in memory; cleared on lock.
     photos: HashMap<String, PhotoInfo>,
     albums: HashMap<String, Album>,
+    collections: Collections,
     recovery_required: bool,
     last_activity: Instant,
     importing: bool,
@@ -187,6 +188,7 @@ fn wipe_vault(vault: &mut Vault) {
     vault.pending_recovery = None;
     vault.photos.clear();
     vault.albums.clear();
+    vault.collections = Collections::default();
     vault.media_cache = None;
     vault.thumb_cache.clear();
     vault.thumb_order.clear();
@@ -252,6 +254,52 @@ fn default_scrypt_p() -> u32 {
 struct Album {
     name: String,
     created: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    folder: Option<String>, // folder id; None = top level
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Folder {
+    name: String,
+    created: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>, // folder id; None = top level
+}
+
+/// A saved filter, matched by the UI. Every set field must match (AND). Dates
+/// compare against the capture date, falling back to the import date; `to` is
+/// exclusive (the start of the day after the chosen end date).
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+struct SmartRules {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    query: String, // name or tag contains, case-insensitive
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>, // "photo" or "video"
+    #[serde(default, skip_serializing_if = "is_false")]
+    favorite: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    unfiled: bool, // in no album
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SmartAlbum {
+    name: String,
+    created: f64,
+    rules: SmartRules,
+}
+
+/// Album folders and smart albums. Stored at the top level of the index next
+/// to photos and albums.
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct Collections {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    folders: HashMap<String, Folder>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    smart_albums: HashMap<String, SmartAlbum>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -284,6 +332,8 @@ struct IndexData {
     photos: HashMap<String, PhotoInfo>,
     #[serde(default)]
     albums: HashMap<String, Album>,
+    #[serde(flatten)]
+    collections: Collections,
     #[serde(default)]
     recovery_required: bool,
 }
@@ -292,6 +342,8 @@ struct IndexData {
 struct IndexOut<'a> {
     photos: &'a HashMap<String, PhotoInfo>,
     albums: &'a HashMap<String, Album>,
+    #[serde(flatten)]
+    collections: &'a Collections,
     recovery_required: bool,
 }
 
@@ -316,6 +368,27 @@ struct AlbumEntry {
     id: String,
     name: String,
     created: f64,
+    folder: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FolderEntry {
+    id: String,
+    name: String,
+    parent: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SmartEntry {
+    id: String,
+    name: String,
+    rules: SmartRules,
+}
+
+#[derive(Serialize)]
+struct CollectionsOut {
+    folders: Vec<FolderEntry>,
+    smart_albums: Vec<SmartEntry>,
 }
 
 // ---------------------------------------------------------------- crypto ---
@@ -635,6 +708,7 @@ fn parse_index(json: &[u8]) -> Result<IndexData, String> {
         Ok(IndexData {
             photos,
             albums: HashMap::new(),
+            collections: Collections::default(),
             recovery_required: false,
         })
     }
@@ -730,6 +804,7 @@ fn persist_index(vault: &Vault, key: &[u8; 32]) -> Result<(), String> {
     let prior = IndexOut {
         photos: &previous.photos,
         albums: &previous.albums,
+        collections: &previous.collections,
         recovery_required: previous.recovery_required,
     };
     let previous_blob = encrypt(
@@ -739,6 +814,7 @@ fn persist_index(vault: &Vault, key: &[u8; 32]) -> Result<(), String> {
     let out = IndexOut {
         photos: &vault.photos,
         albums: &vault.albums,
+        collections: &vault.collections,
         recovery_required: vault.recovery_required,
     };
     let json = serde_json::to_vec(&out).map_err(|e| e.to_string())?;
@@ -809,6 +885,7 @@ fn finish_unlock(state: &Mutex<Vault>, master: [u8; 32]) -> Result<(), String> {
     let data = load_index(&vault, &master)?;
     vault.photos = data.photos;
     vault.albums = data.albums;
+    vault.collections = data.collections;
     vault.recovery_required = data.recovery_required;
     let cutoff = now_secs() - TRASH_RETENTION_SECS;
     let expired: Vec<String> = vault
@@ -1377,6 +1454,7 @@ fn create_new_vault(state: &Mutex<Vault>, password: &str) -> Result<(), String> 
     }
     vault.photos = HashMap::new();
     vault.albums = HashMap::new();
+    vault.collections = Collections::default();
     persist_index(&vault, &master)?;
     // Meta goes last, so the vault only exists once it's complete. If readers
     // see the new meta, the vault is done even if the disk didn't confirm it.
@@ -1867,6 +1945,7 @@ fn album_list(state: &Mutex<Vault>) -> Result<Vec<AlbumEntry>, String> {
             id: id.clone(),
             name: a.name.clone(),
             created: a.created,
+            folder: a.folder.clone(),
         })
         .collect();
     albums.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -1883,26 +1962,38 @@ fn edit_library<T>(
 ) -> Result<T, String> {
     let photos = vault.photos.clone();
     let albums = vault.albums.clone();
+    let collections = vault.collections.clone();
     let saved = edit(vault).and_then(|out| persist_index(vault, key).map(|()| out));
     if saved.is_err() {
         vault.photos = photos;
         vault.albums = albums;
+        vault.collections = collections;
     }
     saved
 }
 
 #[tauri::command]
-async fn album_create(name: String, state: VaultState<'_>) -> Result<String, String> {
+async fn album_create(
+    name: String,
+    folder: Option<String>,
+    state: VaultState<'_>,
+) -> Result<String, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("Album name can't be empty.".into());
     }
     let mut vault = vlock(&state);
     let key = vault.active_key().ok_or("locked")?;
-    create_album(&mut vault, &key, name)
+    create_album(&mut vault, &key, name, folder)
 }
 
-fn create_album(vault: &mut Vault, key: &[u8; 32], name: String) -> Result<String, String> {
+fn create_album(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    name: String,
+    folder: Option<String>,
+) -> Result<String, String> {
+    check_folder(vault, folder.as_deref())?;
     edit_library(vault, key, |vault| {
         let id = random_id();
         vault.albums.insert(
@@ -1910,9 +2001,261 @@ fn create_album(vault: &mut Vault, key: &[u8; 32], name: String) -> Result<Strin
             Album {
                 name,
                 created: now_secs(),
+                folder,
             },
         );
         Ok(id)
+    })
+}
+
+// ----------------------------------------------------------- collections ---
+
+fn check_folder(vault: &Vault, folder: Option<&str>) -> Result<(), String> {
+    match folder {
+        Some(id) if !vault.collections.folders.contains_key(id) => Err("Folder not found.".into()),
+        _ => Ok(()),
+    }
+}
+
+fn folder_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Folder name can't be empty.".into());
+    }
+    Ok(name.to_string())
+}
+
+#[tauri::command]
+async fn list_collections(state: VaultState<'_>) -> Result<CollectionsOut, String> {
+    let vault = vlock(&state);
+    vault.background_key().ok_or("locked")?;
+    let mut folders: Vec<FolderEntry> = vault
+        .collections
+        .folders
+        .iter()
+        .map(|(id, f)| FolderEntry {
+            id: id.clone(),
+            name: f.name.clone(),
+            parent: f.parent.clone(),
+        })
+        .collect();
+    folders.sort_by_key(|f| f.name.to_lowercase());
+    let mut smart_albums: Vec<SmartEntry> = vault
+        .collections
+        .smart_albums
+        .iter()
+        .map(|(id, s)| SmartEntry {
+            id: id.clone(),
+            name: s.name.clone(),
+            rules: s.rules.clone(),
+        })
+        .collect();
+    smart_albums.sort_by_key(|s| s.name.to_lowercase());
+    Ok(CollectionsOut {
+        folders,
+        smart_albums,
+    })
+}
+
+#[tauri::command]
+async fn folder_create(
+    name: String,
+    parent: Option<String>,
+    state: VaultState<'_>,
+) -> Result<String, String> {
+    let name = folder_name(&name)?;
+    let mut vault = vlock(&state);
+    let key = vault.active_key().ok_or("locked")?;
+    create_folder(&mut vault, &key, name, parent)
+}
+
+fn create_folder(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    name: String,
+    parent: Option<String>,
+) -> Result<String, String> {
+    check_folder(vault, parent.as_deref())?;
+    edit_library(vault, key, |vault| {
+        let id = random_id();
+        vault.collections.folders.insert(
+            id.clone(),
+            Folder {
+                name,
+                created: now_secs(),
+                parent,
+            },
+        );
+        Ok(id)
+    })
+}
+
+#[tauri::command]
+async fn folder_rename(id: String, name: String, state: VaultState<'_>) -> Result<(), String> {
+    let name = folder_name(&name)?;
+    let mut vault = vlock(&state);
+    let key = vault.active_key().ok_or("locked")?;
+    edit_library(&mut vault, &key, |vault| {
+        vault
+            .collections
+            .folders
+            .get_mut(&id)
+            .ok_or("Folder not found.")?
+            .name = name;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+async fn folder_delete(id: String, state: VaultState<'_>) -> Result<(), String> {
+    let mut vault = vlock(&state);
+    let key = vault.active_key().ok_or("locked")?;
+    delete_folder(&mut vault, &key, &id)
+}
+
+/// Removes the folder only. Albums and folders inside it move up to its parent.
+fn delete_folder(vault: &mut Vault, key: &[u8; 32], id: &str) -> Result<(), String> {
+    let Some(parent) = vault.collections.folders.get(id).map(|f| f.parent.clone()) else {
+        return Ok(());
+    };
+    edit_library(vault, key, |vault| {
+        vault.collections.folders.remove(id);
+        for (child, f) in vault.collections.folders.iter_mut() {
+            if f.parent.as_deref() == Some(id) {
+                // A restored parent loop must not leave a folder as its own parent.
+                f.parent = parent.clone().filter(|p| p != child);
+            }
+        }
+        for a in vault.albums.values_mut() {
+            if a.folder.as_deref() == Some(id) {
+                a.folder = parent.clone();
+            }
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+async fn move_to_folder(
+    albums: Vec<String>,
+    folders: Vec<String>,
+    to: Option<String>,
+    state: VaultState<'_>,
+) -> Result<(), String> {
+    let mut vault = vlock(&state);
+    let key = vault.active_key().ok_or("locked")?;
+    move_into_folder(&mut vault, &key, &albums, &folders, to)
+}
+
+/// Moves albums and folders into `to` (None = top level). A folder can't move
+/// into itself or anything inside it.
+fn move_into_folder(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    albums: &[String],
+    folders: &[String],
+    to: Option<String>,
+) -> Result<(), String> {
+    check_folder(vault, to.as_deref())?;
+    if albums.iter().any(|id| !vault.albums.contains_key(id)) {
+        return Err("Album not found.".into());
+    }
+    let all = &vault.collections.folders;
+    for id in folders {
+        if !all.contains_key(id) {
+            return Err("Folder not found.".into());
+        }
+        // `seen` stops the walk if a restored index holds a parent loop.
+        let mut seen = HashSet::new();
+        let mut at = to.as_deref();
+        while let Some(f) = at.filter(|f| seen.insert(*f)) {
+            if f == id {
+                return Err("A folder can't move into itself.".into());
+            }
+            at = all.get(f).and_then(|f| f.parent.as_deref());
+        }
+    }
+    edit_library(vault, key, |vault| {
+        for id in albums {
+            vault.albums.get_mut(id).ok_or("Album not found.")?.folder = to.clone();
+        }
+        for id in folders {
+            vault
+                .collections
+                .folders
+                .get_mut(id)
+                .ok_or("Folder not found.")?
+                .parent = to.clone();
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+async fn smart_album_save(
+    id: Option<String>,
+    name: String,
+    rules: SmartRules,
+    state: VaultState<'_>,
+) -> Result<String, String> {
+    let mut vault = vlock(&state);
+    let key = vault.active_key().ok_or("locked")?;
+    save_smart_album(&mut vault, &key, id, &name, rules)
+}
+
+/// Creates a smart album, or replaces the name and rules of `id`.
+fn save_smart_album(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    id: Option<String>,
+    name: &str,
+    mut rules: SmartRules,
+) -> Result<String, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Smart album name can't be empty.".into());
+    }
+    rules.query = rules.query.trim().to_string();
+    if !matches!(rules.kind.as_deref(), None | Some("photo") | Some("video")) {
+        return Err("Unknown media type.".into());
+    }
+    if matches!((rules.from, rules.to), (Some(f), Some(t)) if f >= t) {
+        return Err("The start date is after the end date.".into());
+    }
+    if rules == SmartRules::default() {
+        return Err("Add at least one rule.".into());
+    }
+    if id
+        .as_ref()
+        .is_some_and(|id| !vault.collections.smart_albums.contains_key(id))
+    {
+        return Err("Smart album not found.".into());
+    }
+    edit_library(vault, key, |vault| {
+        let id = id.unwrap_or_else(random_id);
+        let created = vault
+            .collections
+            .smart_albums
+            .get(&id)
+            .map_or_else(now_secs, |s| s.created);
+        vault
+            .collections
+            .smart_albums
+            .insert(id.clone(), SmartAlbum { name, created, rules });
+        Ok(id)
+    })
+}
+
+#[tauri::command]
+async fn smart_album_delete(id: String, state: VaultState<'_>) -> Result<(), String> {
+    let mut vault = vlock(&state);
+    let key = vault.active_key().ok_or("locked")?;
+    if !vault.collections.smart_albums.contains_key(&id) {
+        return Ok(());
+    }
+    edit_library(&mut vault, &key, |vault| {
+        vault.collections.smart_albums.remove(&id);
+        Ok(())
     })
 }
 
@@ -2052,6 +2395,41 @@ fn set_photo_tags(
 ) -> Result<(), String> {
     edit_library(vault, key, |vault| {
         vault.photos.get_mut(id).ok_or("not found")?.tags = normalize_tags(tags);
+        Ok(())
+    })
+}
+
+#[tauri::command]
+async fn edit_tags(
+    ids: Vec<String>,
+    add: Vec<String>,
+    remove: Vec<String>,
+    state: VaultState<'_>,
+) -> Result<(), String> {
+    let mut vault = vlock(&state);
+    let key = vault.active_key().ok_or("locked")?;
+    edit_photo_tags(&mut vault, &key, &ids, add, &remove)
+}
+
+/// Adds and removes tags on many photos in one save. Matching ignores case.
+fn edit_photo_tags(
+    vault: &mut Vault,
+    key: &[u8; 32],
+    ids: &[String],
+    add: Vec<String>,
+    remove: &[String],
+) -> Result<(), String> {
+    let remove: HashSet<String> = remove.iter().map(|t| t.trim().to_lowercase()).collect();
+    let add = normalize_tags(add);
+    edit_library(vault, key, |vault| {
+        for id in ids {
+            if let Some(p) = vault.photos.get_mut(id) {
+                let mut tags = std::mem::take(&mut p.tags);
+                tags.retain(|t| !remove.contains(&t.to_lowercase()));
+                tags.extend(add.iter().cloned());
+                p.tags = normalize_tags(tags);
+            }
+        }
         Ok(())
     })
 }
@@ -2815,10 +3193,12 @@ async fn clear_vault(state: VaultState<'_>) -> Result<usize, String> {
 fn clear_vault_contents(vault: &mut Vault, key: &[u8; 32]) -> Result<usize, String> {
     let photos = std::mem::take(&mut vault.photos);
     let albums = std::mem::take(&mut vault.albums);
+    let collections = std::mem::take(&mut vault.collections);
     let count = photos.len();
     if let Err(error) = persist_index(vault, key) {
         vault.photos = photos;
         vault.albums = albums;
+        vault.collections = collections;
         return Err(error);
     }
     vault.media_cache = None;
@@ -3443,6 +3823,7 @@ fn ensure_album(state: &Mutex<Vault>, name: &str) -> Result<(String, bool), Stri
         Album {
             name: name.to_string(),
             created: now_secs(),
+            folder: None,
         },
     );
     if let Err(e) = persist_index(&vault, &key) {
@@ -4375,6 +4756,7 @@ fn main() {
                 lock_unreported: false,
                 photos: HashMap::new(),
                 albums: HashMap::new(),
+                collections: Collections::default(),
                 recovery_required: false,
                 last_activity: Instant::now(),
                 importing: false,
@@ -4434,8 +4816,16 @@ fn main() {
             album_rename,
             album_delete,
             albums_assign,
+            list_collections,
+            folder_create,
+            folder_rename,
+            folder_delete,
+            move_to_folder,
+            smart_album_save,
+            smart_album_delete,
             set_favorite,
             set_tags,
+            edit_tags,
             rename_photo,
             import_photos,
             process_inbox,
@@ -4471,6 +4861,7 @@ mod tests {
             lock_unreported: false,
             photos: HashMap::new(),
             albums: HashMap::new(),
+            collections: Collections::default(),
             recovery_required: false,
             last_activity: Instant::now(),
             importing: false,
@@ -4745,6 +5136,7 @@ mod tests {
             Album {
                 name: "Trip".into(),
                 created: 1.0,
+                folder: None,
             },
         );
         vault.photos.insert("photo".into(), test_photo(None));
@@ -5006,6 +5398,7 @@ mod tests {
             lock_unreported: false,
             photos: HashMap::new(),
             albums: HashMap::new(),
+            collections: Collections::default(),
             recovery_required: false,
             last_activity: Instant::now(),
             importing: false,
@@ -5789,6 +6182,7 @@ mod tests {
             Album {
                 name: "Trip".into(),
                 created: 1.0,
+                folder: None,
             },
         );
         fs::create_dir(vault.index_path().with_extension("tmp")).unwrap();
@@ -5842,6 +6236,7 @@ mod tests {
             Album {
                 name: "Trip".into(),
                 created: 1.0,
+                folder: None,
             },
         );
         persist_index(&vault, &fixture.key).unwrap();
@@ -6010,6 +6405,7 @@ mod tests {
             Album {
                 name: "Trip".into(),
                 created: 1.0,
+                folder: None,
             },
         );
         vault.media_cache = Some(("photo".into(), Arc::new(vec![1, 2, 3])));
@@ -6118,6 +6514,7 @@ mod tests {
             Album {
                 name: "Trip".into(),
                 created: 1.0,
+                folder: None,
             },
         );
         let object = vault.objects_dir().join("photo");
@@ -6192,10 +6589,12 @@ mod tests {
     fn library_json(
         photos: &HashMap<String, PhotoInfo>,
         albums: &HashMap<String, Album>,
+        collections: &Collections,
     ) -> serde_json::Value {
         serde_json::to_value(IndexOut {
             photos,
             albums,
+            collections,
             recovery_required: false,
         })
         .unwrap()
@@ -6217,33 +6616,164 @@ mod tests {
                 Album {
                     name: id.into(),
                     created: 1.0,
+                    folder: None,
                 },
             );
         }
+        vault.collections.folders.insert(
+            "folder".into(),
+            Folder {
+                name: "Folder".into(),
+                created: 1.0,
+                parent: None,
+            },
+        );
+        vault.collections.smart_albums.insert(
+            "smart".into(),
+            SmartAlbum {
+                name: "Smart".into(),
+                created: 1.0,
+                rules: SmartRules {
+                    favorite: true,
+                    ..SmartRules::default()
+                },
+            },
+        );
         persist_index(&vault, &key).unwrap();
-        let before = library_json(&vault.photos, &vault.albums);
+        let before = library_json(&vault.photos, &vault.albums, &vault.collections);
         let index_tmp = vault.index_path().with_extension("tmp");
         fs::create_dir(&index_tmp).unwrap();
         let ids = vec!["photo".to_string(), "other".to_string()];
         let edits: Vec<(&str, Box<dyn Fn(&mut Vault) -> Result<(), String>>)> = vec![
-            ("album create", Box::new(|v| create_album(v, &key, "New".into()).map(|_| ()))),
+            ("album create", Box::new(|v| create_album(v, &key, "New".into(), None).map(|_| ()))),
             ("album delete", Box::new(|v| delete_album(v, &key, "album"))),
             ("assign", Box::new(|v| assign_album(v, &key, &ids, "empty", true))),
             ("unassign", Box::new(|v| assign_album(v, &key, &ids, "album", false))),
             ("favorite", Box::new(|v| mark_favorite(v, &key, &ids, true))),
             ("tags", Box::new(|v| set_photo_tags(v, &key, "photo", vec!["new".into()]))),
+            ("bulk tags", Box::new(|v| edit_photo_tags(v, &key, &ids, vec!["new".into()], &["beach".into()]))),
+            ("folder create", Box::new(|v| create_folder(v, &key, "New".into(), None).map(|_| ()))),
+            ("folder delete", Box::new(|v| delete_folder(v, &key, "folder"))),
+            ("move", Box::new(|v| move_into_folder(v, &key, &["album".into()], &[], Some("folder".into())))),
+            ("smart save", Box::new(|v| {
+                let rules = SmartRules { unfiled: true, ..SmartRules::default() };
+                save_smart_album(v, &key, Some("smart".into()), "Changed", rules).map(|_| ())
+            })),
         ];
         for (name, edit) in &edits {
             assert!(edit(&mut vault).is_err(), "{name} should fail");
-            assert_eq!(library_json(&vault.photos, &vault.albums), before, "{name}");
+            assert_eq!(library_json(&vault.photos, &vault.albums, &vault.collections), before, "{name}");
         }
         // A later successful save must not carry any of the failed edits.
         fs::remove_dir(&index_tmp).unwrap();
         persist_index(&vault, &key).unwrap();
         let index = load_index(&vault, &key).unwrap();
-        assert_eq!(library_json(&index.photos, &index.albums), before);
+        assert_eq!(library_json(&index.photos, &index.albums, &index.collections), before);
         mark_favorite(&mut vault, &key, &ids, true).unwrap();
         assert!(load_index(&vault, &key).unwrap().photos["photo"].favorite);
+    }
+
+    #[test]
+    fn folders_nest_move_and_delete_without_losing_albums() {
+        let fixture = ImportFixture::new();
+        let key = fixture.key;
+        let mut vault = vlock(&fixture.state);
+        let travel = create_folder(&mut vault, &key, "Travel".into(), None).unwrap();
+        let y2019 = create_folder(&mut vault, &key, "2019".into(), Some(travel.clone())).unwrap();
+        let album = create_album(&mut vault, &key, "Paris".into(), Some(y2019.clone())).unwrap();
+        assert!(create_album(&mut vault, &key, "X".into(), Some("missing".into())).is_err());
+
+        // A folder can't move into itself or its own subfolder.
+        let ids = [travel.clone()];
+        assert!(move_into_folder(&mut vault, &key, &[], &ids, Some(travel.clone())).is_err());
+        assert!(move_into_folder(&mut vault, &key, &[], &ids, Some(y2019.clone())).is_err());
+        move_into_folder(&mut vault, &key, &[album.clone()], &[], None).unwrap();
+        assert_eq!(vault.albums[&album].folder, None);
+        move_into_folder(&mut vault, &key, &[album.clone()], &[], Some(y2019.clone())).unwrap();
+
+        // Deleting a folder moves what it held up one level.
+        delete_folder(&mut vault, &key, &y2019).unwrap();
+        assert_eq!(vault.albums[&album].folder.as_deref(), Some(travel.as_str()));
+        let sub = create_folder(&mut vault, &key, "Sub".into(), Some(travel.clone())).unwrap();
+        delete_folder(&mut vault, &key, &travel).unwrap();
+        assert_eq!(vault.albums[&album].folder, None);
+        assert_eq!(vault.collections.folders[&sub].parent, None);
+
+        // Folders survive a save and reload.
+        let index = load_index(&vault, &key).unwrap();
+        assert_eq!(index.collections.folders.len(), 1);
+        assert!(index.albums.contains_key(&album));
+    }
+
+    #[test]
+    fn a_restored_parent_loop_does_not_hang_moves() {
+        let fixture = ImportFixture::new();
+        let key = fixture.key;
+        let mut vault = vlock(&fixture.state);
+        for (id, parent) in [("a", Some("b")), ("b", Some("a")), ("c", None)] {
+            vault.collections.folders.insert(
+                id.into(),
+                Folder {
+                    name: id.into(),
+                    created: 1.0,
+                    parent: parent.map(str::to_string),
+                },
+            );
+        }
+        move_into_folder(&mut vault, &key, &[], &["c".into()], Some("a".into())).unwrap();
+        assert!(move_into_folder(&mut vault, &key, &[], &["b".into()], Some("a".into())).is_err());
+        delete_folder(&mut vault, &key, "a").unwrap();
+        assert_eq!(vault.collections.folders["b"].parent, None);
+    }
+
+    #[test]
+    fn indexes_without_folders_still_load() {
+        let v2 = br#"{"photos":{},"albums":{"a1":{"name":"Trip","created":3.0}}}"#;
+        let data = parse_index(v2).unwrap();
+        assert_eq!(data.albums["a1"].folder, None);
+        assert!(data.collections.folders.is_empty());
+        assert!(data.collections.smart_albums.is_empty());
+    }
+
+    #[test]
+    fn smart_albums_validate_rules_and_keep_their_id() {
+        let fixture = ImportFixture::new();
+        let key = fixture.key;
+        let mut vault = vlock(&fixture.state);
+        let rules = |kind: Option<&str>| SmartRules {
+            kind: kind.map(str::to_string),
+            ..SmartRules::default()
+        };
+        assert!(save_smart_album(&mut vault, &key, None, "Empty", SmartRules::default()).is_err());
+        assert!(save_smart_album(&mut vault, &key, None, " ", rules(Some("video"))).is_err());
+        assert!(save_smart_album(&mut vault, &key, None, "Bad", rules(Some("audio"))).is_err());
+        let backwards = SmartRules { from: Some(2.0), to: Some(1.0), ..SmartRules::default() };
+        assert!(save_smart_album(&mut vault, &key, None, "Dates", backwards).is_err());
+        let empty_range = SmartRules { from: Some(2.0), to: Some(2.0), ..SmartRules::default() };
+        assert!(save_smart_album(&mut vault, &key, None, "Dates", empty_range).is_err());
+        let id = save_smart_album(&mut vault, &key, None, "Videos", rules(Some("video"))).unwrap();
+        let created = vault.collections.smart_albums[&id].created;
+        let fav = SmartRules { favorite: true, ..SmartRules::default() };
+        assert_eq!(save_smart_album(&mut vault, &key, Some(id.clone()), "Faves", fav.clone()).unwrap(), id);
+        let saved = &load_index(&vault, &key).unwrap().collections.smart_albums[&id];
+        assert_eq!((saved.name.as_str(), &saved.rules, saved.created), ("Faves", &fav, created));
+        assert!(save_smart_album(&mut vault, &key, Some("missing".into()), "X", fav).is_err());
+    }
+
+    #[test]
+    fn bulk_tag_edits_add_and_remove_ignoring_case() {
+        let fixture = ImportFixture::new();
+        let key = fixture.key;
+        let mut vault = vlock(&fixture.state);
+        let mut photo = test_photo(None);
+        photo.tags = vec!["Beach".into(), "old".into()];
+        vault.photos.insert("a".into(), photo);
+        vault.photos.insert("b".into(), test_photo(None));
+        let ids = vec!["a".to_string(), "b".to_string(), "gone".to_string()];
+        edit_photo_tags(&mut vault, &key, &ids, vec![" beach ".into(), "Trip".into()], &["OLD".into()]).unwrap();
+        assert_eq!(vault.photos["a"].tags, ["Beach", "Trip"]);
+        assert_eq!(vault.photos["b"].tags, ["beach", "Trip"]);
+        assert_eq!(load_index(&vault, &key).unwrap().photos["b"].tags, ["beach", "Trip"]);
     }
 
     #[test]
