@@ -135,6 +135,34 @@ test('search, albums and favorites retain the chosen sort order', () => {
       view.type === 'favorites' ? ['one', 'two', 'old'] : ['one', 'two', 'ten', 'old']);
   }
 });
+test('not-in-an-album and smart album views filter by their rules', () => {
+  const a = app();
+  const t = iso => new Date(iso).getTime() / 1000;
+  a.ctx.photos = [
+    photo('filed', 'beach.jpg', '2026-01-05T12:00:00-05:00', { albums: ['x'], favorite: true }),
+    photo('loose', 'Beach.mov', '2026-03-01T12:00:00-05:00', { favorite: true }),
+    photo('tagged', 'IMG_1.jpg', '2026-03-31T23:30:00-04:00', { tags: ['beach'], taken: t('2025-03-31T23:30:00-04:00') }),
+    photo('gone', 'beach2.jpg', '2026-03-02T12:00:00-05:00', { deleted: 1 }),
+  ];
+  const ids = view => { a.ctx.currentView = view; return Array.from(a.run('computeVisible()'), p => p.id).sort(); };
+  assert.deepEqual(ids({ type: 'unfiled' }), ['loose', 'tagged']);
+  a.ctx.smartAlbums = [
+    { id: 'q', rules: { query: 'BEACH' } },
+    { id: 'fav-unfiled', rules: { favorite: true, unfiled: true } },
+    { id: 'video', rules: { kind: 'video' } },
+    { id: 'photo', rules: { kind: 'photo' } },
+    // Taken dates win over added dates; `to` is exclusive.
+    { id: 'march25', rules: { from: t('2025-03-01T00:00:00-05:00'), to: t('2025-04-01T00:00:00-04:00') } },
+    { id: 'jan26', rules: { from: t('2026-01-01T00:00:00-05:00'), to: t('2026-01-05T12:00:00-05:00') } },
+  ];
+  assert.deepEqual(ids({ type: 'smart', smart: 'q' }), ['filed', 'loose', 'tagged']);
+  assert.deepEqual(ids({ type: 'smart', smart: 'fav-unfiled' }), ['loose']);
+  assert.deepEqual(ids({ type: 'smart', smart: 'video' }), ['loose']);
+  assert.deepEqual(ids({ type: 'smart', smart: 'photo' }), ['filed', 'tagged']);
+  assert.deepEqual(ids({ type: 'smart', smart: 'march25' }), ['tagged']);
+  assert.deepEqual(ids({ type: 'smart', smart: 'jan26' }), []);
+  assert.deepEqual(ids({ type: 'smart', smart: 'missing' }), []);
+});
 test('duplicates remain adjacent under the existing content grouping', () => {
   const a = app();
   a.ctx.photos = sample().map((p, i) => ({ ...p, hash: i % 2 ? 'hashB' : 'hashA' }));

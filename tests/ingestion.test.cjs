@@ -76,6 +76,7 @@ function app() {
         if (state.handlers[command]) return state.handlers[command](args);
         if (command === 'list_photos') return structuredClone(state.photos);
         if (command === 'list_albums') return [];
+        if (command === 'list_collections') return { folders: [], smart_albums: [] };
         if (command === 'vault_status') return 'locked';
         if (command === 'trash_photos') state.photos = state.photos.map(p => args.ids.includes(p.id) ? { ...p, deleted: true } : p);
         return null;
@@ -347,7 +348,7 @@ test('automatic refreshes never report user activity', async () => {
   a.state.timers[a.run('refreshRetry') - 1].fn();
   await new Promise(setImmediate);
   const commands = new Set(a.calls.map(c => c.command));
-  assert.deepEqual([...commands].sort(), ['list_albums', 'list_photos']);
+  assert.deepEqual([...commands].sort(), ['list_albums', 'list_collections', 'list_photos']);
   assert.equal(a.element('importreports').children.length, 2);
 });
 
@@ -608,6 +609,7 @@ test('successful trash does not clear unrelated selections added during the requ
   a.state.handlers.trash_photos = () => deleting.promise;
   const operation = a.element('seldelete').onclick();
   a.element('selalbum').parentElement = { style: {} };
+  a.element('seltags').parentElement = { style: {} };
   a.run('selection.add("b")');
   deleting.resolve();
   await operation;
@@ -985,6 +987,102 @@ test('albums view shows a card per album with full-name tooltips, and lock clear
   assert.equal(a.element('viewopts').hidden, false);
   a.run('clearVaultUI()');
   assert.equal(a.element('viewtitle').title, undefined);
+});
+
+test('folders show their contents with breadcrumbs, and search looks inside every folder', async () => {
+  const a = app();
+  a.state.handlers.list_albums = () => [{ id: 'paris', name: 'Paris', created: 1, folder: 'y19' },
+    { id: 'pets', name: 'Pets', created: 2, folder: null }];
+  a.state.handlers.list_collections = () => ({ folders: [{ id: 'travel', name: 'Travel', parent: null },
+    { id: 'y19', name: '2019', parent: 'travel' }], smart_albums: [] });
+  await a.run('loadAlbums()');
+  await a.seed([{ ...photo('p1'), albums: ['paris'] }]);
+  const grid = a.element('grid');
+  a.run('currentView = { type: "albums" }; renderPhotos()');
+  assert.equal(a.element('count').textContent, '1 folder · 1 album');
+  assert.match(grid.innerHTML, /data-key="f:travel"/);
+  assert.doesNotMatch(grid.innerHTML, /data-key="a:paris"/);
+  a.run('currentView = { type: "albums", folder: "y19" }; renderPhotos()');
+  assert.equal(a.element('viewtitle').textContent, '2019');
+  assert.match(grid.innerHTML, /data-crumb="">Albums<\/button>.*data-crumb="travel">Travel<\/button>.*aria-current="page">2019/);
+  assert.match(grid.innerHTML, /data-key="a:paris"/);
+  a.run('currentView = { type: "albums" }; query = "par"; renderPhotos()');
+  assert.equal(a.element('count').textContent, '1 matching album');
+  assert.match(grid.innerHTML, /class="apath">Travel › 2019</);
+});
+
+test('selected album cards move together into the picked folder', async () => {
+  const a = app();
+  a.state.handlers.list_albums = () => [{ id: 'a1', name: 'One', created: 1 }, { id: 'a2', name: 'Two', created: 2 }];
+  a.state.handlers.list_collections = () => ({ folders: [{ id: 'f1', name: 'Box', parent: null }], smart_albums: [] });
+  await a.run('loadAlbums()');
+  a.run('currentView = { type: "albums" }; cardSelection = new Set(["a:a1", "a:a2", "f:f1"])');
+  const moving = a.run('moveItems(["a1", "a2"], ["f1"])');
+  // The destination list leaves out the folders being moved.
+  assert.doesNotMatch(a.element('fmselect').innerHTML, /Box/);
+  a.element('fmselect').value = '';
+  a.element('folderform').events.submit({ preventDefault() {} });
+  await moving;
+  const call = a.calls.find(c => c.command === 'move_to_folder');
+  assert.deepEqual(JSON.parse(JSON.stringify(call.args)), { albums: ['a1', 'a2'], folders: ['f1'], to: null });
+  assert.equal(a.run('cardSelection.size'), 0);
+});
+
+test('locking closes and wipes the folder picker and smart album editor', async () => {
+  const a = app();
+  a.state.handlers.list_collections = () => ({ folders: [{ id: 'f1', name: 'Secret trip', parent: null }],
+    smart_albums: [{ id: 's1', name: 'Private', rules: { query: 'hidden', from: 1000 } }] });
+  await a.run('loadAlbums()');
+  const moving = a.run('moveItems(["a1"], [])');
+  a.run('editSmartAlbum("s1")');
+  assert.match(a.element('fmselect').innerHTML, /Secret trip/);
+  assert.equal(a.element('smquery').value, 'hidden');
+  a.run('clearVaultUI()');
+  assert.equal(await moving, undefined);
+  assert.equal(a.calls.some(c => c.command === 'move_to_folder'), false);
+  for (const id of ['foldermodal', 'smartmodal']) assert.equal(a.element(id).classList.contains('open'), false);
+  assert.equal(a.element('fmselect').innerHTML, '');
+  assert.equal(a.element('fmtitle').textContent, '');
+  for (const id of ['smname', 'smquery', 'smfrom', 'smto']) assert.equal(a.element(id).value, '');
+  assert.equal(a.run('smartEditing'), null);
+});
+
+test('a smart album view drops photos that stop matching after favorite or tag edits', async () => {
+  const a = app();
+  a.state.handlers.list_collections = () => ({ folders: [], smart_albums: [
+    { id: 'fav', name: 'Faves', rules: { favorite: true } }, { id: 'tag', name: 'Beach', rules: { query: 'beach' } }] });
+  await a.run('loadAlbums()');
+  await a.seed([{ ...photo('a'), favorite: true, tags: ['beach'] }, { ...photo('b'), favorite: true, tags: ['beach'] }]);
+  const ids = () => Array.from(a.run('visible'), p => p.id).sort();
+  a.run('currentView = { type: "smart", smart: "fav" }; renderPhotos()');
+  assert.deepEqual(ids(), ['a', 'b']);
+  a.run('applyFavorite(["a"], false)');
+  assert.deepEqual(ids(), ['b']);
+  a.run('currentView = { type: "smart", smart: "tag" }; renderPhotos(); show(0); renderInfo()');
+  assert.equal(a.run('viewerId'), 'a');
+  a.element('lbtags').value = '';
+  await a.element('lbtags').events.keydown({ key: 'Enter', stopPropagation() {} });
+  assert.deepEqual(ids(), ['b']);
+  assert.equal(a.run('viewerId'), 'b');
+});
+
+test('bulk tag edits send one request for the whole selection', async () => {
+  const a = app();
+  await a.seed([{ ...photo('a'), tags: ['old'] }, photo('b')]);
+  a.run('selection = new Set(["a", "b"])');
+  const adding = a.run('bulkTags(true)');
+  a.element('pminput').value = ' beach, trip ,';
+  a.element('promptform').events.submit({ preventDefault() {} });
+  await adding;
+  const call = a.calls.find(c => c.command === 'edit_tags');
+  assert.deepEqual(JSON.parse(JSON.stringify(call.args)), { ids: ['a', 'b'], add: ['beach', 'trip'], remove: [] });
+  // Removing starts empty, so pressing Enter right away removes nothing.
+  const removing = a.run('bulkTags(false)');
+  assert.equal(a.element('pminput').value, '');
+  assert.match(a.element('pmtitle').textContent, /In use: old/);
+  a.element('promptform').events.submit({ preventDefault() {} });
+  await removing;
+  assert.equal(a.calls.filter(c => c.command === 'edit_tags').length, 1);
 });
 
 test('a library refresh, such as after filing into an album, keeps the scroll position', async () => {
