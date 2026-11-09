@@ -15,10 +15,24 @@ Liquid Glass. The existing native title bar and window controls remain.
 
 - Follow system light/dark appearance. Keep text and controls readable with
   reduced transparency, increased contrast, and reduced motion preferences.
+- Dark appearance uses the Nocturne palette approved on 2026-11-09: charcoal
+  page, sidebar, and panels (`#141617`, `#191c1d`, `#202324`), `#343939` lines,
+  `#e8e8e2` text, `#9a9f9c` secondary text, a `#c6da96` accent that takes dark
+  `#192017` text, and `#f5aaa0` for destructive actions. Light appearance keeps
+  its blue accent with white text on it.
+- Show photos as a dense contact sheet: square tiles with square corners and
+  3px gaps.
+- Every sidebar row shows a count: library rows and smart albums count items,
+  albums count photos, and folders count the albums anywhere inside them.
+  Counts follow imports, deletes, moves, favorites, and Inbox batches.
+- Under the view title, show the item count. A view holding both photos and
+  videos adds how many of each, such as "32,418 items · 30,312 photos ·
+  2,106 videos".
 - Keep toolbar actions, search, albums, and sorting usable at 1100 by 760 and
   the minimum 600 by 400 window size. A narrow list scrolls horizontally so
   names and sortable columns retain their width.
-- Keep the selected library or album title and count current. Clear them on lock.
+- Keep the selected library or album title, count, and sidebar counts current.
+  Clear them on lock.
 - Support keyboard sidebar navigation and visible focus. Control activation
   must not also invoke photo shortcuts. Keep focus within an open dialog.
 - Preserve column sorting, selection, viewer identity, import reports, and
@@ -41,6 +55,18 @@ showing, reuses loaded thumbnails, and restores the window and list scroll
 offsets, so filing photos into an album or an Inbox batch doesn't jump to the
 top. Switching views still starts at the first batch.
 `renderPhotos` updates the view title/count and renders a scrollable list.
+`libraryCounts` makes one pass over `photos` (about 4ms for 30,000 items and
+500 albums) for the library, album, and smart album counts, then walks each
+album's folder chain for folder counts. `renderSidebar` calls it, so every
+caller that refreshes the sidebar refreshes the counts.
+The accent fills the active sidebar row and primary buttons. `--on-accent`
+holds the text color that sits on it.
+When the grid is sorted by date, `renderYearRail` lists years down the right
+edge behind a thin left border. `updateRailYear` highlights the year whose
+month heading has reached the top of the view (`.on` and `aria-current`).
+A window scroll listener runs it at most once per animation frame. A rail
+jump renders one batch past the target so the page is tall enough to put
+that year at the top.
 `setHeaderHeight` measures the toolbar to size the list's scroll area.
 `--sbw` controls the sidebar boundary, content inset, and file-drop overlay.
 The `#sbresize` handle sets it by drag or arrow keys, between 170px and the
@@ -77,6 +103,18 @@ The task-only UI/README diffs, test logs, build log, and `browser-evidence.json`
 are in `/tmp/photovault-macos-redesign/`. Checks used Node v22.23.2 on macOS.
 The light appearance screenshot is
 `/Users/nikhlkapadia/.t3/userdata/browser-artifacts/browser-screenshot-localhost-mtufsk9v-d8a38e3e.png`.
+
+Nocturne restyle, 2026-11-09:
+
+- PASS: `node --test tests/*.test.cjs`, 126 tests. `tests/library-view.test.cjs`
+  adds three: one-pass counts including nested folder totals, rail
+  highlighting while scrolling, and the rail ignoring years not yet rendered.
+- PASS browser: headless Chromium at 1440 by 900 with a stubbed Tauri API and
+  generated images. Checked dark and light grids, list and Albums views, the
+  focus ring on the active sidebar row, increased contrast with reduced
+  transparency, and rail highlighting after jumps and scrolls with 1,777 and
+  30,000 items. No JavaScript errors.
+- Not run: `npm run build` and the native app.
 
 Browser fixtures use sample images stored outside the repository. They are
 preview data only. No personal vault or Inbox is used. Native VoiceOver,

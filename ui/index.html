@@ -11,16 +11,17 @@
     --bg: #faf9f8; --surface: #fff; --well: #efefef;
     --text: #242424; --secondary: #666665; --line: #00000016;
     --glass: #f1f0eeeb; --control: #ffffffc9; --hover: #00000008;
-    --accent: #0068d9; --selected: #0068d912; --danger: #ba2727;
+    --accent: #0068d9; --on-accent: #fff; --selected: #0068d912; --danger: #ba2727;
     --shadow: 0 2px 8px #00000007, 0 12px 30px #00000008;
   }
+  /* Nocturne: charcoal surfaces with a soft green accent that takes dark text. */
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #1c1c1e; --surface: #252527; --well: #303032;
-      --text: #f3f3f5; --secondary: #a7a7ac; --line: #ffffff19;
-      --glass: #29292ce8; --control: #454548b8; --hover: #ffffff0b;
-      --accent: #409cff; --selected: #409cff25; --danger: #ff827a;
-      --shadow: 0 2px 8px #00000018, 0 12px 30px #00000020;
+      --bg: #141617; --surface: #202324; --well: #2a2e2f;
+      --text: #e8e8e2; --secondary: #9a9f9c; --line: #343939;
+      --glass: #191c1df2; --control: #202324; --hover: #ffffff0a;
+      --accent: #c6da96; --on-accent: #192017; --selected: #c6da9624; --danger: #f5aaa0;
+      --shadow: 0 2px 8px #00000030, 0 12px 30px #00000040;
     }
   }
   * { box-sizing: border-box; margin: 0; }
@@ -43,8 +44,8 @@
     white-space: nowrap; box-shadow: 0 1px 2px #00000005; }
   .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
   .btn:hover, .btn.ghost:hover { background: var(--hover); }
-  .btn.primary, .wide { background: #0068d9; border-color: transparent; color: white; }
-  .btn.primary:hover, .wide:hover { background: #005cbe; }
+  .btn.primary, .wide { background: var(--accent); border-color: transparent; color: var(--on-accent); }
+  .btn.primary:hover, .wide:not(.ghost):hover { filter: brightness(.92); }
   .btn.danger { color: var(--danger); }
   .btn.on { color: var(--accent); background: var(--selected); }
   .btn.ghost { border-color: transparent; background: transparent; box-shadow: none; padding: 6px 8px; }
@@ -83,7 +84,7 @@
   .view-heading { flex: 1; min-width: 120px; }
   #viewtitle { font-size: 21px; line-height: 1.2; font-weight: 650; letter-spacing: -.5px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 350px; }
-  #count { display: block; color: var(--secondary); font-size: 11px; margin-top: 4px; }
+  #count { display: block; color: var(--secondary); font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .toolbar-actions { display: flex; align-items: center; gap: 8px; }
   .control-group { display: flex; align-items: center; padding: 3px; gap: 2px;
     background: var(--control); border: 1px solid var(--line); border-radius: 99px; box-shadow: 0 2px 5px #00000006; }
@@ -116,17 +117,18 @@
   #sidebar .item:hover { background: var(--hover); }
   #sidebar .album-open { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; border: 0; padding: 0; background: transparent; color: inherit; text-align: left; font: inherit; }
   #sidebar .item .icon { color: var(--secondary); }
-  #sidebar .item.active { background: var(--selected); font-weight: 600; }
-  #sidebar .item.active .icon { color: var(--accent); }
+  #sidebar .item.active { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+  #sidebar .item.active .icon, #sidebar .item.active .n, #sidebar .item.active .twisty,
+  #sidebar .item.active .tools button { color: inherit; }
   #sidebar .item.droptarget { background: var(--selected); outline: 2px dashed var(--accent); outline-offset: -2px; }
   #sidebar .item .n { margin-left: auto; color: var(--secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
   #sidebar .head { display: flex; align-items: center; padding: 20px 10px 5px;
-    color: var(--secondary); font-size: 11px; font-weight: 600; }
+    color: var(--secondary); font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: 1.2px; }
   #sidebar .head button { margin-left: auto; background: none; border: 0; color: var(--secondary);
     min-width: 24px; min-height: 24px; border-radius: 6px; font-size: 18px; }
   #sidebar .head button:hover { background: var(--hover); }
   #sidebar .head .disclose { display: flex; align-items: center; gap: 3px; margin: 0 0 0 -6px;
-    padding: 0 6px; color: inherit; font-size: 11px; font-weight: 600; }
+    padding: 0 6px; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; }
   #sidebar .head .disclose .icon { width: 12px; height: 12px; stroke-width: 2.2;
     color: var(--secondary); transform: rotate(90deg); transition: transform .15s; }
   #sidebar .head .disclose[aria-expanded="false"] .icon { transform: none; }
@@ -185,8 +187,8 @@
   .list img.mini { width: 38px; height: 38px; object-fit: cover; border-radius: 6px; background: var(--well); display: block; }
   .list td.dim { color: var(--secondary); }
   .list .fav { color: var(--danger); margin-right: 5px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 6px; padding: 16px 24px; }
-  .grid .ph { aspect-ratio: 1; overflow: hidden; border-radius: 8px; background: var(--well);
+  .grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 3px; padding: 16px 24px; }
+  .grid .ph { aspect-ratio: 1; overflow: hidden; border-radius: 0; background: var(--well);
     position: relative; content-visibility: auto; contain-intrinsic-size: auto 180px; }
   .grid .ghead { grid-column: 1 / -1; padding: 12px 0 6px; font-size: 14px; font-weight: 600; }
   .render-sentinel { grid-column: 1 / -1; height: 1px; }
@@ -194,7 +196,7 @@
   .grid .ph:hover { filter: brightness(.96); }
   .grid .ph.sel, .grid .ph.focused { outline: 3px solid var(--accent); outline-offset: -3px; }
   .grid .ph .check { display: none; position: absolute; top: 8px; right: 8px; width: 22px; height: 22px;
-    border-radius: 50%; background: #0068d9; color: white; border: 1px solid #ffffffc0;
+    border-radius: 50%; background: var(--accent); color: var(--on-accent); border: 1px solid #ffffffc0;
     font-size: 13px; line-height: 20px; text-align: center; }
   .grid .ph.sel .check { display: block; }
   .grid .ph .fbadge { position: absolute; top: 8px; left: 8px; color: white; font-size: 15px; text-shadow: 0 1px 4px #000; }
@@ -220,13 +222,18 @@
   .cardbar .crumb:hover { background: var(--hover); }
   .cardbar .crumb[aria-current="page"] { color: var(--text); font-weight: 600; }
   .cardbar .cardsel { margin-left: auto; display: flex; align-items: center; gap: 8px; }
-  #yearrail { position: fixed; right: 6px; top: calc(var(--hh, 80px) + 12px); bottom: 24px; z-index: 10;
-    display: flex; flex-direction: column; gap: 1px; overflow-y: auto; }
+  #yearrail { position: fixed; right: 0; top: var(--hh, 80px); bottom: 0; width: 64px; z-index: 10;
+    display: flex; flex-direction: column; gap: 2px; overflow-y: auto; padding: 12px 8px;
+    border-left: 1px solid var(--line); background: var(--bg); }
   #yearrail[hidden] { display: none; }
-  #yearrail button { background: none; border: 0; border-radius: 6px; padding: 3px 6px;
+  /* Auto margins center the years without clipping the first ones when they overflow. */
+  #yearrail button:first-child { margin-top: auto; }
+  #yearrail button:last-child { margin-bottom: auto; }
+  #yearrail button { background: none; border: 0; border-radius: 6px; padding: 4px 6px; text-align: right;
     color: var(--secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
   #yearrail button:hover { background: var(--hover); color: var(--text); }
-  #content.has-rail .grid { padding-right: 58px; }
+  #yearrail button.on { color: var(--accent); font-weight: 700; }
+  #content.has-rail .grid { padding-right: 82px; }
   .modal .field { display: block; font-size: 12px; color: var(--secondary); }
   .modal .field .ti, .modal .field select { display: block; width: 100%; margin-top: 4px; }
   .modal .field select { margin-bottom: 12px; }
@@ -320,7 +327,7 @@
   .setrow .hint { color: var(--secondary); font-size: 11px; margin-top: 2px; }
   .switch { appearance: none; -webkit-appearance: none; width: 34px; height: 20px; border-radius: 99px;
     background: var(--secondary); position: relative; flex: none; transition: background .15s; }
-  .switch:checked { background: #0068d9; }
+  .switch:checked { background: var(--accent); }
   .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px;
     height: 16px; border-radius: 50%; background: white; box-shadow: 0 1px 3px #0003; transition: left .15s; }
   .switch:checked::after { left: 16px; }
@@ -870,6 +877,8 @@ function clearVaultUI() {
   $("pmtitle").textContent = "";
   $("yearrail").innerHTML = "";
   $("yearrail").hidden = true;
+  railYears = [];
+  railActive = -1;
   closePairPreview(false);
   $("phonelist").innerHTML = "";
   $("phoneselect").innerHTML = "";
@@ -1329,22 +1338,30 @@ function folderTree(skip = new Set()) {
 const sidebarRow = (v, id) =>
   $("sidebar").querySelector(`[data-v="${v}"]${id ? `[data-id="${id}"]` : ""}`);
 
-function renderSidebar() {
-  const live = photos.filter(p => !p.deleted);
+// Sidebar counts from one pass over the library. `albums` and `smart` map ids
+// to photo counts, and `folders` maps a folder id to the albums anywhere inside it.
+function libraryCounts() {
+  const counts = { all: 0, favorites: 0, videos: 0, unfiled: 0, duplicates: 0, trash: 0,
+    albums: new Map(), smart: new Map(smartAlbums.map(a => [a.id, 0])), folders: new Map() };
   const byHash = new Map();
-  const albumCounts = new Map();
-  for (const p of live) {
+  for (const p of photos) {
+    if (p.deleted) { counts.trash++; continue; }
+    counts.all++;
+    if (p.favorite) counts.favorites++;
+    if (isVideo(p)) counts.videos++;
+    if (!p.albums.length) counts.unfiled++;
     if (p.hash) byHash.set(p.hash, (byHash.get(p.hash) || 0) + 1);
-    for (const id of p.albums) albumCounts.set(id, (albumCounts.get(id) || 0) + 1);
+    for (const id of p.albums) counts.albums.set(id, (counts.albums.get(id) || 0) + 1);
+    for (const a of smartAlbums) if (matchesSmart(p, a.rules)) counts.smart.set(a.id, counts.smart.get(a.id) + 1);
   }
-  const counts = {
-    all: live.length,
-    favorites: live.filter(p => p.favorite).length,
-    videos: live.filter(isVideo).length,
-    unfiled: live.filter(p => !p.albums.length).length,
-    duplicates: live.filter(p => p.hash && byHash.get(p.hash) > 1).length,
-    trash: photos.length - live.length,
-  };
+  for (const n of byHash.values()) if (n > 1) counts.duplicates += n;
+  for (const a of albums)
+    for (const id of folderChain(a.folder)) counts.folders.set(id, (counts.folders.get(id) || 0) + 1);
+  return counts;
+}
+
+function renderSidebar() {
+  const counts = libraryCounts();
   const isActive = view => currentView.type === view && !currentView.folder;
   const row = (view, label, symbol, count) =>
     `<button class="item${isActive(view) ? " active" : ""}" data-v="${view}" aria-current="${isActive(view) ? "page" : "false"}">` +
@@ -1366,7 +1383,7 @@ function renderSidebar() {
     + `<div class="head">Smart Albums<button id="smartadd" title="New smart album" aria-label="New smart album">+</button></div>`;
   for (const a of smartAlbums) {
     const act = currentView.type === "smart" && currentView.smart === a.id ? " active" : "";
-    const n = live.filter(p => matchesSmart(p, a.rules)).length;
+    const n = counts.smart.get(a.id);
     html += `<div class="item${act}" data-v="smart" data-id="${a.id}"><button class="album-open" title="${esc(a.name)}" aria-current="${act ? "page" : "false"}">${icon("search")} ` +
       `<span class="album-name">${esc(a.name)}</span><span class="n">${n.toLocaleString()}</span></button>${tools("smart album", "Edit")}</div>`;
   }
@@ -1391,15 +1408,16 @@ function renderSidebar() {
       out += `<div class="item${act}" data-v="folder" data-id="${f.id}" style="--depth:${depth}">` +
         `<button class="twisty" data-act="twist" aria-expanded="${open}" aria-label="${open ? "Collapse" : "Expand"} folder">${icon("chevron")}</button>` +
         `<button class="album-open" title="${esc(f.name)}" aria-current="${act ? "page" : "false"}">${icon("folder")} ` +
-        `<span class="album-name">${esc(f.name)}</span></button>${tools("folder")}</div>`;
+        `<span class="album-name">${esc(f.name)}</span>` +
+        `<span class="n">${(counts.folders.get(f.id) || 0).toLocaleString()}</span></button>${tools("folder")}</div>`;
       if (open) out += tree(f.id, depth + 1);
     }
     for (const a of albumsIn.get(parent) || []) {
-      const n = albumCounts.get(a.id) || 0;
+      const n = counts.albums.get(a.id) || 0;
       const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
       out += `<div class="item${act}" data-v="album" data-id="${a.id}" style="--depth:${depth}"><button class="album-open" title="${esc(a.name)}" aria-current="${act ? "page" : "false"}">${icon("photos")} ` +
         `<span class="album-name">${esc(a.name)}</span>` +
-        `<span class="n">${n}</span></button>${tools("album")}</div>`;
+        `<span class="n">${n.toLocaleString()}</span></button>${tools("album")}</div>`;
     }
     return out;
   };
@@ -1672,9 +1690,12 @@ function renderPhotos({ keepScroll = false } = {}) {
   $("viewtitle").title = $("viewtitle").textContent;
   $("count").style.display = "block";
   const counted = (n, noun) => `${n.toLocaleString()} ${query ? "matching " : ""}${noun}${n === 1 ? "" : "s"}`;
+  let videos = 0;
+  for (const p of visible) if (isVideo(p)) videos++;
+  // A view holding both kinds also says how many of each.
   $("count").textContent = albumsView
     ? [cards.folders.length && counted(cards.folders.length, "folder"), counted(cards.albums.length, "album")].filter(Boolean).join(" · ")
-    : counted(shown, "item");
+    : [counted(shown, "item"), ...(videos && videos < shown ? [plural(shown - videos, "photo"), plural(videos, "video")] : [])].join(" · ");
   $("empty").style.display = shown ? "none" : "block";
   $("empty").innerHTML = icon(albumsView ? "albums" : "photos") + emptyMessage();
   $("search").placeholder = albumsView ? "Search albums" : "Search";
@@ -1712,6 +1733,7 @@ function renderPhotos({ keepScroll = false } = {}) {
   lastDateGroup = null;
   renderSentinel = null;
   $("yearrail").hidden = true;
+  railYears = [];
   $("content").classList.remove("has-rail");
   if (albumsView) {
     grid.className = "albums";
@@ -1867,7 +1889,10 @@ function renderAlbumCards({ folders: shownFolders, albums: shownAlbums }) {
 
 // Year buttons down the right edge when the grid is sorted by date. Clicking
 // one renders up to that year's first item and scrolls to its month heading.
+let railYears = [];  // [year, index of its first item in `visible`], top to bottom
+let railActive = -1; // index into railYears of the highlighted year
 function renderYearRail() {
+  railActive = -1;
   const key = photoSort.rules[0].key;
   if (layout !== "grid" || (key !== "added" && key !== "taken") || currentView.type === "duplicates") return;
   const firstOfYear = new Map();
@@ -1877,17 +1902,47 @@ function renderYearRail() {
   });
   if (firstOfYear.size < 2) return;
   const rail = $("yearrail");
-  rail.innerHTML = [...firstOfYear].map(([year, i]) => `<button data-i="${i}">${year}</button>`).join("");
+  railYears = [...firstOfYear];
+  rail.innerHTML = railYears.map(([year, i]) => `<button data-i="${i}">${year}</button>`).join("");
   rail.querySelectorAll("button").forEach(b => { b.onclick = () => jumpTo(Number(b.dataset.i)); });
   rail.hidden = false;
   $("content").classList.add("has-rail");
+  updateRailYear();
 }
 
+// Highlights the last year whose first item has reached the top of the view.
+// Later years aren't rendered yet, so the walk stops at the first missing tile.
+function updateRailYear() {
+  if (!railYears.length) return;
+  const top = (document.querySelector("#gallery header")?.offsetHeight || 0) + 24;
+  let active = 0;
+  for (let k = 1; k < railYears.length; k++) {
+    const tile = tileById.get(visible[railYears[k][1]]?.id);
+    if (!tile || yearAnchor(tile).getBoundingClientRect().top > top) break;
+    active = k;
+  }
+  if (active === railActive) return;
+  railActive = active;
+  $("yearrail").querySelectorAll("button").forEach((b, k) => {
+    b.classList.toggle("on", k === active);
+    b.setAttribute("aria-current", k === active ? "true" : "false");
+  });
+}
+let railFrame = 0;
+window.addEventListener("scroll", () => {
+  if (railFrame || !railYears.length) return;
+  railFrame = requestAnimationFrame(() => { railFrame = 0; updateRailYear(); });
+}, { passive: true });
+
+// A year starts with a month heading, so that's where a jump lands.
+const yearAnchor = tile => tile.previousElementSibling?.classList.contains("ghead") ? tile.previousElementSibling : tile;
+
 function jumpTo(i) {
-  renderMore(i);
+  // A batch past the target keeps the page tall enough to scroll it to the top.
+  renderMore(i + RENDER_BATCH);
   const tile = tileById.get(visible[i]?.id);
   if (!tile) return;
-  const target = tile.previousElementSibling?.classList.contains("ghead") ? tile.previousElementSibling : tile;
+  const target = yearAnchor(tile);
   const header = document.querySelector("#gallery header")?.offsetHeight || 0;
   window.scrollTo(0, target.getBoundingClientRect().top + window.scrollY - header - 8);
 }
