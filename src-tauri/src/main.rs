@@ -12,6 +12,7 @@
 mod native;
 mod instance_lock;
 mod backup;
+mod share;
 
 use aes_gcm::aead::{Aead, AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -292,10 +293,12 @@ struct SmartAlbum {
     rules: SmartRules,
 }
 
-/// Album folders and smart albums. Stored at the top level of the index next
+/// Paired phones, album folders, and smart albums. Stored in the index next
 /// to photos and albums.
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct Collections {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    devices: HashMap<String, share::Device>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     folders: HashMap<String, Folder>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -3411,6 +3414,116 @@ async fn export_photos(
     ))
 }
 
+#[tauri::command]
+async fn pair_device_preview(path: String) -> Result<share::PairPreview, String> {
+    share::preview_pair(&share::read_pair(&PathBuf::from(path))?)
+}
+
+#[tauri::command]
+async fn pair_device(
+    path: String,
+    confirmed_code: String,
+    state: VaultState<'_>,
+) -> Result<(), String> {
+    let bytes = share::read_pair(&PathBuf::from(path))?;
+    let device = share::parse_pair(&bytes)?;
+    if share::preview_pair(&bytes)?.code != confirmed_code {
+        return Err("Pairing file changed. Check the verification code again.".into());
+    }
+    let mut vault = vlock(&state);
+    let key = Zeroizing::new(vault.active_key().ok_or("locked")?);
+    edit_library(&mut vault, &key, |vault| {
+        vault
+            .collections
+            .devices
+            .insert(device.key_id.clone(), device);
+        Ok(())
+    })
+}
+
+#[tauri::command]
+async fn list_devices(state: VaultState<'_>) -> Result<Vec<share::Device>, String> {
+    let mut vault = vlock(&state);
+    let _key = Zeroizing::new(vault.active_key().ok_or("locked")?);
+    let mut devices: Vec<_> = vault.collections.devices.values().cloned().collect();
+    devices.sort_by(|a, b| a.label.cmp(&b.label).then(a.key_id.cmp(&b.key_id)));
+    Ok(devices)
+}
+
+#[tauri::command]
+async fn unpair_device(id: String, state: VaultState<'_>) -> Result<(), String> {
+    let mut vault = vlock(&state);
+    let key = Zeroizing::new(vault.active_key().ok_or("locked")?);
+    edit_library(&mut vault, &key, |vault| {
+        vault
+            .collections
+            .devices
+            .remove(&id)
+            .ok_or("Phone is no longer paired.")?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+async fn share_to_device(
+    ids: Vec<String>,
+    title: String,
+    device: String,
+    dest: String,
+    app: tauri::AppHandle,
+    state: VaultState<'_>,
+) -> Result<ExportResult, String> {
+    let (key, objects, phone, entries, result) = {
+        let mut vault = vlock(&state);
+        let key = Zeroizing::new(vault.active_key().ok_or("locked")?);
+        let phone = vault
+            .collections
+            .devices
+            .get(&device)
+            .cloned()
+            .ok_or("Phone is no longer paired.")?;
+        let mut result = ExportResult::default();
+        let entries = ids
+            .into_iter()
+            .filter_map(|id| match vault.photos.get(&id) {
+                Some(photo) if photo.deleted.is_none() => Some((id, photo.clone())),
+                photo => {
+                    result.failed(
+                        photo
+                            .map(|p| p.name.clone())
+                            .unwrap_or_else(|| format!("Unavailable photo {id}")),
+                        "Photo is missing or in Recently Deleted.".into(),
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        (key, vault.objects_dir(), phone, entries, result)
+    };
+    share::write_share(
+        &PathBuf::from(dest),
+        &phone,
+        title,
+        entries,
+        result,
+        |id| {
+            let original = Zeroizing::new(decrypt_owned(
+                &key,
+                fs::read(objects.join(id)).map_err(|e| e.to_string())?,
+            )?);
+            let thumb = match fs::read(objects.join(format!("{id}.t"))) {
+                Ok(blob) => Some(Zeroizing::new(decrypt_owned(&key, blob)?)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.to_string()),
+            };
+            Ok((original, thumb))
+        },
+        |progress| {
+            let _ = app.emit("share-progress", progress);
+        },
+    )
+}
+
 /// Write a consistent encrypted snapshot and publish it only after it is complete.
 #[tauri::command]
 async fn backup_vault(
@@ -4837,6 +4950,11 @@ fn main() {
             clear_vault,
             export_photo,
             export_photos,
+            pair_device_preview,
+            pair_device,
+            list_devices,
+            unpair_device,
+            share_to_device,
             backup_vault,
             restore_backup,
             scan_dates

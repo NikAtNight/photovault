@@ -1,0 +1,4 @@
+build/
+PhotoVault.xcodeproj/
+xcuserdata/
+*.xcresult

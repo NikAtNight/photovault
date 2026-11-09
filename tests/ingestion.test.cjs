@@ -67,6 +67,7 @@ function app() {
   const state = { photos: [], handlers: {}, timers: [], save: async () => '/export', open: async () => null, ask: async () => true };
   const observer = class { observe() {} unobserve() {} disconnect() {} };
   const ctx = vm.createContext({
+    crypto: require("node:crypto").webcrypto,
     document: { getElementById: element, createElement: tag => new Element(tag),
       createDocumentFragment: () => new Element(), querySelector: element,
       querySelectorAll: () => [], addEventListener: (name, handler) => listeners.set(`dom:${name}`, handler), documentElement: new Element() },
@@ -1097,3 +1098,248 @@ test('a library refresh, such as after filing into an album, keeps the scroll po
   a.run('window.restored = undefined; currentView = { type: "favorites" }; renderPhotos()');
   assert.equal(a.run('window.restored'), undefined);
 });
+
+test('iPhone share keeps grid order and reports counts after saving', async () => {
+  const a = app();
+  await a.seed([photo('a'), photo('b')]);
+  a.state.handlers.list_devices = () => [{ label: 'Phone', key_id: 'phone-key' }];
+  a.state.handlers.share_to_device = () => ({ exported: 1, failed: 1, issues: [{ name: 'b.jpg', reason: 'Missing original' }] });
+  a.state.save = args => { assert.match(args.defaultPath, /^PhotoVault-[0-9a-f]{8}\.pvshare$/); return '/chosen.pvshare'; };
+  a.run('selection = new Set(["b", "a"])');
+  await a.element('selshare').onclick();
+  const call = a.calls.find(c => c.command === 'share_to_device');
+  assert.deepEqual(JSON.parse(JSON.stringify(call.args)), { ids: ['a', 'b'], title: 'Selection', device: 'phone-key', dest: '/chosen.pvshare' });
+  assert.match(a.element('toastmsg').textContent, /1 shared, 1 failed.*AirDrop/);
+});
+
+test('iPhone sharing explains pairing when no phone is paired', async () => {
+  const a = app();
+  a.state.handlers.list_devices = () => [];
+  await a.run('sharePhotos(["a"], "Trip")');
+  assert.match(a.element('toastmsg').textContent, /Pair your iPhone first.*Settings > Your iPhone/);
+  assert.equal(a.calls.some(c => c.command === 'share_to_device'), false);
+});
+
+test('sharing lets the user choose a phone and cancel the save dialog', async () => {
+  const a = app();
+  a.state.handlers.list_devices = () => [{ label: 'One', key_id: 'one' }, { label: 'Two', key_id: 'two' }];
+  a.state.handlers.share_to_device = () => ({ exported: 1, failed: 0, issues: [] });
+  const sharing = a.run('sharePhotos(["a"], "Trip")');
+  await new Promise(setImmediate);
+  assert.equal(a.element('phonemodal').classList.contains('open'), true);
+  a.element('phoneselect').value = 'two';
+  a.element('phoneform').events.submit({ preventDefault() {} });
+  await sharing;
+  assert.equal(a.calls.find(c => c.command === 'share_to_device').args.device, 'two');
+  a.state.save = () => null;
+  const cancelling = a.run('sharePhotos(["a"], "Trip")');
+  await new Promise(setImmediate);
+  a.element('phoneform').events.submit({ preventDefault() {} });
+  await cancelling;
+  assert.equal(a.calls.filter(c => c.command === 'share_to_device').length, 1);
+});
+
+test('lock wipes phone labels and cancels the phone picker', async () => {
+  const a = app();
+  a.state.handlers.list_devices = () => [{ label: 'Private phone', key_id: 'one' }, { label: 'Other', key_id: 'two' }];
+  await a.run('loadPhones()');
+  const sharing = a.run('sharePhotos(["a"], "Private album")');
+  await new Promise(setImmediate);
+  assert.match(a.element('phoneselect').innerHTML, /Private phone/);
+  a.run('clearVaultUI()');
+  await sharing;
+  assert.equal(a.element('phonemodal').classList.contains('open'), false);
+  assert.equal(a.element('phoneselect').innerHTML, '');
+  assert.equal(a.element('phonelist').innerHTML, '');
+  assert.equal(a.run('phoneResolve'), null);
+  assert.equal(a.calls.some(c => c.command === 'share_to_device'), false);
+});
+
+for (const stage of ['list_devices', 'save', 'share_to_device']) {
+  test(`a share response after lock during ${stage} shows nothing`, async () => {
+    const a = app(), pending = deferred();
+    a.state.handlers.list_devices = () => [{ label: 'Phone', key_id: 'one' }];
+    a.state.handlers.share_to_device = () => ({ exported: 1, failed: 0, issues: [] });
+    if (stage === 'save') a.state.save = () => pending.promise;
+    else a.state.handlers[stage] = () => pending.promise;
+    const sharing = a.run('sharePhotos(["a"], "Trip")');
+    await new Promise(setImmediate);
+    a.run('clearVaultUI()');
+    pending.resolve(stage === 'list_devices' ? [{ label: 'Secret', key_id: 'one' }]
+      : stage === 'save' ? '/saved' : { exported: 1, failed: 0, issues: [] });
+    await sharing;
+    assert.equal(a.element('toastmsg').textContent, '');
+    assert.equal(a.element('phonemodal').classList.contains('open'), false);
+    if (stage !== 'share_to_device') assert.equal(a.calls.some(c => c.command === 'share_to_device'), false);
+  });
+}
+
+test('album sharing includes live album members in sorted order with its title', async () => {
+  const a = app();
+  a.state.handlers.list_albums = () => [{ id: 'trip', name: 'Trip' }];
+  a.state.handlers.list_devices = () => [{ label: 'Phone', key_id: 'one' }];
+  a.state.handlers.share_to_device = () => ({ exported: 2, failed: 0, issues: [] });
+  await a.run('loadAlbums()');
+  await a.seed([{ ...photo('a'), albums: ['trip'] }, { ...photo('b'), albums: ['trip'] },
+    { ...photo('gone'), albums: ['trip'], deleted: 2 }, photo('outside')]);
+  await a.run('shareAlbum("trip")');
+  const call = a.calls.find(c => c.command === 'share_to_device');
+  assert.deepEqual(Array.from(call.args.ids), ['a', 'b']);
+  assert.equal(call.args.title, 'Trip');
+  assert.match(a.element('sidebar').innerHTML, /data-act="share"/);
+});
+
+test('pairing opens only pvpair files and refreshes paired phones', async () => {
+  const a = app();
+  a.state.open = args => { assert.deepEqual(Array.from(args.filters[0].extensions), ['pvpair']); return '/phone.pvpair'; };
+  a.state.handlers.list_devices = () => [{ label: '<iPhone>', key_id: 'one' }];
+  a.state.handlers.pair_device_preview = () => ({ label: '<iPhone>', key_id: 'one', code: 'ABCD 1234' });
+  const pairing = a.element('pairphone').onclick();
+  await new Promise(setImmediate);
+  assert.equal(a.element('pairkeyid').textContent, 'Key ID: one');
+  assert.equal(a.element('paircode').textContent, 'ABCD 1234');
+  assert.equal(a.calls.some(c => c.command === 'pair_device'), false);
+  a.element('pairyes').onclick();
+  await pairing;
+  assert.deepEqual({ ...a.calls.find(c => c.command === 'pair_device').args }, { path: '/phone.pvpair', confirmedCode: 'ABCD 1234' });
+  assert.match(a.element('phonelist').innerHTML, /&lt;iPhone&gt;/);
+});
+
+for (const outcome of ['cancel', 'lock']) {
+  test(`pairing ${outcome} wipes verification details and never saves`, async () => {
+    const a = app();
+    a.state.open = () => '/phone.pvpair';
+    a.state.handlers.pair_device_preview = () => ({ label: 'Private phone', key_id: 'one', code: 'ABCD 1234' });
+    const pairing = a.element('pairphone').onclick();
+    await new Promise(setImmediate);
+    if (outcome === 'lock') a.run('clearVaultUI()');
+    else a.element('paircancel').onclick();
+    await pairing;
+    assert.equal(a.calls.some(c => c.command === 'pair_device'), false);
+    assert.equal(a.element('pairmodal').classList.contains('open'), false);
+    for (const id of ['pairlabel', 'pairkeyid', 'paircode']) assert.equal(a.element(id).textContent, '');
+  });
+}
+
+for (const confirmed of [false, true]) {
+  test(`unpairing ${confirmed ? 'confirmed' : 'cancelled'} respects the confirmation`, async () => {
+    const a = app();
+    a.state.handlers.list_devices = () => [{ label: 'Phone', key_id: 'one' }];
+    a.element('unpairtest').dataset.phone = 'one';
+    a.run('$("phonelist").querySelectorAll = () => [$("unpairtest")]');
+    a.state.ask = () => confirmed;
+    await a.run('loadPhones()');
+    await a.element('unpairtest').onclick();
+    assert.equal(a.calls.some(c => c.command === 'unpair_device'), confirmed);
+    if (confirmed) assert.equal(a.calls.find(c => c.command === 'unpair_device').args.id, 'one');
+  });
+}
+
+test('phone lists and picker distinguish identical labels by key and pairing date', async () => {
+  const a = app();
+  const phones = [{ label: '<iPhone>', key_id: 'first', added: 1000 }, { label: '<iPhone>', key_id: 'second', added: 2000 }];
+  a.state.handlers.list_devices = () => phones;
+  await a.run('loadPhones()');
+  const sharing = a.run('sharePhotos(["a"], "Trip")');
+  await new Promise(setImmediate);
+  for (const id of ['phonelist', 'phoneselect']) {
+    for (const phone of phones) {
+      assert.ok(a.element(id).innerHTML.includes(`&lt;iPhone&gt; · Key ID: ${phone.key_id} · Paired: ${new Date(phone.added * 1000).toLocaleString()}`));
+    }
+    assert.doesNotMatch(a.element(id).innerHTML, /<iPhone>/);
+  }
+  a.element('phonecancel').onclick();
+  await sharing;
+});
+
+for (const outcome of ['remove', 'keep', 'lock']) {
+  test(`pairing offers to remove other phones and handles ${outcome}`, async () => {
+    const a = app();
+    a.state.open = () => '/phone.pvpair';
+    a.state.handlers.pair_device_preview = () => ({ label: 'iPhone', key_id: 'new', code: 'ABCD' });
+    let phones = [{ label: 'iPhone', key_id: 'old', added: 1000 }, { label: 'iPhone', key_id: 'new', added: 2000 }];
+    a.state.handlers.list_devices = () => phones;
+    a.state.handlers.unpair_device = ({ id }) => { phones = phones.filter(p => p.key_id !== id); };
+    let prompted = false;
+    a.state.ask = (message, options) => {
+      prompted = true;
+      assert.ok(a.calls.some(c => c.command === 'pair_device'));
+      assert.match(message, /Key ID: old/);
+      assert.equal(options.title, 'Remove other phones');
+      if (outcome === 'lock') a.run('clearVaultUI()');
+      return outcome !== 'keep';
+    };
+    const pairing = a.element('pairphone').onclick();
+    await new Promise(setImmediate);
+    a.element('pairyes').onclick();
+    await pairing;
+    assert.equal(prompted, true);
+    assert.deepEqual(a.calls.filter(c => c.command === 'unpair_device').map(c => c.args.id), outcome === 'remove' ? ['old'] : []);
+    if (outcome === 'remove') assert.doesNotMatch(a.element('phonelist').innerHTML, /Key ID: old/);
+  });
+}
+
+test('Recently Deleted hides the share selection button and live views restore it', async () => {
+  const a = app();
+  a.element('selalbum').parentElement = { style: {} };
+  a.element('seltags').parentElement = { style: {} };
+  a.run('selection = new Set(["a"]); currentView = { type: "trash" }; updateSelectionUI()');
+  assert.equal(a.element('selshare').style.display, 'none');
+  a.run('currentView = { type: "all" }; updateSelectionUI()');
+  assert.equal(a.element('selshare').style.display, '');
+});
+
+test('sharing an empty album reports nothing shared before choosing a phone or file', async () => {
+  const a = app();
+  a.state.handlers.list_albums = () => [{ id: 'empty', name: 'Empty' }];
+  await a.run('loadAlbums()');
+  await a.run('shareAlbum("empty")');
+  assert.match(a.element('toastmsg').textContent, /Nothing was shared/);
+  assert.equal(a.calls.some(c => c.command === 'list_devices' || c.command === 'share_to_device'), false);
+});
+
+test('all-failed shares retain errors without telling the user to AirDrop a file', async () => {
+  const a = app();
+  a.state.handlers.list_devices = () => [{ label: 'iPhone', key_id: 'one', added: 1000 }];
+  a.state.handlers.share_to_device = () => ({ exported: 0, failed: 1, issues: [{ name: 'a.jpg', reason: 'Missing original' }] });
+  await a.run('sharePhotos(["a"], "Trip")');
+  assert.match(a.element('toastmsg').textContent, /Nothing was shared\. No file was saved/);
+  assert.match(a.element('importreports').textContent, /a.jpg: Missing original/);
+  assert.doesNotMatch(a.element('toastmsg').textContent + a.element('importreports').textContent, /AirDrop/);
+  assert.equal(a.run('activeShares'), 0);
+});
+
+for (const outcome of ['success', 'error', 'lock']) {
+  test(`share progress only updates during an active share, then stops after ${outcome}`, async () => {
+    const a = app(), pending = deferred();
+    a.state.handlers.list_devices = () => [{ label: 'iPhone', key_id: 'one', added: 1000 }];
+    a.state.handlers.share_to_device = () => pending.promise;
+    await a.emit('share-progress', { done: 0, total: 2 });
+    assert.equal(a.element('toastmsg').textContent, '');
+    const sharing = a.run('sharePhotos(["a", "b"], "Trip")');
+    await new Promise(setImmediate);
+    await a.emit('share-progress', { done: 1, total: 2 });
+    assert.equal(a.element('toastmsg').textContent, 'Sharing to iPhone 1 / 2…');
+    if (outcome === 'lock') await a.emit('vault-locked');
+    if (outcome === 'error') pending.reject(new Error('Disk full'));
+    else pending.resolve({ exported: 2, failed: 0, issues: [] });
+    await sharing;
+    assert.equal(a.run('activeShares'), 0);
+    const message = a.element('toastmsg').textContent;
+    await a.emit('share-progress', { done: 2, total: 2 });
+    assert.equal(a.element('toastmsg').textContent, message);
+    if (outcome === 'lock') assert.equal(message, 'Vault locked');
+  });
+}
+
+for (const reason of ['Pairing file exceeds the 64 KiB limit.', 'Phone label exceeds the 64-character limit.']) {
+  test(`pairing preview reports ${reason}`, async () => {
+    const a = app();
+    a.state.open = () => '/phone.pvpair';
+    a.state.handlers.pair_device_preview = () => { throw new Error(reason); };
+    await a.element('pairphone').onclick();
+    assert.ok(a.element('toastmsg').textContent.includes(reason));
+    assert.equal(a.calls.some(c => c.command === 'pair_device'), false);
+    assert.equal(a.element('pairmodal').classList.contains('open'), false);
+  });
+}

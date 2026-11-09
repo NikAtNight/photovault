@@ -14,7 +14,14 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-aes-gcm = "0.10"
+# Unify features with aes-gcm so expanded AES keys are wiped on drop.
+aes = { version = "0.8.4", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+ghash = { version = "0.5.1", features = ["zeroize"] }
+polyval = { version = "0.6.2", features = ["zeroize"] }
+p256 = { version = "0.13", features = ["ecdh"] }
+hkdf = "0.12"
+sha2 = "0.10"
 scrypt = "0.11"
 rand = "0.8"
 image = "0.25"

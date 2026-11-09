@@ -1,0 +1,81 @@
+name: PhotoVault
+options:
+  bundleIdPrefix: com.talix.photovault
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    DEVELOPMENT_TEAM: 2TG5HP8NSV
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_STRICT_CONCURRENCY: complete
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  PhotoVault:
+    type: application
+    platform: iOS
+    sources:
+      - path: PhotoVault
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.talix.photovault.ios
+        PRODUCT_NAME: PhotoVault
+        INFOPLIST_KEY_CFBundleDisplayName: PhotoVault
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    info:
+      path: PhotoVault/Info.plist
+      properties:
+        CFBundleDisplayName: PhotoVault
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSFaceIDUsageDescription: PhotoVault uses Face ID to unlock your shared albums and to use the pairing key.
+        LSRequiresIPhoneOS: true
+        LSSupportsOpeningDocumentsInPlace: false
+        UIFileSharingEnabled: false
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.talix.photovault.share
+            UTTypeDescription: PhotoVault Share
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [pvshare]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: PhotoVault Share
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes: [com.talix.photovault.share]
+  PhotoVaultTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: PhotoVaultTests
+        excludes:
+          - "Fixtures/**"
+    dependencies:
+      - target: PhotoVault
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.talix.photovault.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/PhotoVault.app/PhotoVault
+        BUNDLE_LOADER: $(TEST_HOST)
+schemes:
+  PhotoVault:
+    build:
+      targets:
+        PhotoVault: all
+        PhotoVaultTests: [test]
+    test:
+      targets:
+        - PhotoVaultTests

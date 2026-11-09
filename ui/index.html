@@ -477,6 +477,7 @@
       <button id="tagremove">Remove tags&hellip;</button>
     </div>
   </div>
+  <button class="btn" id="selshare">Share to iPhone&hellip;</button>
   <button class="btn" id="selexport">Export&hellip;</button>
   <button class="btn" id="selrestore" style="display:none">Restore</button>
   <button class="btn danger" id="seldelete">Delete</button>
@@ -559,6 +560,10 @@
       <button class="btn" type="submit">Change password</button>
     </form>
 
+    <h3>Your iPhone</h3>
+    <button class="btn" id="pairphone">Pair iPhone&hellip;</button>
+    <div id="phonelist"></div>
+
     <h3>Library</h3>
     <div class="btnrow">
       <button class="btn" id="backupbtn">Back up vault&hellip;</button>
@@ -622,6 +627,31 @@
     <div class="btnrow">
       <button class="btn primary" type="submit">Move</button>
       <button class="btn" type="button" id="fmcancel">Cancel</button>
+    </div>
+  </form>
+</div>
+
+<div class="modal" id="pairmodal" role="dialog" aria-modal="true" aria-labelledby="pairtitle">
+  <div class="box">
+    <h2 id="pairtitle">Verify iPhone</h2>
+    <p>Compare this code and key ID with the pairing screen on your iPhone.</p>
+    <p id="pairlabel"></p>
+    <p id="pairkeyid"></p>
+    <pre id="paircode" style="user-select:text;white-space:pre-wrap"></pre>
+    <div class="btnrow">
+      <button class="btn primary" id="pairyes">Codes match</button>
+      <button class="btn" id="paircancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="phonemodal" role="dialog" aria-modal="true" aria-labelledby="phonetitle">
+  <form class="box" id="phoneform">
+    <h2 id="phonetitle">Choose your iPhone</h2>
+    <label class="field">iPhone<select class="sel" id="phoneselect"></select></label>
+    <div class="btnrow">
+      <button class="btn primary" type="submit">Continue</button>
+      <button class="btn" type="button" id="phonecancel">Cancel</button>
     </div>
   </form>
 </div>
@@ -702,6 +732,7 @@ let viewerId = null;       // survives insertions and sorting during ingestion
 let settings = null;
 let importing = false;
 let activeExports = 0;
+let activeShares = 0;
 let sessionVersion = 0;    // invalidates async work when the vault locks
 let authRequest = 0;
 let gridRequest = 0;
@@ -814,6 +845,7 @@ function clearVaultUI() {
   $("recoverynotice").hidden = true;
   sessionVersion++;
   activeExports = 0;
+  activeShares = 0;
   importing = false;
   pendingImportRefresh = false;
   importRefresh = null;
@@ -828,7 +860,7 @@ function clearVaultUI() {
   closeLightbox();
   endDrag(); // a drag in flight when the vault locks must not leave its
              // overlay (which can name an album) painted over the lock screen
-  for (const m of ["settings", "keymodal", "offermodal", "promptmodal", "foldermodal", "smartmodal"])
+  for (const m of ["settings", "keymodal", "offermodal", "promptmodal", "foldermodal", "smartmodal", "phonemodal", "pairmodal"])
     $(m).classList.remove("open");
   // Closed modals keep their contents, so wipe the recovery key, passwords,
   // and the album, folder, and smart album details they may still hold.
@@ -838,6 +870,12 @@ function clearVaultUI() {
   $("pmtitle").textContent = "";
   $("yearrail").innerHTML = "";
   $("yearrail").hidden = true;
+  closePairPreview(false);
+  $("phonelist").innerHTML = "";
+  $("phoneselect").innerHTML = "";
+  $("phoneselect").value = "";
+  phoneResolve?.(null);
+  phoneResolve = null;
   $("fmtitle").textContent = "";
   $("fmselect").innerHTML = "";
   fmResolve?.(undefined);
@@ -1313,6 +1351,7 @@ function renderSidebar() {
     icon(symbol) + `<span>${label}</span><span class="n">${count.toLocaleString()}</span></button>`;
   const tools = (kind, edit = "Rename") =>
     `<span class="tools"><button data-act="ren" title="${edit} ${kind}" aria-label="${edit} ${kind}">&#9998;</button>` +
+    (kind === "album" || kind === "smart album" ? `<button data-act="share" title="Share to iPhone" aria-label="Share ${kind} to iPhone">${icon("export")}</button>` : "") +
     (kind === "smart album" ? "" : `<button data-act="move" title="Move to folder" aria-label="Move ${kind} to folder">&#8599;</button>`) +
     `<button data-act="del" title="Delete ${kind}" aria-label="Delete ${kind}">&#10005;</button></span>`;
   let html = `<div class="brand">${icon("lock")} PhotoVault</div><div class="head">Library</div>`
@@ -1384,6 +1423,7 @@ function renderSidebar() {
       const keyboard = e.detail === 0;
       const act = e.target.closest("[data-act]")?.dataset.act;
       const { v, id } = el.dataset;
+      if (act === "share") { shareAlbum(id, v === "smart"); return; }
       if (act === "twist") { toggleFolder(id); return; }
       if (act === "ren") { v === "folder" ? renameFolder(id) : v === "smart" ? editSmartAlbum(id) : renameAlbum(id); return; }
       if (act === "del") { v === "folder" ? deleteFolder(id) : v === "smart" ? deleteSmartAlbum(id) : deleteAlbum(id); return; }
@@ -2017,6 +2057,7 @@ function updateSelectionUI() {
     $("selcount").textContent = `${n} selected`;
     const inTrash = currentView.type === "trash";
     $("selfav").style.display = inTrash ? "none" : "";
+    $("selshare").style.display = inTrash ? "none" : "";
     $("selalbum").parentElement.style.display = inTrash ? "none" : "";
     $("seltags").parentElement.style.display = inTrash ? "none" : "";
     $("seldelete").style.display = inTrash ? "none" : "";
@@ -2056,6 +2097,136 @@ $("selpurge").onclick = async () => {
   if (!ok || session !== sessionVersion) return;
   await changePhotos("purge_photos", ids, true);
 };
+
+let pairResolve = null;
+function closePairPreview(confirmed) {
+  $("pairmodal").classList.remove("open");
+  for (const id of ["pairlabel", "pairkeyid", "paircode"]) $(id).textContent = "";
+  pairResolve?.(confirmed);
+  pairResolve = null;
+}
+$("pairyes").onclick = () => closePairPreview(true);
+$("paircancel").onclick = () => closePairPreview(false);
+let phoneResolve = null;
+$("phoneform").addEventListener("submit", e => {
+  e.preventDefault();
+  $("phonemodal").classList.remove("open");
+  phoneResolve?.($("phoneselect").value);
+  phoneResolve = null;
+});
+$("phonecancel").onclick = () => {
+  $("phonemodal").classList.remove("open");
+  $("phoneselect").innerHTML = "";
+  phoneResolve?.(null);
+  phoneResolve = null;
+};
+function phoneDescription(phone) {
+  return `${phone.label} · Key ID: ${phone.key_id} · Paired: ${new Date(phone.added * 1000).toLocaleString()}`;
+}
+async function loadPhones() {
+  const session = sessionVersion;
+  try {
+    const phones = await invoke("list_devices");
+    if (session !== sessionVersion) return;
+    $("phonelist").innerHTML = phones.map(p => `<div class="setrow"><span class="grow">${esc(phoneDescription(p))}</span>` +
+      `<button class="btn" data-phone="${esc(p.key_id)}">Unpair</button></div>`).join("");
+    $("phonelist").querySelectorAll("[data-phone]").forEach(button => {
+      button.onclick = async () => {
+        try {
+          const ok = await ask("Unpair this iPhone? Files already shared with it will still open.", { title: "Unpair iPhone", kind: "warning" });
+          if (!ok || session !== sessionVersion) return;
+          await invoke("unpair_device", { id: button.dataset.phone });
+          if (session === sessionVersion) await loadPhones();
+        } catch (err) { if (session === sessionVersion) toast("Could not unpair iPhone: " + err); }
+      };
+    });
+  } catch (err) { if (session === sessionVersion) toast("Could not load paired phones: " + err); }
+}
+$("pairphone").onclick = async () => {
+  const session = sessionVersion;
+  try {
+    const path = await open({ multiple: false, filters: [{ name: "PhotoVault pairing", extensions: ["pvpair"] }] });
+    if (!path || session !== sessionVersion) return;
+    const preview = await invoke("pair_device_preview", { path });
+    if (session !== sessionVersion) return;
+    const confirmed = await new Promise(resolve => {
+      closePairPreview(false);
+      pairResolve = resolve;
+      $("pairlabel").textContent = preview.label;
+      $("pairkeyid").textContent = `Key ID: ${preview.key_id}`;
+      $("paircode").textContent = preview.code;
+      $("pairmodal").classList.add("open");
+      $("paircancel").focus();
+    });
+    if (!confirmed || session !== sessionVersion) return;
+    await invoke("pair_device", { path, confirmedCode: preview.code });
+    if (session !== sessionVersion) return;
+    await loadPhones();
+    if (session !== sessionVersion) return;
+    toast("iPhone paired");
+    const others = (await invoke("list_devices")).filter(p => p.key_id !== preview.key_id);
+    if (session !== sessionVersion || !others.length) return;
+    const remove = await ask(`Remove the other paired phones?\n${others.map(phoneDescription).join("\n")}\nFiles already shared with them will still open.`,
+      { title: "Remove other phones", kind: "warning", okLabel: "Remove", cancelLabel: "Keep" });
+    if (!remove || session !== sessionVersion) return;
+    for (const phone of others) {
+      if (session !== sessionVersion) return;
+      await invoke("unpair_device", { id: phone.key_id });
+    }
+    if (session === sessionVersion) await loadPhones();
+  } catch (err) { if (session === sessionVersion) toast("Could not pair iPhone: " + err); }
+};
+async function sharePhotos(ids, title) {
+  const session = sessionVersion;
+  if ($("gallery").style.display === "none") return;
+  if (!ids.length) { toast("Nothing was shared. There are no photos or videos to share."); return; }
+  let started = false;
+  try {
+    const phones = await invoke("list_devices");
+    if (session !== sessionVersion) return;
+    if (!phones.length) {
+      toast("Pair your iPhone first. In the iPhone app, export a pairing file. Send it to this Mac, then choose Settings > Your iPhone > Pair iPhone….");
+      return;
+    }
+    let device = phones[0].key_id;
+    if (phones.length > 1) {
+      device = await new Promise(resolve => {
+        phoneResolve?.(null);
+        phoneResolve = resolve;
+        $("phoneselect").innerHTML = phones.map(p => `<option value="${esc(p.key_id)}">${esc(phoneDescription(p))}</option>`).join("");
+        $("phoneselect").value = phones[0].key_id;
+        $("phonemodal").classList.add("open");
+        $("phoneselect").focus();
+      });
+    }
+    if (!device || session !== sessionVersion) return;
+    const randomName = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, "0")).join("");
+    const dest = await save({ defaultPath: `PhotoVault-${randomName}.pvshare`, filters: [{ name: "PhotoVault share", extensions: ["pvshare"] }] });
+    if (!dest || session !== sessionVersion) return;
+    activeShares++;
+    started = true;
+    toast("Saving iPhone share…");
+    const result = await invoke("share_to_device", { ids, title, device, dest });
+    if (session !== sessionVersion) return;
+    const detail = result.exported > 0
+      ? "AirDrop the saved file to your iPhone and open it in PhotoVault."
+      : "Nothing was shared. No file was saved.";
+    appendOperationReport(`Share to iPhone: ${result.exported} shared, ${result.failed} failed`, {
+      detail,
+      rows: result.issues.map(issue => `${issue.name}: ${issue.reason}`), expanded: result.failed > 0,
+    });
+    toast(`${result.exported} shared, ${result.failed} failed. ${detail}`);
+  } catch (err) { if (session === sessionVersion) toast("Could not share to iPhone: " + err); }
+  finally { if (started && session === sessionVersion) activeShares--; }
+}
+function shareAlbum(id, smart = false) {
+  const album = (smart ? smartAlbums : albums).find(a => a.id === id);
+  if (!album) return;
+  const items = photos.filter(p => !p.deleted && (smart ? matchesSmart(p, album.rules) : p.albums.includes(id)));
+  sortPhotos(items);
+  return sharePhotos(items.map(p => p.id), album.name);
+}
+$("selshare").onclick = () => sharePhotos(visible.filter(p => selection.has(p.id)).map(p => p.id), "Selection");
 
 $("selexport").onclick = () => exportMany(selectedIds(), "Export selection to…");
 
@@ -2516,6 +2687,7 @@ for (const ev of ["pointerup", "pointercancel", "lostpointercapture"])
 
 listen("import-progress", e => { if (importing && $("gallery").style.display !== "none") progressToast("Importing")(e); });
 listen("export-progress", e => { if (activeExports && $("gallery").style.display !== "none") progressToast("Exporting")(e); });
+listen("share-progress", e => { if (activeShares && $("gallery").style.display !== "none") progressToast("Sharing to iPhone")(e); });
 listen("backup-progress", progressToast("Backing up"));
 listen("scan-progress", progressToast("Scanning"));
 
@@ -2853,6 +3025,7 @@ $("settingsbtn").onclick = async () => {
   if (session !== sessionVersion) return;
   $("touchidrow").style.display = bio ? "flex" : "none";
   $("touchidhint").textContent = "Unlock the vault with your fingerprint";
+  loadPhones();
   refreshRecoveryStatus();
   $("cpw0").value = ""; $("cpw1").value = ""; $("cpw2").value = "";
   $("settings").classList.add("open");
@@ -3055,6 +3228,8 @@ document.addEventListener("keydown", e => {
       else if (top.id === "keymodal") cancelRecoveryKey();
       else if (top.id === "offermodal") $("offerno").click();
       else if (top.id === "settings") $("setclose").click();
+      else if (top.id === "pairmodal") closePairPreview(false);
+      else if (top.id === "phonemodal") $("phonecancel").onclick();
       else if (top.id === "foldermodal") $("fmcancel").click();
       else top.classList.remove("open");
     }
