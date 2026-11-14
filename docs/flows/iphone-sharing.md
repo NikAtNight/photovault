@@ -16,7 +16,8 @@ Devices live in `Collections` in the encrypted index. Re-pairing replaces the
 same key ID. `list_devices` and `unpair_device` require an unlocked vault.
 Unpairing does not revoke existing shares.
 
-The selection button preserves grid order. Sidebar album share actions select
+The selection button shares the whole selection, including photos outside
+the open view, in the current sort order. Sidebar album share actions select
 live members and apply the current sort. Smart albums use their current rules.
 `sharePhotos` explains pairing when no phone exists, offers a picker for several
 phones, and opens a save dialog with a random `PhotoVault-xxxxxxxx.pvshare` name.

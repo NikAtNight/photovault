@@ -36,7 +36,15 @@ Liquid Glass. The existing native title bar and window controls remain.
 - Support keyboard sidebar navigation and visible focus. Control activation
   must not also invoke photo shortcuts. Keep focus within an open dialog.
 - Preserve column sorting, selection, viewer identity, import reports, and
-  Inbox drop targets.
+  Inbox drop targets. Selection rules are in
+  [photo-selection.md](photo-selection.md).
+- Keep a long album list manageable. Album rows are 30px tall. Each row has
+  one actions button in place of four. From eight albums up, a Filter albums
+  field sits under My Albums and lists matching albums and folders from every
+  folder, flat, with the folder path as the tooltip.
+- Settings > Library shows the vault's size on disk.
+- The video player hides AirPlay unless Settings > General > Show AirPlay in
+  the video player is on. It is off by default.
 
 ## Implementation
 
@@ -115,6 +123,41 @@ Nocturne restyle, 2026-11-09:
   transparency, and rail highlighting after jumps and scrolls with 1,777 and
   30,000 items. No JavaScript errors.
 - Not run: `npm run build` and the native app.
+
+AirPlay option, 2026-11-13:
+
+`Settings.airplay` in `src-tauri/src/main.rs` defaults to false, including
+for settings files saved before it existed. `applyAirplay` in `ui/index.html`
+sets `x-webkit-airplay` and `disableRemotePlayback` on `#lbvid` at unlock and
+on every settings change. The markup starts as `deny`, so a failed settings
+load stays hidden.
+
+- PASS: `node --test tests/*.test.cjs`, 134 tests, one new for this option.
+- PASS: `cargo test`, 125 tests, one new
+  (`airplay_is_off_unless_settings_turn_it_on`).
+- NOT RUN: the native app. Nobody has confirmed that the button leaves the
+  WKWebView video controls, or that it comes back, with an AirPlay receiver
+  on the network.
+
+Sidebar and vault size, 2026-11-13:
+
+`renderSidebar` builds the fixed rows and calls `albumRows` for My Albums and
+`wireSidebarRows` for the handlers. Typing in `#albfilter` redraws only
+`#albumlist`, so the field keeps its focus. A full sidebar refresh restores
+the focus and caret. `albumFilter` resets on lock and when the list drops
+under `ALBUM_FILTER_MIN`.
+
+`vault_size` in `src-tauri/src/main.rs` adds the sizes of the files in the
+vault folder and its `objects` folder. It needs an unlocked vault and releases
+the vault lock before reading the disk. Settings shows "Calculating…" until it
+answers and "Unavailable" if it fails.
+
+- PASS: `node --test tests/*.test.cjs`, 140 tests, two new for these.
+- PASS: `cargo test`, 126 tests, one new
+  (`vault_size_adds_up_objects_and_vault_files`).
+- PASS: headless WebKit with 32 synthetic albums. Typing filtered the list
+  and kept focus, Escape cleared it, and Settings showed the stubbed size.
+- NOT RUN: the native app, and `vault_size` against a real vault.
 
 Browser fixtures use sample images stored outside the repository. They are
 preview data only. No personal vault or Inbox is used. Native VoiceOver,

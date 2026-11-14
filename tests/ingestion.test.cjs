@@ -95,6 +95,7 @@ function app() {
   return { state, calls, element, run: code => vm.runInContext(code, ctx),
     emit: (name, payload) => listeners.get(name)({ payload }),
     keydown: event => listeners.get("dom:keydown")({ preventDefault() {}, ...event }),
+    dom: (name, event = {}) => listeners.get(`dom:${name}`)(event),
     async seed(list) { state.photos = list; await vm.runInContext('loadGrid()', ctx); },
   };
 }
@@ -1186,7 +1187,10 @@ test('album sharing includes live album members in sorted order with its title',
   const call = a.calls.find(c => c.command === 'share_to_device');
   assert.deepEqual(Array.from(call.args.ids), ['a', 'b']);
   assert.equal(call.args.title, 'Trip');
-  assert.match(a.element('sidebar').innerHTML, /data-act="share"/);
+  // The sidebar row's menu offers the same share.
+  a.run('itemMenu("album", "trip", 0, 0)');
+  assert.deepEqual(Array.from(a.run('ctxItems.filter(Boolean).map(item => item[0])')),
+    ['Rename…', 'Move to Folder…', 'Share to iPhone…', 'Delete Album…']);
 });
 
 test('pairing opens only pvpair files and refreshes paired phones', async () => {
@@ -1343,3 +1347,410 @@ for (const reason of ['Pairing file exceeds the 64 KiB limit.', 'Phone label exc
     assert.equal(a.element('pairmodal').classList.contains('open'), false);
   });
 }
+
+// The selection bar reads these parents once anything is selected.
+function selecting(a) {
+  a.element('selalbum').parentElement = { style: {} };
+  a.element('seltags').parentElement = { style: {} };
+  return a;
+}
+const selected = a => Array.from(a.run('selectedIds()')).sort();
+
+test('Shift-click selects a range, with or without select mode or an earlier click', async () => {
+  const a = selecting(app());
+  await a.seed(['a', 'b', 'c', 'd', 'e'].map(id => photo(id)));
+  // No tile was clicked yet: Shift picks the one tile instead of opening it.
+  a.run('tileClick(1, { shiftKey: true })');
+  assert.deepEqual(selected(a), ['b']);
+  assert.equal(a.run('viewerId'), null);
+  a.run('tileClick(3, { shiftKey: true })');
+  assert.deepEqual(selected(a), ['b', 'c', 'd']);
+  // The anchor stays put, so a second Shift-click reaches the other way.
+  a.run('tileClick(0, { shiftKey: true })');
+  assert.deepEqual(selected(a), ['a', 'b', 'c', 'd']);
+  a.run('clearSelection(); selectMode = true; tileClick(4, {}); tileClick(2, { shiftKey: true })');
+  assert.deepEqual(selected(a), ['c', 'd', 'e']);
+  a.run('clearSelection(); tileClick(0, { metaKey: true }); tileClick(1, { shiftKey: true })');
+  assert.deepEqual(selected(a), ['a', 'b']);
+  // Space on the focused tile anchors a range too.
+  a.run('clearSelection(); focusIdx = 3; document.querySelector = () => null');
+  a.keydown({ key: ' ' });
+  assert.deepEqual(selected(a), ['d']);
+  a.run('tileClick(4, { shiftKey: true })');
+  assert.deepEqual(selected(a), ['d', 'e']);
+});
+
+test('the selection survives a change of view, and a range never starts in the previous view', async () => {
+  const a = selecting(app());
+  a.state.handlers.list_albums = () => [{ id: 'x', name: 'Trip', created: 1 }];
+  await a.run('loadAlbums()');
+  await a.seed([photo('a'), photo('b'), { ...photo('c'), albums: ['x'] }, { ...photo('d'), albums: ['x'] }]);
+  a.run('selectMode = true; tileClick(0, {})');
+  a.run('openView({ type: "album", album: "x" })');
+  assert.deepEqual(selected(a), ['a']);
+  assert.equal(a.run('selectMode'), true);
+  assert.equal(a.element('selbar').classList.contains('open'), true);
+  assert.equal(a.element('selcount').textContent, '1 selected · 1 not in this view');
+  // The last click was at index 0 of All Photos. It must not anchor a range here.
+  a.run('tileClick(1, { shiftKey: true })');
+  assert.deepEqual(selected(a), ['a', 'd']);
+  a.run('openView({ type: "albums" }); openView({ type: "all" })');
+  assert.deepEqual(selected(a), ['a', 'd']);
+  assert.equal(a.element('selcount').textContent, '2 selected');
+});
+
+test('entering or leaving Recently Deleted clears the selection', async () => {
+  const a = selecting(app());
+  await a.seed([photo('a'), { ...photo('gone'), deleted: 5 }]);
+  a.run('selectMode = true; tileClick(0, {}); openView({ type: "trash" })');
+  assert.deepEqual(selected(a), []);
+  assert.equal(a.run('selectMode'), false);
+  // Delete Forever must never reach a photo picked outside Recently Deleted.
+  a.run('tileClick(0, { metaKey: true }); openView({ type: "all" })');
+  assert.deepEqual(selected(a), []);
+});
+
+test('sharing a selection includes picked photos outside the open view', async () => {
+  const a = selecting(app());
+  await a.seed([photo('a'), { ...photo('b'), albums: ['x'] }, { ...photo('c'), albums: ['x'] }]);
+  a.state.handlers.list_devices = () => [{ label: 'Phone', key_id: 'phone-key' }];
+  a.state.handlers.share_to_device = () => ({ exported: 2, failed: 0, issues: [] });
+  a.state.save = () => '/chosen.pvshare';
+  a.run('selection = new Set(["c", "a"]); currentView = { type: "album", album: "x" }; renderPhotos()');
+  await a.element('selshare').onclick();
+  assert.deepEqual(Array.from(a.calls.find(c => c.command === 'share_to_device').args.ids), ['a', 'c']);
+});
+
+test('the album menu filters as you type and offers a new album for an unused name', async () => {
+  const a = selecting(app());
+  a.state.handlers.list_albums = () => [{ id: 'x', name: 'Trip <2026>', created: 1 }, { id: 'y', name: 'Pets', created: 2 }];
+  await a.run('loadAlbums()');
+  await a.seed([photo('a')]);
+  a.run('selection = new Set(["a"])');
+  const list = a.element('albumrows'), search = a.element('albumsearch');
+  search.value = 'stale';
+  a.element('selalbum').onclick({ stopPropagation() {} });
+  assert.equal(search.value, '');
+  assert.equal(search.focusCount, 1);
+  assert.match(list.innerHTML, /data-id="x".*data-id="y".*data-new="">New album…/s);
+  search.value = ' TRIP ';
+  search.oninput();
+  assert.match(list.innerHTML, /data-id="x"/);
+  assert.doesNotMatch(list.innerHTML, /data-id="y"/);
+  assert.match(list.innerHTML, /data-new="TRIP">Create album “TRIP”/);
+  // An album already has this name, so there is nothing to create.
+  search.value = 'pets';
+  search.oninput();
+  assert.match(list.innerHTML, /data-id="y"/);
+  assert.doesNotMatch(list.innerHTML, /data-new/);
+  search.value = '<b>';
+  search.oninput();
+  assert.match(list.innerHTML, /No album matches.*data-new="&lt;b&gt;">Create album “&lt;b&gt;”/s);
+  assert.doesNotMatch(list.innerHTML, /<b>/);
+  // Remove is offered only inside an album, and only before typing.
+  search.value = '';
+  a.run('currentView = { type: "album", album: "x" }; renderAlbumMenu()');
+  assert.match(list.innerHTML, /data-remove="1"/);
+  // Escape closes the menu and leaves the selection alone. Lock wipes it.
+  let stopped = false;
+  search.onkeydown({ key: 'Escape', stopPropagation() { stopped = true; } });
+  assert.equal(stopped, true);
+  assert.equal(a.element('albummenu').classList.contains('open'), false);
+  assert.deepEqual(selected(a), ['a']);
+  search.value = 'secret';
+  a.run('clearVaultUI()');
+  assert.equal(search.value, '');
+  assert.equal(list.innerHTML, '');
+});
+
+test('filing a selection creates the typed album, or adds to and removes from an existing one', async () => {
+  const a = selecting(app());
+  await a.seed([photo('a'), photo('b')]);
+  a.state.handlers.album_create = () => 'new-id';
+  const calls = command => a.calls.filter(c => c.command === command).map(c => JSON.parse(JSON.stringify(c.args)));
+  a.run('selection = new Set(["a", "b"])');
+  await a.run('fileSelection({ create: "Lake house" })');
+  assert.deepEqual(calls('album_create'), [{ name: 'Lake house' }]);
+  assert.deepEqual(calls('albums_assign'), [{ ids: ['a', 'b'], album: 'new-id', add: true }]);
+  assert.deepEqual(selected(a), []);
+  // A blank name asks for one. Cancelling files nothing and keeps the selection.
+  a.run('selection = new Set(["a"])');
+  const asking = a.run('fileSelection({ create: "" })');
+  assert.equal(a.element('pmtitle').textContent, 'New album');
+  a.element('pmcancel').onclick();
+  await asking;
+  assert.equal(calls('albums_assign').length, 1);
+  assert.deepEqual(selected(a), ['a']);
+  await a.run('fileSelection({ album: "x" })');
+  a.run('selection = new Set(["b"]); currentView = { type: "album", album: "x" }');
+  await a.run('fileSelection({ remove: true })');
+  assert.deepEqual(calls('albums_assign').slice(1), [{ ids: ['a'], album: 'x', add: true }, { ids: ['b'], album: 'x', add: false }]);
+  // A failed create reports the error and keeps the selection for another try.
+  a.state.handlers.album_create = () => { throw new Error('Disk full'); };
+  a.run('selection = new Set(["a"])');
+  await a.run('fileSelection({ create: "Again" })');
+  assert.match(a.element('toastmsg').textContent, /Disk full/);
+  assert.deepEqual(selected(a), ['a']);
+  assert.equal(calls('albums_assign').length, 3);
+});
+
+test('AirPlay stays out of the video player until Settings turns it on', async () => {
+  assert.match(html, /<video id="lbvid"[^>]*x-webkit-airplay="deny"[^>]*disableremoteplayback/);
+  const a = app(), vid = a.element('lbvid');
+  a.state.handlers.vault_status = () => 'unlocked';
+  // Settings saved before this option existed have no airplay field.
+  a.state.handlers.get_settings = () => ({ auto_lock_secs: 900, lock_on_sleep: true, screen_protect: true, skip_duplicates: true, touch_id: false });
+  await a.run('refresh()');
+  assert.equal(vid['x-webkit-airplay'], 'deny');
+  assert.equal(vid.disableRemotePlayback, true);
+  a.run('fillSettings()');
+  assert.equal(!!a.element('optairplay').checked, false);
+  a.element('autolocksel').value = '900';
+  a.element('optairplay').checked = true;
+  await a.element('optairplay').events.change();
+  assert.equal(a.calls.find(c => c.command === 'set_settings').args.settings.airplay, true);
+  assert.equal(vid['x-webkit-airplay'], 'allow');
+  assert.equal(vid.disableRemotePlayback, false);
+  // A failed settings load falls back to hidden.
+  a.state.handlers.get_settings = () => { throw new Error('unreadable'); };
+  await a.run('refresh()');
+  assert.equal(vid['x-webkit-airplay'], 'deny');
+});
+
+test('every element id in the page is used once', () => {
+  // The app looks elements up by id, so a repeat sends one feature's output
+  // into another's element. The album menu once drew its rows in the sidebar.
+  const seen = new Map();
+  for (const [, id] of html.matchAll(/\sid="([^"$]+)"/g)) seen.set(id, (seen.get(id) || 0) + 1);
+  assert.deepEqual([...seen].filter(([, n]) => n > 1).map(([id]) => id), []);
+});
+
+// The toast button starts Undo without handing back its promise.
+const undoFromToast = a => { a.element('toastact').onclick(); return new Promise(setImmediate); };
+const toastText = a => a.element('toastmsg').textContent;
+const assigns = a => a.calls.filter(c => c.command === 'albums_assign').map(c => JSON.parse(JSON.stringify(c.args)));
+// A stand-in vault that keeps album membership, so reloads show what was saved.
+function albumVault(a, albums, photos) {
+  a.state.photos = photos;
+  a.state.handlers.list_albums = () => albums;
+  a.state.handlers.albums_assign = ({ ids, album, add }) => {
+    a.state.photos = a.state.photos.map(p => !ids.includes(p.id) ? p
+      : { ...p, albums: add ? [...new Set([...p.albums, album])] : p.albums.filter(x => x !== album) });
+  };
+  a.state.handlers.album_create = ({ name }) => { albums.push({ id: 'new', name, created: 9 }); return 'new'; };
+  a.state.handlers.album_delete = ({ id }) => {
+    albums.splice(albums.findIndex(x => x.id === id), 1);
+    a.state.photos = a.state.photos.map(p => ({ ...p, albums: p.albums.filter(x => x !== id) }));
+  };
+  return a.run('loadAlbums().then(loadGrid)');
+}
+
+test('filing says what changed, and Undo reverses only that', async () => {
+  const a = selecting(app());
+  await albumVault(a, [{ id: 'x', name: 'Trip', created: 1 }], [photo('a'), photo('b'), { ...photo('c'), albums: ['x'] }]);
+  assert.equal(await a.run('filePhotos(["a", "b", "c"], "x", true)'), true);
+  assert.equal(toastText(a), 'Added 2 items to “Trip” · 1 already there');
+  assert.equal(a.element('toastact').textContent, 'Undo');
+  await undoFromToast(a);
+  // c was in the album before, so Undo leaves it there.
+  assert.deepEqual(assigns(a).at(-1), { ids: ['a', 'b'], album: 'x', add: false });
+  assert.deepEqual(Array.from(a.run('photos.filter(p => p.albums.includes("x")).map(p => p.id)')), ['c']);
+  assert.equal(toastText(a), 'Took 2 items back out of “Trip”');
+  // Nothing to change means nothing to undo.
+  await a.run('filePhotos(["c"], "x", true)');
+  assert.equal(toastText(a), 'Already in “Trip”');
+  assert.equal(a.element('toastact').style.display, 'none');
+  await a.run('filePhotos(["c"], "x", false)');
+  assert.equal(toastText(a), 'Removed 1 item from “Trip”');
+  await undoFromToast(a);
+  assert.deepEqual(assigns(a).at(-1), { ids: ['c'], album: 'x', add: true });
+});
+
+test('undoing a new album deletes it, and a failed or locked filing stays quiet about success', async () => {
+  const a = selecting(app());
+  const albums = [{ id: 'x', name: 'Trip', created: 1 }];
+  await albumVault(a, albums, [photo('a'), photo('b')]);
+  a.run('selection = new Set(["a", "b"])');
+  await a.run('fileSelection({ create: "Lake" })');
+  assert.equal(toastText(a), 'Added 2 items to new album “Lake”');
+  assert.deepEqual(selected(a), []);
+  await undoFromToast(a);
+  assert.equal(a.calls.filter(c => c.command === 'album_delete').length, 1);
+  assert.deepEqual(albums.map(x => x.id), ['x']);
+  assert.equal(a.run('photos.some(p => p.albums.length)'), false);
+  // A failed save reports the error, offers no Undo, and keeps the selection.
+  a.state.handlers.albums_assign = () => { throw new Error('Disk full'); };
+  a.run('selection = new Set(["a"])');
+  await a.run('fileSelection({ album: "x" })');
+  assert.match(toastText(a), /Disk full/);
+  assert.equal(a.element('toastact').style.display, 'none');
+  assert.deepEqual(selected(a), ['a']);
+  // Undo after a lock must not touch the vault.
+  a.state.handlers.albums_assign = () => null;
+  await a.run('filePhotos(["a"], "x", true)');
+  const undo = a.element('toastact').onclick, before = a.calls.length;
+  await a.emit('vault-locked');
+  undo();
+  await new Promise(setImmediate);
+  assert.equal(a.calls.slice(before).some(c => c.command === 'albums_assign'), false);
+});
+
+test('dragging photos onto a sidebar album files them, and a short or cancelled drag does not', async () => {
+  const a = selecting(app());
+  await albumVault(a, [{ id: 'x', name: 'Trip', created: 1 }], ['a', 'b', 'c'].map(id => photo(id)));
+  const over = id => a.run(`document.elementFromPoint = () => ({ closest: () => ${id ? `({ dataset: { id: "${id}" } })` : 'null'} })`);
+  const down = i => a.run(`armPhotoDrag(${i}, { button: 0, clientX: 100, clientY: 100 })`);
+  over('x');
+  // A selected photo carries the whole selection.
+  a.run('selection = new Set(["a", "c"])');
+  down(0);
+  a.dom('pointermove', { clientX: 103, clientY: 100 });
+  assert.equal(a.run('photoDrag.ids'), null);
+  a.dom('pointermove', { clientX: 20, clientY: 300 });
+  assert.equal(a.element('dragghost').textContent, 'Add 2 items to “Trip”');
+  a.dom('pointerup');
+  await new Promise(setImmediate);
+  assert.deepEqual(assigns(a), [{ ids: ['a', 'c'], album: 'x', add: true }]);
+  // The click that ends the drag neither opens nor selects.
+  a.run('tileClick(0, {})');
+  assert.equal(a.run('viewerId'), null);
+  assert.deepEqual(selected(a), ['a', 'c']);
+  // A photo outside the selection goes alone and leaves the selection as it was.
+  down(1);
+  a.dom('pointermove', { clientX: 20, clientY: 300 });
+  a.dom('pointerup');
+  await new Promise(setImmediate);
+  assert.deepEqual(assigns(a).at(-1), { ids: ['b'], album: 'x', add: true });
+  assert.deepEqual(selected(a), ['a', 'c']);
+  // Released away from an album, cancelled with Escape, or never moved: nothing is filed.
+  const count = assigns(a).length;
+  over(null);
+  down(1);
+  a.dom('pointermove', { clientX: 400, clientY: 300 });
+  assert.equal(a.element('dragghost').textContent, '1 item');
+  a.dom('pointerup');
+  over('x');
+  down(1);
+  a.dom('pointermove', { clientX: 20, clientY: 300 });
+  a.keydown({ key: 'Escape' });
+  a.dom('pointerup');
+  down(1);
+  a.dom('pointerup');
+  // Recently Deleted photos can't be dragged into an album, and neither can a right-button press.
+  a.run('currentView = { type: "trash" }; armPhotoDrag(0, { button: 0, clientX: 1, clientY: 1 })');
+  assert.equal(a.run('photoDrag'), null);
+  a.run('currentView = { type: "all" }; armPhotoDrag(0, { button: 2, clientX: 1, clientY: 1 })');
+  assert.equal(a.run('photoDrag'), null);
+  await new Promise(setImmediate);
+  assert.equal(assigns(a).length, count);
+  assert.deepEqual(selected(a), ['a', 'c']);
+  // A lock mid-drag ends it without filing.
+  down(0);
+  a.dom('pointermove', { clientX: 20, clientY: 300 });
+  await a.emit('vault-locked');
+  assert.equal(a.run('photoDrag'), null);
+  assert.equal(a.element('dragghost').style.display, 'none');
+});
+
+test('a right-click picks the photo as Finder does and offers the actions that fit the view', async () => {
+  const a = selecting(app());
+  await albumVault(a, [{ id: 'x', name: 'Trip', created: 1 }],
+    [photo('a'), photo('b'), { ...photo('c'), albums: ['x'] }, { ...photo('gone'), deleted: 5 }]);
+  const labels = () => Array.from(a.run('ctxItems.filter(Boolean).map(item => item[0])'));
+  const click = i => a.run(`photoMenu(${i}, { preventDefault() {}, clientX: 5, clientY: 5 })`);
+  click(1);
+  assert.deepEqual(selected(a), ['b']);
+  assert.deepEqual(labels(), ['Open', 'Favorite', 'Add to Album…', 'Add Tags…', 'Remove Tags…', 'Share to iPhone…', 'Export…', 'Delete']);
+  // Inside the selection, the menu keeps all of it and drops Open.
+  a.run('selection = new Set(["a", "b"])');
+  click(0);
+  assert.deepEqual(selected(a), ['a', 'b']);
+  assert.equal(labels().includes('Open'), false);
+  // Outside it, the right-clicked photo replaces the selection.
+  click(2);
+  assert.deepEqual(selected(a), ['c']);
+  await a.run('ctxItems.find(item => item && item[0] === "Delete")[1]()');
+  assert.deepEqual(Array.from(a.calls.find(c => c.command === 'trash_photos').args.ids), ['c']);
+  a.run('currentView = { type: "album", album: "x" }; renderPhotos(); selection.clear()');
+  await a.seed([photo('a'), { ...photo('c'), albums: ['x'] }]);
+  click(0);
+  assert.equal(labels().includes('Remove from This Album'), true);
+  // Recently Deleted offers only its own two actions.
+  await a.seed([{ ...photo('gone'), deleted: 5 }]);
+  a.run('selection.clear(); currentView = { type: "trash" }; renderPhotos()');
+  click(0);
+  assert.deepEqual(labels(), ['Restore', 'Delete Forever…']);
+  // Escape closes the menu first and leaves the selection for a second press.
+  a.run('document.querySelector = () => null; document.querySelectorAll = sel => sel === ".menu.open" ? [$("ctxmenu")] : []');
+  a.keydown({ key: 'Escape' });
+  assert.deepEqual(selected(a), ['gone']);
+  a.run('document.querySelectorAll = () => []');
+  a.keydown({ key: 'Escape' });
+  assert.deepEqual(selected(a), []);
+  click(0);
+  a.run('clearVaultUI()');
+  assert.equal(a.run('ctxItems.length'), 0);
+  assert.equal(a.element('ctxmenu').innerHTML, '');
+});
+
+test('the sidebar filters a long album list to a flat set of matches', async () => {
+  const a = app();
+  const names = ['Trip <Rome>', 'Pets', 'Work', 'Home', 'Garden', 'Cars', 'Food', 'Rome 2024'];
+  let albums = names.map((name, i) => ({ id: 'a' + i, name, created: i, folder: i === 7 ? 'deep' : null }));
+  a.state.handlers.list_albums = () => albums;
+  a.state.handlers.list_collections = () => ({ smart_albums: [], folders: [{ id: 'top', name: 'Travel', parent: null }, { id: 'deep', name: 'Romantic', parent: 'top' }] });
+  await a.run('loadAlbums()');
+  a.run('renderSidebar()');
+  const sidebar = () => a.element('sidebar').innerHTML;
+  assert.match(sidebar(), /id="albfilter"/);
+  // The collapsed folder hides its album until the filter looks inside every folder.
+  assert.doesNotMatch(sidebar(), /Rome 2024/);
+  a.element('albfilter').value = ' ROM ';
+  a.element('albfilter').oninput();
+  const rows = a.element('albumlist').innerHTML;
+  assert.match(rows, /data-v="folder" data-id="deep"/);
+  assert.match(rows, /data-id="a0".*data-id="a7"/s);
+  assert.match(rows, /title="Travel › Romantic › Rome 2024"/);
+  assert.doesNotMatch(rows, /Pets|data-act="twist"|<Rome>/);
+  a.element('albfilter').value = 'zzz';
+  a.element('albfilter').oninput();
+  assert.match(a.element('albumlist').innerHTML, /No albums match/);
+  // The typed text survives a sidebar refresh, and Escape clears it without clearing a selection.
+  a.run('renderSidebar()');
+  assert.match(sidebar(), /id="albfilter"[^>]*value="zzz"/);
+  let stopped = false;
+  a.element('albfilter').onkeydown({ key: 'Escape', stopPropagation() { stopped = true; } });
+  assert.equal(stopped, true);
+  assert.equal(a.run('albumFilter'), '');
+  // A short list has no filter, and can't stay filtered by text typed earlier.
+  a.run('albumFilter = "rom"');
+  albums = albums.slice(0, 3);
+  await a.run('loadAlbums()');
+  a.run('renderSidebar()');
+  assert.doesNotMatch(sidebar(), /id="albfilter"/);
+  assert.match(sidebar(), /Pets/);
+  a.run('albumFilter = "x"; clearVaultUI()');
+  assert.equal(a.run('albumFilter'), '');
+});
+
+test('Settings shows the vault size and never writes it over the lock screen', async () => {
+  const a = app(), size = deferred();
+  a.state.handlers.vault_size = () => size.promise;
+  await a.element('settingsbtn').onclick();
+  assert.equal(a.element('vaultsize').textContent, 'Calculating…');
+  size.resolve(5 * 1073741824);
+  await new Promise(setImmediate);
+  assert.equal(a.element('vaultsize').textContent, '5.00 GB');
+  a.state.handlers.vault_size = () => { throw new Error('locked'); };
+  await a.element('settingsbtn').onclick();
+  await new Promise(setImmediate);
+  assert.equal(a.element('vaultsize').textContent, 'Unavailable');
+  const late = deferred();
+  a.state.handlers.vault_size = () => late.promise;
+  const opening = a.element('settingsbtn').onclick();
+  await a.emit('vault-locked');
+  late.resolve(123);
+  await opening;
+  await new Promise(setImmediate);
+  assert.equal(a.element('vaultsize').textContent, '');
+});

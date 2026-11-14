@@ -76,6 +76,9 @@ struct Settings {
     lock_on_sleep: bool,
     #[serde(default)]
     touch_id: bool,
+    // Whether the video player offers AirPlay. Off unless the user turns it on.
+    #[serde(default)]
+    airplay: bool,
 }
 
 impl Default for Settings {
@@ -86,6 +89,7 @@ impl Default for Settings {
             screen_protect: true,
             lock_on_sleep: true,
             touch_id: false,
+            airplay: false,
         }
     }
 }
@@ -3073,6 +3077,32 @@ fn sweep_orphans(vault: &Vault) -> usize {
     removed
 }
 
+/// Bytes the vault uses on disk: the encrypted originals and thumbnails in
+/// `objects`, plus the index, metadata, and settings files beside it.
+#[tauri::command]
+async fn vault_size(state: VaultState<'_>) -> Result<u64, String> {
+    let dir = {
+        let mut vault = vlock(&state);
+        vault.active_key().ok_or("locked")?;
+        vault.dir.clone()
+    };
+    // Tens of thousands of files take a moment to stat, so the lock is released first.
+    Ok(dir_bytes(&dir) + dir_bytes(&dir.join("objects")))
+}
+
+/// Total size of the files directly inside `dir`. Unreadable entries count as zero.
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 // ------------------------------------------------------------------ trash ---
 
 #[tauri::command]
@@ -4943,6 +4973,7 @@ fn main() {
             import_photos,
             process_inbox,
             cleanup_orphans,
+            vault_size,
             trash_photos,
             restore_photos,
             purge_photos,
@@ -7432,5 +7463,28 @@ mod tests {
         assert!(saved.is_ok());
         let on_disk: Settings = serde_json::from_slice(&fs::read(vault.settings_path()).unwrap()).unwrap();
         assert_eq!(on_disk.auto_lock_secs, 0);
+    }
+
+    #[test]
+    fn vault_size_adds_up_objects_and_vault_files() {
+        let fixture = ImportFixture::new();
+        let dir = vlock(&fixture.state).dir.clone();
+        let before = dir_bytes(&dir) + dir_bytes(&dir.join("objects"));
+        fs::write(dir.join("objects").join("blob"), [0u8; 1000]).unwrap();
+        fs::write(dir.join("objects").join("blob.t"), [0u8; 50]).unwrap();
+        fs::write(dir.join("extra.bak"), [0u8; 7]).unwrap();
+        // Directories are not counted themselves, and a missing one reads as empty.
+        assert_eq!(dir_bytes(&dir.join("nowhere")), 0);
+        assert_eq!(dir_bytes(&dir) + dir_bytes(&dir.join("objects")), before + 1057);
+    }
+
+    #[test]
+    fn airplay_is_off_unless_settings_turn_it_on() {
+        assert!(!Settings::default().airplay);
+        // A settings file written before the option existed.
+        let old: Settings = serde_json::from_str(r#"{"touch_id":true}"#).unwrap();
+        assert!(!old.airplay);
+        let on: Settings = serde_json::from_str(r#"{"airplay":true}"#).unwrap();
+        assert!(on.airplay);
     }
 }

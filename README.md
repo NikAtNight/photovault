@@ -16,7 +16,8 @@ with Face ID only and never touches your Photos library or iCloud.
   inactivity (15 minutes by default), and when the Mac sleeps or the screen
   locks.
 - Decrypted media goes straight to the window and is never written to disk.
-  Screenshots and screen sharing of the window are blocked by default.
+  Screenshots and screen sharing of the window are blocked by default, and
+  the video player hides AirPlay unless you turn it on in Settings.
 - Forget the password without a recovery key and the photos are gone. That's
   the point.
 
@@ -29,9 +30,11 @@ The vault lives in `~/Library/Application Support/com.talix.photovault/vault/`.
   Folders and zips in the Inbox become albums.
 - **Formats:** JPEG, PNG, GIF, WebP, BMP, TIFF, HEIC, MP4, MOV, M4V.
 - **Organize** with albums, folders of albums, smart albums, favorites, and
-  tags. Duplicates are skipped by content hash.
+  tags. Drag photos onto an album in the sidebar, or right-click for the same
+  actions. Duplicates are skipped by content hash.
 - **Browse** in a grid or list, sorted by date, name, size, or type. Jump to a
-  year, search by name, and select many items at once.
+  year, search by name, and select many items at once. Shift-click selects a
+  range, and the selection follows you from view to view.
 - **View** full screen with arrow keys, zoom, an info panel, and a slideshow.
 - **Delete** to Recently Deleted, which keeps items for 30 days.
 - **Export** single items, a selection, or everything. **Back up** the vault to
@@ -65,8 +68,8 @@ Tests: `node --test tests/*.test.cjs` and `cd src-tauri && cargo test`.
 After a rebuild you may need to turn Touch ID on again, because local builds
 are signed ad hoc and the keychain entry is tied to the signature.
 
-More detail lives in [docs/flows](docs/flows): ingestion, sorting, vault
-reliability, macOS design, and iPhone sharing. App icon notes are in
+More detail lives in [docs/flows](docs/flows): ingestion, sorting, selection,
+vault reliability, macOS design, and iPhone sharing. App icon notes are in
 [docs/app-icon.md](docs/app-icon.md).
 
 ## License

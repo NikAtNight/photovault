@@ -133,11 +133,13 @@
     color: var(--secondary); transform: rotate(90deg); transition: transform .15s; }
   #sidebar .head .disclose[aria-expanded="false"] .icon { transform: none; }
   #sidebar .album-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #albumlist .item { padding-left: calc(10px + var(--depth, 0) * 14px); }
+  #albumlist .item { min-height: 30px; padding-top: 4px; padding-bottom: 4px;
+    padding-left: calc(10px + var(--depth, 0) * 14px); }
+  #albfilter { margin: 2px 0 6px; padding: 6px 10px; font-size: 12px; }
   #albumlist .item[data-v="album"] { padding-left: calc(30px + var(--depth, 0) * 14px); }
   #sidebar .twisty { display: grid; place-items: center; flex: none; width: 16px; height: 22px;
     margin-right: -5px; padding: 0; border: 0; border-radius: 5px; background: none; color: var(--secondary); }
-  #sidebar .twisty:hover { background: var(--hover); }
+  #sidebar button.twisty:hover { background: var(--hover); }
   #sidebar .twisty .icon { width: 11px; height: 11px; stroke-width: 2.4; transition: transform .15s; }
   #sidebar .twisty[aria-expanded="true"] .icon { transform: rotate(90deg); }
   #sidebar .head .headbtns { display: flex; gap: 2px; margin-left: auto; }
@@ -264,6 +266,18 @@
   #selbar .btn { background: transparent; border-color: transparent; box-shadow: none; }
   #selbar .sc { color: var(--secondary); margin-right: 4px; }
   #selbar .menu { top: auto; bottom: calc(100% + 8px); }
+  /* The album picker and right-click menus float where they were asked for. */
+  #albummenu, #ctxmenu { position: fixed; right: auto; z-index: 120; }
+  #ctxmenu .danger { color: var(--danger); }
+  /* The search field stays put while the album list scrolls under it. */
+  #albummenu { max-height: none; overflow: visible; width: 240px; }
+  #dragghost { display: none; position: fixed; z-index: 310; pointer-events: none; padding: 5px 11px;
+    border-radius: 99px; background: var(--accent); color: var(--on-accent); font-size: 12px;
+    font-weight: 600; box-shadow: var(--shadow); white-space: nowrap; }
+  html.photodrag, html.photodrag * { cursor: grabbing !important; }
+  #albummenu .ti { margin: 0 0 5px; padding: 7px 10px; }
+  #albumrows { max-height: 264px; overflow-y: auto; }
+  #albumrows .none { padding: 7px 12px; color: var(--secondary); }
   #drophint { display: none; position: fixed; inset: 0 0 0 var(--sbw); place-items: center;
     text-align: center; padding: 0 24px; font-size: 22px; background: var(--glass);
     border: 3px dashed var(--accent); z-index: 300; pointer-events: none; }
@@ -343,6 +357,8 @@
     z-index: 400; align-items: center; gap: 12px; max-width: 90vw; box-shadow: var(--shadow);
     -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px); }
   #toast button { background: none; border: 0; color: var(--accent); font-size: 12px; padding: 0; }
+  /* Sit above the selection bar instead of covering its buttons. */
+  #selbar.open ~ #toast { bottom: 84px; }
   #toast button:hover { text-decoration: underline; }
   @media (max-width: 1000px) {
     header { gap: 10px; padding: 16px; }
@@ -475,7 +491,6 @@
   <button class="btn" id="selfav">&#9825; Favorite</button>
   <div class="menuwrap">
     <button class="btn" id="selalbum">Album &#9662;</button>
-    <div class="menu" id="albummenu"></div>
   </div>
   <div class="menuwrap">
     <button class="btn" id="seltags">Tags &#9662;</button>
@@ -491,6 +506,13 @@
   <button class="btn danger" id="selpurge" style="display:none">Delete Forever</button>
   <button class="btn" id="selclear" aria-label="Clear selection"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
 </div>
+
+<div class="menu" id="albummenu">
+  <input type="text" class="ti" id="albumsearch" placeholder="Find or create an album" aria-label="Find or create an album" autocomplete="off" spellcheck="false">
+  <div id="albumrows"></div>
+</div>
+<div class="menu" id="ctxmenu" role="menu"></div>
+<div id="dragghost"></div>
 
 <div id="drophint">Drop photos or videos to import</div>
 
@@ -509,7 +531,7 @@
   </div>
   <div class="stage" id="lbstage">
     <img id="lbimg" alt="">
-    <video id="lbvid" controls playsinline style="display:none"></video>
+    <video id="lbvid" controls playsinline x-webkit-airplay="deny" disableremoteplayback style="display:none"></video>
     <button class="nav" id="lbprev" aria-label="Previous photo"><svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg></button>
     <button class="nav" id="lbnext" aria-label="Next photo"><svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg></button>
     <div id="lbzoom">
@@ -543,6 +565,9 @@
       <input type="checkbox" class="switch" id="optsleep" aria-label="Lock when the Mac sleeps or the screen locks"></div>
     <div class="setrow"><span class="grow">Block screenshots &amp; screen sharing</span>
       <input type="checkbox" class="switch" id="optprotect" aria-label="Block screenshots and screen sharing"></div>
+    <div class="setrow"><span class="grow">Show AirPlay in the video player
+      <div class="hint">Off keeps the AirPlay button out of the video controls</div></span>
+      <input type="checkbox" class="switch" id="optairplay" aria-label="Show AirPlay in the video player"></div>
     <div class="setrow"><span class="grow">Skip duplicates when importing
       <div class="hint">Identical files already in the vault are not re-added</div></span>
       <input type="checkbox" class="switch" id="optdedupe" aria-label="Skip duplicate imports"></div>
@@ -572,6 +597,9 @@
     <div id="phonelist"></div>
 
     <h3>Library</h3>
+    <div class="setrow"><span class="grow">Vault size
+      <div class="hint">Encrypted photos, videos, and thumbnails on this Mac</div></span>
+      <span id="vaultsize"></span></div>
     <div class="btnrow">
       <button class="btn" id="backupbtn">Back up vault&hellip;</button>
       <button class="btn" id="scanbtn">Find photo dates</button>
@@ -694,6 +722,7 @@
     <div class="setrow"><span class="grow">Search</span><span class="hint">/</span></div>
     <div class="setrow"><span class="grow">Select all</span><span class="hint">&#8984;A</span></div>
     <div class="setrow"><span class="grow">Select focused photo</span><span class="hint">Space</span></div>
+    <div class="setrow"><span class="grow">Select a range &middot; add or remove one</span><span class="hint">&#8679; Click &middot; &#8984; Click</span></div>
     <div class="setrow"><span class="grow">Open focused photo</span><span class="hint">Enter</span></div>
     <div class="setrow"><span class="grow">Move focus / previous &amp; next photo</span><span class="hint">Arrows</span></div>
     <div class="setrow"><span class="grow">Move to Recently Deleted</span><span class="hint">Delete</span></div>
@@ -732,6 +761,7 @@ let query = "";
 let selection = new Set();
 let selectMode = false;
 let lastClick = -1;
+let albumFilter = "";      // text in the sidebar's album filter
 let focusIdx = -1;
 let cur = -1;              // lightbox index into `visible`
 let viewerReturnFocus = null;
@@ -813,6 +843,7 @@ async function refresh() {
     const loadedSettings = await invoke("get_settings").catch(() => null);
     if (request !== authRequest || session !== sessionVersion) return;
     settings = loadedSettings;
+    applyAirplay();
     const recoveryRequired = await invoke("recovery_status");
     if (request !== authRequest || session !== sessionVersion) return;
     $("recoverynotice").hidden = !recoveryRequired;
@@ -875,6 +906,14 @@ function clearVaultUI() {
   $("cpw0").value = ""; $("cpw1").value = ""; $("cpw2").value = "";
   $("pminput").value = "";
   $("pmtitle").textContent = "";
+  endPhotoDrag();
+  closeMenus();
+  ctxItems = [];
+  $("ctxmenu").innerHTML = "";
+  $("albumsearch").value = "";
+  $("albumrows").innerHTML = "";
+  albumFilter = "";
+  $("vaultsize").textContent = "";
   $("yearrail").innerHTML = "";
   $("yearrail").hidden = true;
   railYears = [];
@@ -1301,8 +1340,8 @@ function emptyMessage() {
     case "albums": if (currentView.folder) return "This folder is empty.<br>Use the move button on an album or folder to put it here.";
       return "No albums yet.<br>Click + next to My Albums, or drop a folder or zip " +
       "into PhotoVault Inbox.";
-    case "album": return "This album is empty.<br>Drag photos here (or onto the album in the " +
-      "sidebar) to import straight into it,<br>or select photos already in your vault and use Album ▾.";
+    case "album": return "This album is empty.<br>Drag files here to import straight into it,<br>" +
+      "or drag photos already in your vault onto it in the sidebar.";
     default: return "<strong>Your photos, kept private</strong><br>Import photos and videos, or drag them into this window.";
   }
 }
@@ -1366,11 +1405,6 @@ function renderSidebar() {
   const row = (view, label, symbol, count) =>
     `<button class="item${isActive(view) ? " active" : ""}" data-v="${view}" aria-current="${isActive(view) ? "page" : "false"}">` +
     icon(symbol) + `<span>${label}</span><span class="n">${count.toLocaleString()}</span></button>`;
-  const tools = (kind, edit = "Rename") =>
-    `<span class="tools"><button data-act="ren" title="${edit} ${kind}" aria-label="${edit} ${kind}">&#9998;</button>` +
-    (kind === "album" || kind === "smart album" ? `<button data-act="share" title="Share to iPhone" aria-label="Share ${kind} to iPhone">${icon("export")}</button>` : "") +
-    (kind === "smart album" ? "" : `<button data-act="move" title="Move to folder" aria-label="Move ${kind} to folder">&#8599;</button>`) +
-    `<button data-act="del" title="Delete ${kind}" aria-label="Delete ${kind}">&#10005;</button></span>`;
   let html = `<div class="brand">${icon("lock")} PhotoVault</div><div class="head">Library</div>`
     + row("all", "All Photos", "photos", counts.all)
     + row("favorites", "Favorites", "heart", counts.favorites)
@@ -1385,75 +1419,38 @@ function renderSidebar() {
     const act = currentView.type === "smart" && currentView.smart === a.id ? " active" : "";
     const n = counts.smart.get(a.id);
     html += `<div class="item${act}" data-v="smart" data-id="${a.id}"><button class="album-open" title="${esc(a.name)}" aria-current="${act ? "page" : "false"}">${icon("search")} ` +
-      `<span class="album-name">${esc(a.name)}</span><span class="n">${n.toLocaleString()}</span></button>${tools("smart album", "Edit")}</div>`;
+      `<span class="album-name">${esc(a.name)}</span><span class="n">${n.toLocaleString()}</span></button>${rowMore("smart album", a.name)}</div>`;
   }
+  // A filter earns its place once the list is long. Without it, nothing may stay filtered.
+  const filtering = albums.length >= ALBUM_FILTER_MIN && !albumsCollapsed;
+  if (albums.length < ALBUM_FILTER_MIN) albumFilter = "";
   html += `<div class="head"><button class="disclose" id="albtoggle" aria-expanded="${!albumsCollapsed}" ` +
       `aria-controls="albumlist" title="${albumsCollapsed ? "Show" : "Hide"} albums">${icon("chevron")}My Albums</button>` +
       `<span class="headbtns"><button id="foladd" title="New folder" aria-label="New folder">${icon("folder")}</button>` +
       `<button id="albadd" title="New album" aria-label="New album">+</button></span></div>` +
-      `<div id="albumlist"${albumsCollapsed ? " hidden" : ""}>`;
-  // Folders holding the current album or folder stay open so it's visible.
-  const shownFolder = currentView.type === "album" ? albums.find(a => a.id === currentView.album)?.folder
-    : currentView.type === "albums" ? currentView.folder : null;
-  const forcedOpen = new Set(folderChain(currentView.type === "album" ? shownFolder : folderOf(shownFolder)?.parent));
-  const foldersIn = new Map(), albumsIn = new Map();
-  const push = (map, key, item) => map.get(key)?.push(item) ?? map.set(key, [item]);
-  for (const f of folders) push(foldersIn, folderOf(f.parent) ? f.parent : null, f);
-  for (const a of albums) push(albumsIn, folderOf(a.folder) ? a.folder : null, a);
-  const tree = (parent, depth) => {
-    let out = "";
-    for (const f of foldersIn.get(parent) || []) {
-      const open = openFolders.has(f.id) || forcedOpen.has(f.id);
-      const act = currentView.type === "albums" && currentView.folder === f.id ? " active" : "";
-      out += `<div class="item${act}" data-v="folder" data-id="${f.id}" style="--depth:${depth}">` +
-        `<button class="twisty" data-act="twist" aria-expanded="${open}" aria-label="${open ? "Collapse" : "Expand"} folder">${icon("chevron")}</button>` +
-        `<button class="album-open" title="${esc(f.name)}" aria-current="${act ? "page" : "false"}">${icon("folder")} ` +
-        `<span class="album-name">${esc(f.name)}</span>` +
-        `<span class="n">${(counts.folders.get(f.id) || 0).toLocaleString()}</span></button>${tools("folder")}</div>`;
-      if (open) out += tree(f.id, depth + 1);
-    }
-    for (const a of albumsIn.get(parent) || []) {
-      const n = counts.albums.get(a.id) || 0;
-      const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
-      out += `<div class="item${act}" data-v="album" data-id="${a.id}" style="--depth:${depth}"><button class="album-open" title="${esc(a.name)}" aria-current="${act ? "page" : "false"}">${icon("photos")} ` +
-        `<span class="album-name">${esc(a.name)}</span>` +
-        `<span class="n">${n.toLocaleString()}</span></button>${tools("album")}</div>`;
-    }
-    return out;
-  };
-  html += tree(null, 0);
-  if (!albums.length && !folders.length) html += `<p class="sidebar-note">Create an album to organize your photos.</p>`;
-  html += `</div>`;
+      (filtering ? `<input type="text" class="ti" id="albfilter" placeholder="Filter albums" aria-label="Filter albums" ` +
+        `autocomplete="off" spellcheck="false" value="${esc(albumFilter)}">` : "") +
+      `<div id="albumlist"${albumsCollapsed ? " hidden" : ""}>${albumRows(counts)}</div>`;
   const sb = $("sidebar");
+  // A background refresh can land mid-typing, so the filter keeps its focus and caret.
+  const typing = document.activeElement?.id === "albfilter" ? document.activeElement.selectionStart : null;
   sb.innerHTML = html;
-  sb.querySelectorAll(".item").forEach(el => {
-    el.onkeydown = e => {
-      if (e.target !== el) return;
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        e.stopPropagation();
-        const { v, id } = el.dataset;
-        el.click();
-        sidebarRow(v, id)?.focus();
-      }
+  wireSidebarRows(sb);
+  if (filtering) {
+    const filter = $("albfilter");
+    if (typing !== null) { filter.focus(); filter.setSelectionRange(typing, typing); }
+    filter.oninput = () => {
+      albumFilter = filter.value;
+      $("albumlist").innerHTML = albumRows(libraryCounts());
+      wireSidebarRows($("albumlist"));
     };
-    el.onclick = e => {
-      const keyboard = e.detail === 0;
-      const act = e.target.closest("[data-act]")?.dataset.act;
-      const { v, id } = el.dataset;
-      if (act === "share") { shareAlbum(id, v === "smart"); return; }
-      if (act === "twist") { toggleFolder(id); return; }
-      if (act === "ren") { v === "folder" ? renameFolder(id) : v === "smart" ? editSmartAlbum(id) : renameAlbum(id); return; }
-      if (act === "del") { v === "folder" ? deleteFolder(id) : v === "smart" ? deleteSmartAlbum(id) : deleteAlbum(id); return; }
-      if (act === "move") { v === "folder" ? moveItems([], [id]) : moveItems([id], []); return; }
-      openView({ type: v === "folder" ? "albums" : v, album: v === "album" ? id : null,
-        folder: v === "folder" ? id : null, smart: v === "smart" ? id : null });
-      if (keyboard) {
-        const row = sidebarRow(v, id);
-        (row?.querySelector(".album-open") || row)?.focus();
-      }
+    filter.onkeydown = e => {
+      if (e.key !== "Escape" || !filter.value) return;
+      e.stopPropagation();
+      filter.value = "";
+      filter.oninput();
     };
-  });
+  }
   $("albtoggle").onclick = () => {
     albumsCollapsed = !albumsCollapsed;
     localStorage.setItem("pv-albums-collapsed", albumsCollapsed ? "1" : "0");
@@ -1487,9 +1484,115 @@ function renderSidebar() {
   $("smartadd").onclick = e => { e.stopPropagation(); editSmartAlbum(null); };
 }
 
+// One button per row opens its menu. A right-click on the row opens the same one.
+const ALBUM_FILTER_MIN = 8;
+const rowMore = (kind, name) => `<span class="tools"><button data-act="more" aria-haspopup="menu" ` +
+  `title="More actions" aria-label="Actions for ${kind} ${esc(name)}">&#8943;</button></span>`;
+
+// The My Albums rows: the folder tree, or a flat list of matches while filtering.
+function albumRows(counts) {
+  const needle = albumFilter.trim().toLowerCase();
+  // A match can sit in any folder, so its tooltip says where.
+  const full = (parent, name) => {
+    const where = needle && folderPath(parent);
+    return esc(where ? `${where} › ${name}` : name);
+  };
+  const folderRow = (f, depth, open) => {
+    const act = currentView.type === "albums" && currentView.folder === f.id ? " active" : "";
+    return `<div class="item${act}" data-v="folder" data-id="${f.id}" style="--depth:${depth}">` +
+      (open === null ? `<span class="twisty" aria-hidden="true"></span>`
+        : `<button class="twisty" data-act="twist" aria-expanded="${open}" aria-label="${open ? "Collapse" : "Expand"} folder">${icon("chevron")}</button>`) +
+      `<button class="album-open" title="${full(f.parent, f.name)}" aria-current="${act ? "page" : "false"}">${icon("folder")} ` +
+      `<span class="album-name">${esc(f.name)}</span>` +
+      `<span class="n">${(counts.folders.get(f.id) || 0).toLocaleString()}</span></button>${rowMore("folder", f.name)}</div>`;
+  };
+  const albumRow = (a, depth) => {
+    const n = counts.albums.get(a.id) || 0;
+    const act = currentView.type === "album" && currentView.album === a.id ? " active" : "";
+    return `<div class="item${act}" data-v="album" data-id="${a.id}" style="--depth:${depth}"><button class="album-open" title="${full(a.folder, a.name)}" aria-current="${act ? "page" : "false"}">${icon("photos")} ` +
+      `<span class="album-name">${esc(a.name)}</span>` +
+      `<span class="n">${n.toLocaleString()}</span></button>${rowMore("album", a.name)}</div>`;
+  };
+  if (needle) {
+    const hit = x => x.name.toLowerCase().includes(needle);
+    return folders.filter(hit).map(f => folderRow(f, 0, null)).join("") + albums.filter(hit).map(a => albumRow(a, 0)).join("")
+      || `<p class="sidebar-note">No albums match.</p>`;
+  }
+  // Folders holding the current album or folder stay open so it's visible.
+  const shownFolder = currentView.type === "album" ? albums.find(a => a.id === currentView.album)?.folder
+    : currentView.type === "albums" ? currentView.folder : null;
+  const forcedOpen = new Set(folderChain(currentView.type === "album" ? shownFolder : folderOf(shownFolder)?.parent));
+  const foldersIn = new Map(), albumsIn = new Map();
+  const push = (map, key, item) => map.get(key)?.push(item) ?? map.set(key, [item]);
+  for (const f of folders) push(foldersIn, folderOf(f.parent) ? f.parent : null, f);
+  for (const a of albums) push(albumsIn, folderOf(a.folder) ? a.folder : null, a);
+  const tree = (parent, depth) => {
+    let out = "";
+    for (const f of foldersIn.get(parent) || []) {
+      const open = openFolders.has(f.id) || forcedOpen.has(f.id);
+      out += folderRow(f, depth, open);
+      if (open) out += tree(f.id, depth + 1);
+    }
+    for (const a of albumsIn.get(parent) || []) out += albumRow(a, depth);
+    return out;
+  };
+  return tree(null, 0) || `<p class="sidebar-note">Create an album to organize your photos.</p>`;
+}
+
+function wireSidebarRows(root) {
+  root.querySelectorAll(".item").forEach(el => {
+    const { v, id } = el.dataset;
+    el.onkeydown = e => {
+      if (e.target !== el) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        e.stopPropagation();
+        el.click();
+        sidebarRow(v, id)?.focus();
+      }
+    };
+    el.onclick = e => {
+      const keyboard = e.detail === 0;
+      const button = e.target.closest("[data-act]");
+      if (button?.dataset.act === "twist") { toggleFolder(id); return; }
+      if (button?.dataset.act === "more") {
+        e.stopPropagation(); // the document click handler would close the menu again
+        const box = button.getBoundingClientRect();
+        itemMenu(v, id, box.left, box.bottom + 4, keyboard);
+        return;
+      }
+      openView({ type: v === "folder" ? "albums" : v, album: v === "album" ? id : null,
+        folder: v === "folder" ? id : null, smart: v === "smart" ? id : null });
+      if (keyboard) {
+        const row = sidebarRow(v, id);
+        (row?.querySelector(".album-open") || row)?.focus();
+      }
+    };
+    if (v === "album" || v === "folder" || v === "smart")
+      el.oncontextmenu = e => { e.preventDefault(); itemMenu(v, id, e.clientX, e.clientY); };
+  });
+}
+
+// The menu for an album, folder, or smart album, from the sidebar or an album card.
+function itemMenu(v, id, x, y, keyboard = false) {
+  const share = ["Share to iPhone…", () => shareAlbum(id, v === "smart")];
+  openMenu(x, y, v === "album" ? [["Rename…", () => renameAlbum(id)], ["Move to Folder…", () => moveItems([id], [])],
+      share, null, ["Delete Album…", () => deleteAlbum(id), true]]
+    : v === "folder" ? [["Rename…", () => renameFolder(id)], ["Move to Folder…", () => moveItems([], [id])],
+      null, ["Delete Folder…", () => deleteFolder(id), true]]
+    : [["Edit…", () => editSmartAlbum(id)], share, null, ["Delete Smart Album…", () => deleteSmartAlbum(id), true]],
+    keyboard);
+}
+
 function openView(view) {
+  // Picked photos carry across views, so one batch can come from several
+  // albums. Recently Deleted has its own actions, so crossing into or out of
+  // it starts over.
+  const wasTrash = currentView.type === "trash";
   currentView = { album: null, folder: null, smart: null, ...view };
-  clearSelection();
+  if (wasTrash !== (currentView.type === "trash")) clearSelection();
+  cardSelection.clear();
+  lastClick = -1;
   renderPhotos();
   renderSidebar();
   window.scrollTo(0, 0);
@@ -1651,14 +1754,19 @@ async function deleteSmartAlbum(id) {
 }
 
 function tileClick(i, e) {
+  // The click that ends a drag must not open or select the photo under it.
+  if (Date.now() - dragEnded < 100) return;
   focusIdx = i;
-  if (selectMode || e.metaKey || e.ctrlKey) {
-    toggleSelect(visible[i].id);
-    lastClick = i;
-  } else if (e.shiftKey && lastClick >= 0) {
+  // Shift comes first so a range also works in select mode. With nothing
+  // clicked yet, the range is the one tile, which becomes the anchor.
+  if (e.shiftKey) {
+    if (lastClick < 0 || lastClick >= visible.length) lastClick = i;
     const [a, b] = [Math.min(lastClick, i), Math.max(lastClick, i)];
     for (let j = a; j <= b; j++) selection.add(visible[j].id);
     updateSelectionUI();
+  } else if (selectMode || e.metaKey || e.ctrlKey) {
+    toggleSelect(visible[i].id);
+    lastClick = i;
   } else {
     show(i);
     lastClick = i;
@@ -1864,6 +1972,10 @@ function renderAlbumCards({ folders: shownFolders, albums: shownAlbums }) {
     $("cardclear").onclick = () => { cardSelection.clear(); renderPhotos({ keepScroll: true }); };
   }
   grid.querySelectorAll(".acard").forEach(card => {
+    card.oncontextmenu = e => {
+      e.preventDefault();
+      itemMenu(card.dataset.key.startsWith("f:") ? "folder" : "album", card.dataset.key.slice(2), e.clientX, e.clientY);
+    };
     card.onclick = e => {
       const key = card.dataset.key, id = key.slice(2);
       // Command- or Shift-click picks cards to move together.
@@ -1993,6 +2105,8 @@ function renderMore(throughIndex = -1) {
     }
     tile.dataset.id = p.id;
     tile.onclick = e => tileClick(i, e);
+    tile.oncontextmenu = e => photoMenu(i, e);
+    tile.onpointerdown = e => armPhotoDrag(i, e);
     frag.appendChild(tile);
     tileById.set(p.id, tile);
     observeTile(tile);
@@ -2049,6 +2163,7 @@ $("search").addEventListener("input", e => {
   searchTimer = setTimeout(() => {
     query = e.target.value.trim().toLowerCase();
     cardSelection.clear(); // a picked card the search hides shouldn't move unseen
+    lastClick = -1;
     renderPhotos();
   }, 150);
 });
@@ -2109,7 +2224,10 @@ function updateSelectionUI() {
   const n = selection.size;
   $("selbar").classList.toggle("open", n > 0);
   if (n > 0) {
-    $("selcount").textContent = `${n} selected`;
+    // Actions cover the whole selection, so say when part of it is out of sight.
+    let hidden = n;
+    for (const p of visible) if (selection.has(p.id)) hidden--;
+    $("selcount").textContent = `${n} selected${hidden ? ` · ${hidden} not in this view` : ""}`;
     const inTrash = currentView.type === "trash";
     $("selfav").style.display = inTrash ? "none" : "";
     $("selshare").style.display = inTrash ? "none" : "";
@@ -2281,7 +2399,12 @@ function shareAlbum(id, smart = false) {
   sortPhotos(items);
   return sharePhotos(items.map(p => p.id), album.name);
 }
-$("selshare").onclick = () => sharePhotos(visible.filter(p => selection.has(p.id)).map(p => p.id), "Selection");
+$("selshare").onclick = () => {
+  // The selection can reach past this view, so order all of it by the current sort.
+  const items = photos.filter(p => selection.has(p.id));
+  sortPhotos(items);
+  return sharePhotos(items.map(p => p.id), "Selection");
+};
 
 $("selexport").onclick = () => exportMany(selectedIds(), "Export selection to…");
 
@@ -2332,44 +2455,251 @@ async function exportMany(ids, title) {
   }
 }
 
-// Album menu in the selection bar.
+// Album menu in the selection bar. Typing filters the list and offers a new
+// album under the typed name.
+function renderAlbumMenu() {
+  const name = $("albumsearch").value.trim(), needle = name.toLowerCase();
+  const matches = albums.filter(a => a.name.toLowerCase().includes(needle));
+  const rows = [matches.map(a => {
+    const where = folderPath(a.folder);
+    return `<button data-id="${a.id}" title="${esc(where ? `${where} › ${a.name}` : a.name)}">${esc(a.name)}</button>`;
+  }).join("") || (name ? `<div class="none">No album matches</div>` : "")];
+  if (!name) rows.push(`<button data-new="">New album…</button>`);
+  else if (!albums.some(a => a.name.toLowerCase() === needle))
+    rows.push(`<button data-new="${esc(name)}">Create album “${esc(name)}”</button>`);
+  if (!name && currentView.type === "album") rows.push(`<button data-remove="1">Remove from this album</button>`);
+  const list = $("albumrows");
+  list.innerHTML = rows.filter(Boolean).join(`<div class="sep"></div>`);
+  list.querySelectorAll("button").forEach(b => {
+    b.onclick = () => fileSelection("new" in b.dataset ? { create: b.dataset.new }
+      : b.dataset.remove ? { remove: true } : { album: b.dataset.id });
+  });
+}
+
+// Adds the selection to an album, or to a new one called `create` (asked for
+// when blank), or takes it out of the open album.
+async function fileSelection({ album, create, remove }) {
+  $("albummenu").classList.remove("open");
+  const ids = selectedIds();
+  let created = false;
+  try {
+    if (create !== undefined) {
+      const name = create || await promptText("New album");
+      if (!name?.trim()) return;
+      album = await invoke("album_create", { name });
+      created = true;
+      await loadAlbums();
+    }
+    if (await filePhotos(ids, remove ? currentView.album : album, !remove, created)) clearSelection();
+  } catch (err) { toast("" + err); }
+}
+
+// Adds photos to an album or takes them out, then says what happened. Undo
+// reverses only what this call changed, so photos that were already in the
+// album stay there. Undoing a new album deletes it. Resolves true once saved.
+async function filePhotos(ids, album, add, created = false) {
+  const session = sessionVersion, picked = new Set(ids);
+  const changed = photos.filter(p => picked.has(p.id) && p.albums.includes(album) !== add).map(p => p.id);
+  try { await invoke("albums_assign", { ids, album, add }); }
+  catch (err) {
+    if (session === sessionVersion) toast("" + err);
+    return false;
+  }
+  if (session !== sessionVersion) return false;
+  const name = `“${albumName(album) || "album"}”`, n = changed.length;
+  await loadGrid().catch(() => {});
+  if (session !== sessionVersion) return false;
+  if (!n && !created) {
+    toast(add ? `Already in ${name}` : `None of these were in ${name}`);
+    return true;
+  }
+  const already = add && ids.length > n ? ` · ${(ids.length - n).toLocaleString()} already there` : "";
+  toast(add ? `Added ${plural(n, "item")} to ${created ? "new album " : ""}${name}${already}`
+    : `Removed ${plural(n, "item")} from ${name}`, "Undo", async () => {
+    if (session !== sessionVersion) return;
+    try {
+      if (created) {
+        await invoke("album_delete", { id: album });
+        if (currentView.type === "album" && currentView.album === album) currentView = { type: "all", album: null };
+        await loadAlbums();
+      } else {
+        await invoke("albums_assign", { ids: changed, album, add: !add });
+      }
+      if (session !== sessionVersion) return;
+      await loadGrid();
+      toast(created ? `Deleted the new album ${name}` : add ? `Took ${plural(n, "item")} back out of ${name}`
+        : `Put ${plural(n, "item")} back in ${name}`);
+    } catch (err) { if (session === sessionVersion) toast("Could not undo: " + err); }
+  });
+  return true;
+}
+
+function closeMenus() {
+  document.querySelectorAll(".menu.open").forEach(m => m.classList.remove("open"));
+}
+
+// Opens a floating menu at a point, nudged or flipped so it stays in the
+// window. `above` grows it upward from the point instead.
+function placeMenu(menu, x, y, above = false) {
+  menu.classList.add("open");
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  const up = (above || y + h > window.innerHeight - 8) && y - h >= 8;
+  menu.style.left = Math.max(8, Math.min(x, window.innerWidth - w - 8)) + "px";
+  menu.style.top = up ? "auto" : Math.max(8, Math.min(y, window.innerHeight - h - 8)) + "px";
+  menu.style.bottom = up ? window.innerHeight - y + "px" : "auto";
+}
+
+function openAlbumMenu(x, y, above = false) {
+  closeMenus();
+  $("albumsearch").value = "";
+  renderAlbumMenu();
+  placeMenu($("albummenu"), x, y, above);
+  $("albumsearch").focus();
+}
+
 $("selalbum").onclick = e => {
   e.stopPropagation();
-  const menu = $("albummenu");
-  if (menu.classList.contains("open")) { menu.classList.remove("open"); return; }
-  let html = "";
-  for (const a of albums) {
-    const where = folderPath(a.folder);
-    html += `<button data-id="${a.id}" title="${esc(where ? `${where} › ${a.name}` : a.name)}">${esc(a.name)}</button>`;
+  if ($("albummenu").classList.contains("open")) { $("albummenu").classList.remove("open"); return; }
+  const box = $("selalbum").getBoundingClientRect();
+  openAlbumMenu(box.left, box.top - 8, true);
+};
+$("albumsearch").oninput = renderAlbumMenu;
+// Enter takes the first row. That's the best match, or the new album when
+// nothing matches.
+$("albumsearch").onkeydown = e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    $("albumrows").querySelector("button")?.click();
+  } else if (e.key === "ArrowDown") {
+    e.preventDefault();
+    $("albumrows").querySelector("button")?.focus();
+  } else if (e.key === "Escape") {
+    e.stopPropagation(); // close the menu, keep the selection
+    $("albummenu").classList.remove("open");
+    $("selalbum").focus();
   }
-  if (albums.length) html += `<div class="sep"></div>`;
-  html += `<button data-new="1">New album…</button>`;
-  if (currentView.type === "album")
-    html += `<div class="sep"></div><button data-remove="1">Remove from this album</button>`;
-  menu.innerHTML = html;
+};
+
+// ----------------------------------------------------------- right-click ---
+
+// Rows of the open right-click menu: [label, action, destructive], or null
+// for a separator.
+let ctxItems = [];
+function openMenu(x, y, items, keyboard = false) {
+  closeMenus();
+  ctxItems = items;
+  const menu = $("ctxmenu");
+  menu.innerHTML = items.map((item, i) => item
+    ? `<button role="menuitem" data-i="${i}"${item[2] ? ' class="danger"' : ""}>${esc(item[0])}</button>`
+    : `<div class="sep"></div>`).join("");
   menu.querySelectorAll("button").forEach(b => {
-    b.onclick = async () => {
+    b.onclick = e => {
+      e.stopPropagation(); // an action may open the album picker, which a document click would close
       menu.classList.remove("open");
-      const ids = selectedIds();
-      try {
-        if (b.dataset.new) {
-          const name = await promptText("New album");
-          if (!name?.trim()) return;
-          const id = await invoke("album_create", { name });
-          await loadAlbums();
-          await invoke("albums_assign", { ids, album: id, add: true });
-        } else if (b.dataset.remove) {
-          await invoke("albums_assign", { ids, album: currentView.album, add: false });
-        } else {
-          await invoke("albums_assign", { ids, album: b.dataset.id, add: true });
-        }
-        clearSelection();
-        await loadGrid();
-      } catch (err) { toast("" + err); }
+      ctxItems[b.dataset.i][1]();
     };
   });
-  menu.classList.add("open");
+  placeMenu(menu, x, y);
+  if (keyboard) menu.querySelector("button")?.focus();
+}
+$("ctxmenu").onkeydown = e => {
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  e.preventDefault();
+  const rows = [...$("ctxmenu").querySelectorAll("button")];
+  const at = rows.indexOf(document.activeElement);
+  rows[e.key === "ArrowDown" ? (at + 1) % rows.length : (at < 1 ? rows.length : at) - 1]?.focus();
 };
+
+// As in Finder, a right-click on a photo outside the selection picks it alone,
+// and the menu then acts on the selection.
+function photoMenu(i, e) {
+  e.preventDefault();
+  const id = visible[i].id;
+  if (!selection.has(id)) {
+    selection.clear();
+    selection.add(id);
+    lastClick = i;
+  }
+  focusIdx = i;
+  updateSelectionUI();
+  const bar = button => () => $(button).onclick();
+  openMenu(e.clientX, e.clientY, currentView.type === "trash"
+    ? [["Restore", bar("selrestore")], ["Delete Forever…", bar("selpurge"), true]]
+    : [
+      ...(selection.size === 1 ? [["Open", () => show(visible.findIndex(p => p.id === id))], null] : []),
+      [$("selfav")._fav ? "Favorite" : "Unfavorite", bar("selfav")],
+      ["Add to Album…", () => openAlbumMenu(e.clientX, e.clientY)],
+      ...(currentView.type === "album" ? [["Remove from This Album", () => fileSelection({ remove: true })]] : []),
+      ["Add Tags…", () => bulkTags(true)],
+      ["Remove Tags…", () => bulkTags(false)],
+      null,
+      ["Share to iPhone…", bar("selshare")],
+      ["Export…", bar("selexport")],
+      null,
+      ["Delete", bar("seldelete"), true],
+    ]);
+}
+
+// ------------------------------------------------- drag photos to an album ---
+
+// Native drags are off (see the dragstart handler), so pointer events carry a
+// drag from a tile to a sidebar album. `ids` is set once the pointer has moved
+// far enough to mean it.
+let photoDrag = null; // { x, y, id, ids, album }
+let dragEnded = 0;
+
+function armPhotoDrag(i, e) {
+  if (e.button !== 0 || e.ctrlKey || currentView.type === "trash") return;
+  photoDrag = { x: e.clientX, y: e.clientY, id: visible[i].id, ids: null, album: null };
+}
+
+function photoDragOver(position) {
+  lastDragPos = position;
+  const ghost = $("dragghost"), n = photoDrag.ids.length;
+  ghost.style.left = position.x + 14 + "px";
+  ghost.style.top = position.y + 12 + "px";
+  autoScrollSidebar(position);
+  const album = document.elementFromPoint(position.x, position.y)
+    ?.closest?.("#sidebar .item[data-v='album']")?.dataset.id || null;
+  ghost.textContent = album ? `Add ${plural(n, "item")} to “${albumName(album) || "album"}”` : plural(n, "item");
+  if (album === photoDrag.album) return;
+  photoDrag.album = album;
+  document.querySelectorAll("#sidebar .item.droptarget").forEach(el => el.classList.remove("droptarget"));
+  if (album) $("sidebar").querySelector(`.item[data-v='album'][data-id='${album}']`)?.classList.add("droptarget");
+}
+
+// Ends the drag and returns it if it had started moving.
+function endPhotoDrag() {
+  const drag = photoDrag;
+  photoDrag = null;
+  if (!drag?.ids) return null;
+  $("dragghost").style.display = "none";
+  document.documentElement.classList.remove("photodrag");
+  stopSidebarScroll();
+  lastDragPos = null;
+  document.querySelectorAll("#sidebar .item.droptarget").forEach(el => el.classList.remove("droptarget"));
+  return drag;
+}
+
+document.addEventListener("pointermove", e => {
+  if (!photoDrag) return;
+  if (!photoDrag.ids) {
+    if (Math.hypot(e.clientX - photoDrag.x, e.clientY - photoDrag.y) < 6) return;
+    // Dragging a selected photo takes the whole selection. Any other photo goes alone.
+    photoDrag.ids = selection.has(photoDrag.id) ? selectedIds() : [photoDrag.id];
+    closeMenus();
+    $("dragghost").style.display = "block";
+    document.documentElement.classList.add("photodrag");
+  }
+  photoDragOver({ x: e.clientX, y: e.clientY });
+});
+document.addEventListener("pointerup", () => {
+  const drag = endPhotoDrag();
+  if (!drag) return;
+  dragEnded = Date.now();
+  if (drag.album) filePhotos(drag.ids, drag.album, true);
+});
+document.addEventListener("pointercancel", endPhotoDrag);
 
 // Tags menu in the selection bar.
 $("seltags").onclick = e => {
@@ -2394,11 +2724,12 @@ async function bulkTags(add) {
 $("tagadd").onclick = () => bulkTags(true);
 $("tagremove").onclick = () => bulkTags(false);
 
-// Close any open dropdown on outside click.
+// Close any open dropdown on outside click, and when the window scrolls,
+// resizes, or loses focus under a floating one.
 document.addEventListener("click", e => {
-  if (!e.target.closest(".menuwrap"))
-    document.querySelectorAll(".menu.open").forEach(m => m.classList.remove("open"));
+  if (!e.target.closest(".menuwrap, #albummenu")) closeMenus();
 });
+for (const ev of ["scroll", "resize", "blur"]) window.addEventListener(ev, closeMenus, { passive: true });
 
 // ---------------------------------------------------------------- lightbox ---
 
@@ -2960,7 +3291,7 @@ function autoScrollSidebar(position) {
   if (!sidebarScroller) {
     sidebarScroller = setInterval(() => {
       sb.scrollTop += sidebarScrollDir * 12;
-      showDropTarget(lastDragPos);
+      (photoDrag?.ids ? photoDragOver : showDropTarget)(lastDragPos);
     }, 30);
   }
 }
@@ -3053,6 +3384,7 @@ function fillSettings() {
   $("autolocksel").value = String(settings.auto_lock_secs);
   $("optsleep").checked = settings.lock_on_sleep;
   $("optprotect").checked = settings.screen_protect;
+  $("optairplay").checked = settings.airplay;
   $("optdedupe").checked = settings.skip_duplicates;
   $("opttouchid").checked = settings.touch_id;
 }
@@ -3062,10 +3394,19 @@ async function pushSettings() {
     auto_lock_secs: parseInt($("autolocksel").value, 10),
     lock_on_sleep: $("optsleep").checked,
     screen_protect: $("optprotect").checked,
+    airplay: $("optairplay").checked,
     skip_duplicates: $("optdedupe").checked,
     touch_id: settings?.touch_id ?? false,
   };
+  applyAirplay();
   await invoke("set_settings", { settings }).catch(err => toast("" + err));
+}
+
+// The video player offers AirPlay only when Settings turns it on.
+function applyAirplay() {
+  const on = !!settings?.airplay;
+  $("lbvid").disableRemotePlayback = !on;
+  $("lbvid").setAttribute("x-webkit-airplay", on ? "allow" : "deny");
 }
 
 $("settingsbtn").onclick = async () => {
@@ -3073,6 +3414,10 @@ $("settingsbtn").onclick = async () => {
   invoke("get_build_info").then(info => {
     $("buildinfo").textContent = `PhotoVault ${info.version} · Build ${info.build}`;
   }).catch(() => { $("buildinfo").textContent = "Version information unavailable"; });
+  $("vaultsize").textContent = "Calculating…";
+  invoke("vault_size").then(
+    bytes => { if (session === sessionVersion) $("vaultsize").textContent = fmtSize(bytes); },
+    () => { if (session === sessionVersion) $("vaultsize").textContent = "Unavailable"; });
   settings = await invoke("get_settings").catch(() => settings);
   fillSettings();
   const bio = await invoke("touchid_available").catch(() => false);
@@ -3089,7 +3434,7 @@ $("settingsbtn").onclick = async () => {
 $("setclose").onclick = () => { $("settings").classList.remove("open"); $("settingsbtn").focus(); };
 $("helpclose").onclick = () => $("helpmodal").classList.remove("open");
 
-for (const id of ["autolocksel", "optsleep", "optprotect", "optdedupe"])
+for (const id of ["autolocksel", "optsleep", "optprotect", "optairplay", "optdedupe"])
   $(id).addEventListener("change", pushSettings);
 
 $("opttouchid").addEventListener("change", async e => {
@@ -3249,6 +3594,9 @@ document.addEventListener("keydown", e => {
     }
     return;
   }
+  if (e.key === "Escape" && photoDrag?.ids) { endPhotoDrag(); return; }
+  // Escape closes an open menu before it does anything else, such as clearing the selection.
+  if (e.key === "Escape" && document.querySelectorAll(".menu.open").length) { closeMenus(); return; }
   const inControl = document.activeElement?.closest?.("button, [role=button], summary, video, a");
   const viewerOpen = $("lightbox").classList.contains("open");
   const controlKeys = viewerOpen ? ["Enter", " "]
@@ -3320,6 +3668,7 @@ document.addEventListener("keydown", e => {
   if (e.key === " " && focusIdx >= 0) {
     e.preventDefault();
     toggleSelect(visible[focusIdx].id);
+    lastClick = focusIdx;
     return;
   }
   if (e.key === "Delete" || e.key === "Backspace") {
